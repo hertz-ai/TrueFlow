@@ -1,0 +1,78 @@
+{
+  "correlation_id": "cycle_000001_17cd85f8",
+  "timestamp": 1764005255443,
+  "event_count": 6,
+  "calls": [
+    {
+      "call_id": "",
+      "type": "cycle_start",
+      "timestamp": 1.764005248544934E9,
+      "module": "",
+      "function": "",
+      "file_path": "",
+      "line_number": 0,
+      "depth": 0,
+      "correlation_id": "cycle_000001_17cd85f8"
+    },
+    {
+      "call_id": "call_2675",
+      "type": "call",
+      "timestamp": 1.764005248544934E9,
+      "module": "src.crawl4ai.embodied_ai.rl_ef.learning_llm_provider",
+      "function": "_encode_message",
+      "file_path": "C:\\Users\\sathi\\PycharmProjects\\crawl4ai\\src\\crawl4ai\\embodied_ai\\rl_ef\\learning_llm_provider.py",
+      "line_number": 2000,
+      "depth": 7,
+      "parent_id": "call_2674",
+      "correlation_id": "cycle_000001_17cd85f8"
+    },
+    {
+      "call_id": "call_2676",
+      "type": "call",
+      "timestamp": 1.7640052485459337E9,
+      "module": "src.crawl4ai.embodied_ai.models.qwen_vl_wrapper",
+      "function": "get_sensor_dim",
+      "file_path": "C:\\Users\\sathi\\PycharmProjects\\crawl4ai\\src\\crawl4ai\\embodied_ai\\models\\qwen_vl_wrapper.py",
+      "line_number": 771,
+      "depth": 8,
+      "parent_id": "call_2675",
+      "correlation_id": "cycle_000001_17cd85f8"
+    },
+    {
+      "call_id": "call_2677",
+      "type": "call",
+      "timestamp": 1.7640052485459337E9,
+      "module": "src.crawl4ai.embodied_ai.models.qwen_vl_wrapper",
+      "function": "unwrap_hf_config",
+      "file_path": "C:\\Users\\sathi\\PycharmProjects\\crawl4ai\\src\\crawl4ai\\embodied_ai\\models\\qwen_vl_wrapper.py",
+      "line_number": 751,
+      "depth": 9,
+      "parent_id": "call_2676",
+      "correlation_id": "cycle_000001_17cd85f8"
+    },
+    {
+      "call_id": "call_2677",
+      "type": "return",
+      "timestamp": 1.7640052485459337E9,
+      "module": "src.crawl4ai.embodied_ai.models.qwen_vl_wrapper",
+      "function": "unwrap_hf_config",
+      "file_path": "C:\\Users\\sathi\\PycharmProjects\\crawl4ai\\src\\crawl4ai\\embodied_ai\\models\\qwen_vl_wrapper.py",
+      "line_number": 751,
+      "depth": 9,
+      "parent_id": "call_2676",
+      "correlation_id": "cycle_000001_17cd85f8"
+    },
+    {
+      "call_id": "call_2676",
+      "type": "return",
+      "timestamp": 1.7640052485469341E9,
+      "module": "src.crawl4ai.embodied_ai.models.qwen_vl_wrapper",
+      "function": "get_sensor_dim",
+      "file_path": "C:\\Users\\sathi\\PycharmProjects\\crawl4ai\\src\\crawl4ai\\embodied_ai\\models\\qwen_vl_wrapper.py",
+      "line_number": 771,
+      "depth": 8,
+      "parent_id": "call_2675",
+      "correlation_id": "cycle_000001_17cd85f8"
+    }
+  ]
+}

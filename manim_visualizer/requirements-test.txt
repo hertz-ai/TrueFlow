@@ -1,0 +1,15 @@
+# Test dependencies for manim_visualizer regression testing
+# Install with: pip install -r requirements-test.txt
+
+# Core testing framework
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-html>=3.2.0
+pytest-timeout>=2.1.0
+pytest-xdist>=3.3.1  # Parallel test execution
+
+# Coverage reporting
+coverage>=7.2.0
+
+# Test utilities
+pytest-mock>=3.11.1

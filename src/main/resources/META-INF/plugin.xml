@@ -1,0 +1,152 @@
+<idea-plugin>
+    <id>com.trueflow</id>
+    <name>TrueFlow - Deterministic Code Visualizer</name>
+    <vendor email="support@trueflow.dev" url="https://trueflow.dev">TrueFlow</vendor>
+
+    <description><![CDATA[
+    <h1>TrueFlow - Deterministic Code Visualizer & Explainer</h1>
+    <p><b>Unblackbox LLM code with deterministic truth.</b></p>
+    <p>Zero-code auto-instrumentation with 3D animated execution videos. No SDK required. Just one click!</p>
+
+    <h2>Core Features</h2>
+    <ul>
+        <li><b>3D Animated Execution Videos</b> - Manim-powered cinematic visualizations</li>
+        <li><b>Zero-Code Auto-Instrumentation</b> - JRebel-style runtime injection, no SDK required</li>
+        <li><b>Flamegraph Visualization</b> - Hierarchical performance profiling (like speedscope.app)</li>
+        <li><b>SQL Query Analyzer</b> - N+1 detection, slow query identification, optimization suggestions</li>
+        <li><b>Live Metrics Dashboard</b> - Real-time monitoring with requests/sec, latency, error rate</li>
+        <li><b>PlantUML, Mermaid & D2 Diagrams</b> - Interactive architecture diagrams with component icons</li>
+        <li><b>Dead Code Detection</b> - Identify functions that are never called</li>
+        <li><b>Performance Profiling</b> - Time, memory, CPU usage per function</li>
+        <li><b>29+ Protocol Detection</b> - SQL, gRPC, GraphQL, Kafka, Redis, MQTT, WebSocket, and more</li>
+        <li><b>LLM-Friendly Exports</b> - Natural language summaries for AI-powered code analysis</li>
+    </ul>
+
+    <h2>Perfect For</h2>
+    <ul>
+        <li><b>Understanding AI-Generated Code</b> - See exactly what LLM-generated code does at runtime</li>
+        <li><b>Performance Optimization</b> - Find bottlenecks with flamegraph and SQL analysis</li>
+        <li><b>Database Debugging</b> - Catch N+1 queries and slow SQL automatically</li>
+        <li><b>Production Monitoring</b> - Real-time metrics while app runs</li>
+        <li><b>Understanding Codebases</b> - Architecture diagrams with pattern detection</li>
+        <li><b>Finding Dead Code</b> - Remove unused functions confidently</li>
+        <li><b>API Profiling</b> - FastAPI, Flask, Django performance analysis</li>
+        <li><b>AI/ML Debugging</b> - Track PyTorch, TensorFlow, LangChain execution</li>
+    </ul>
+
+    <h2>Quick Start (One-Click Integration)</h2>
+    <ol>
+        <li>Install plugin from JetBrains Marketplace</li>
+        <li>Open tool window: <b>View -> Tool Windows -> TrueFlow</b></li>
+        <li>Click green <b>"Auto-Integrate into Repo"</b> button</li>
+        <li>Select your main Python file (main.py, app.py, etc.)</li>
+        <li>Click OK - plugin sets up environment variables automatically</li>
+        <li>Run your app normally - traces appear in 9 tabs:</li>
+        <ul>
+            <li><b>Diagram</b> - PlantUML architecture diagrams</li>
+            <li><b>Performance</b> - Function metrics table</li>
+            <li><b>Dead Code</b> - Unused function detection</li>
+            <li><b>Call Trace</b> - Complete execution flow</li>
+            <li><b>Flamegraph</b> - Hierarchical performance visualization</li>
+            <li><b>SQL Analyzer</b> - N+1 query detection</li>
+            <li><b>Live Metrics</b> - Real-time dashboard</li>
+            <li><b>Manim Videos</b> - 3D animated execution videos</li>
+            <li><b>Exports</b> - 11+ export formats</li>
+        </ul>
+    </ol>
+
+    <h2>Support</h2>
+    <ul>
+        <li>Documentation: <a href="https://github.com/trueflow/trueflow">GitHub</a></li>
+        <li>Issues: <a href="https://github.com/trueflow/trueflow/issues">Bug Reports</a></li>
+    </ul>
+    ]]></description>
+
+    <!-- Product and plugin compatibility requirements -->
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.python</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Tool Window -->
+        <toolWindow
+                id="TrueFlow"
+                anchor="right"
+                factoryClass="com.crawl4ai.learningviz.EnhancedLearningFlowToolWindowFactory"
+                icon="/icons/toolWindowIcon.svg"
+                canCloseContents="false"
+                doNotActivateOnStart="false"/>
+
+        <!-- Settings -->
+        <projectConfigurable
+                parentId="tools"
+                instance="com.crawl4ai.learningviz.SettingsConfigurable"
+                id="com.trueflow.settings"
+                displayName="TrueFlow"
+                nonDefaultProject="true"/>
+
+        <!-- Project Service -->
+        <projectService
+                serviceImplementation="com.crawl4ai.learningviz.TraceWatcherService"/>
+    </extensions>
+
+    <actions>
+        <!-- Tool Window Actions -->
+        <action id="TrueFlow.RefreshAction"
+                class="com.crawl4ai.learningviz.actions.RefreshAction"
+                text="Refresh Diagram"
+                description="Refresh the execution flow diagram"
+                icon="AllIcons.Actions.Refresh">
+            <keyboard-shortcut keymap="$default" first-keystroke="F5"/>
+        </action>
+
+        <action id="TrueFlow.ExportAction"
+                class="com.crawl4ai.learningviz.actions.ExportAction"
+                text="Export Diagram"
+                description="Export diagram to file"
+                icon="AllIcons.Actions.Download">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl E"/>
+        </action>
+
+        <action id="TrueFlow.SelectDirectoryAction"
+                class="com.crawl4ai.learningviz.actions.SelectDirectoryAction"
+                text="Select Trace Directory"
+                description="Select directory containing trace files"
+                icon="AllIcons.Actions.Menu_open"/>
+
+        <action id="TrueFlow.AutoIntegrateAction"
+                class="com.crawl4ai.learningviz.actions.AutoIntegrateAction"
+                text="Auto-Integrate into Repo"
+                description="Automatically integrate tracing by selecting entry point"
+                icon="AllIcons.Actions.Lightning">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift I"/>
+        </action>
+
+        <!-- Main Menu -->
+        <group id="TrueFlow.Menu"
+               text="TrueFlow"
+               description="TrueFlow - Deterministic Code Visualizer"
+               popup="true">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <reference ref="TrueFlow.AutoIntegrateAction"/>
+            <separator/>
+            <reference ref="TrueFlow.RefreshAction"/>
+            <reference ref="TrueFlow.ExportAction"/>
+            <reference ref="TrueFlow.SelectDirectoryAction"/>
+        </group>
+    </actions>
+
+    <applicationListeners>
+        <listener class="com.crawl4ai.learningviz.TraceFileListener"
+                  topic="com.intellij.openapi.vfs.VirtualFileListener"/>
+    </applicationListeners>
+
+    <projectListeners>
+        <listener class="com.crawl4ai.learningviz.ProjectOpenListener"
+                  topic="com.intellij.openapi.project.ProjectManagerListener"/>
+    </projectListeners>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Auto-open tool window on project startup -->
+        <postStartupActivity implementation="com.crawl4ai.learningviz.PluginStartupActivity"/>
+    </extensions>
+</idea-plugin>

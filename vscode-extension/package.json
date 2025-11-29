@@ -1,0 +1,151 @@
+{
+  "name": "trueflow",
+  "displayName": "TrueFlow - Deterministic Code Visualizer",
+  "description": "Unblackbox LLM code with deterministic truth. Zero-code Python runtime instrumentation with 3D animated execution videos.",
+  "version": "0.1.0",
+  "publisher": "trueflow",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/trueflow/trueflow"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Visualization",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "python",
+    "profiler",
+    "tracing",
+    "visualization",
+    "manim",
+    "execution-flow",
+    "code-visualization",
+    "flamegraph",
+    "plantuml"
+  ],
+  "activationEvents": [
+    "onLanguage:python",
+    "workspaceContains:**/*.py"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "trueflow.autoIntegrate",
+        "title": "TrueFlow: Auto-Integrate into Project",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "trueflow.showTraceViewer",
+        "title": "TrueFlow: Show Trace Viewer",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "trueflow.generateManimVideo",
+        "title": "TrueFlow: Generate Manim Video",
+        "icon": "$(play)"
+      },
+      {
+        "command": "trueflow.exportDiagram",
+        "title": "TrueFlow: Export Diagram",
+        "icon": "$(export)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "trueflow-sidebar",
+          "title": "TrueFlow",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "trueflow-sidebar": [
+        {
+          "type": "webview",
+          "id": "trueflow.traceViewer",
+          "name": "Trace Viewer"
+        },
+        {
+          "id": "trueflow.performanceMetrics",
+          "name": "Performance Metrics"
+        },
+        {
+          "id": "trueflow.deadCode",
+          "name": "Dead Code"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "TrueFlow",
+      "properties": {
+        "trueflow.traceDirectory": {
+          "type": "string",
+          "default": "./traces",
+          "description": "Directory to store trace files"
+        },
+        "trueflow.autoRefresh": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically refresh when new traces are detected"
+        },
+        "trueflow.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to Python interpreter"
+        },
+        "trueflow.socketPort": {
+          "type": "number",
+          "default": 5678,
+          "description": "Port for real-time trace streaming"
+        },
+        "trueflow.manimQuality": {
+          "type": "string",
+          "enum": ["low_quality", "medium_quality", "high_quality"],
+          "default": "medium_quality",
+          "description": "Quality setting for Manim video generation"
+        }
+      }
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "when": "editorLangId == python",
+          "command": "trueflow.autoIntegrate",
+          "group": "trueflow"
+        }
+      ],
+      "explorer/context": [
+        {
+          "when": "resourceExtname == .py",
+          "command": "trueflow.autoIntegrate",
+          "group": "trueflow"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "ws": "^8.14.0"
+  }
+}
