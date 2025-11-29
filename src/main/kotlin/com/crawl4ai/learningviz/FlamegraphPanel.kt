@@ -2,13 +2,17 @@ package com.crawl4ai.learningviz
 
 import com.google.gson.Gson
 import com.google.gson.JsonObject
+import com.intellij.openapi.fileEditor.FileEditorManager
+import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import java.awt.*
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.awt.event.MouseWheelEvent
 import java.io.File
 import javax.swing.*
 
@@ -16,15 +20,16 @@ import javax.swing.*
  * Flamegraph visualization panel - hierarchical performance visualization.
  *
  * Features:
- * - Speedscope.app style flamegraph
- * - Interactive zoom/pan
+ * - Speedscope.app style icicle graph (root at top, children below)
+ * - Interactive zoom/pan with mouse wheel
  * - Click to jump to source code
  * - Hover for details
- * - Color-coded by duration
+ * - Color-coded by duration (green=fast, red=slow)
+ * - Search with highlighting
  */
 class FlamegraphPanel(private val project: Project) : JPanel(BorderLayout()) {
 
-    private val canvas = FlamegraphCanvas()
+    private val canvas = FlamegraphCanvas(project)
     private val statsLabel = JBLabel()
     private val searchField = JTextField(20)
     private var flamegraphData: FlamegraphData? = null
@@ -40,6 +45,14 @@ class FlamegraphPanel(private val project: Project) : JPanel(BorderLayout()) {
             canvas.resetZoom()
         }
         toolbar.add(resetZoomButton)
+
+        val zoomInButton = JButton("+")
+        zoomInButton.addActionListener { canvas.zoomIn() }
+        toolbar.add(zoomInButton)
+
+        val zoomOutButton = JButton("-")
+        zoomOutButton.addActionListener { canvas.zoomOut() }
+        toolbar.add(zoomOutButton)
 
         add(toolbar, BorderLayout.NORTH)
 
@@ -144,163 +157,287 @@ class FlamegraphPanel(private val project: Project) : JPanel(BorderLayout()) {
 
 /**
  * Canvas for rendering flamegraph using hierarchical rectangles.
+ * Uses icicle graph style (root at top, children below).
  */
-private class FlamegraphCanvas : JPanel() {
+private class FlamegraphCanvas(private val project: Project) : JPanel() {
 
     private var data: FlamegraphData? = null
     private var zoomLevel = 1.0
-    private var offsetX = 0
-    private var offsetY = 0
+    private var panX = 0.0
     private var highlightedFrame: FlamegraphFrame? = null
+    private var searchQuery: String = ""
+
+    // Cache rendered frame rectangles for hit testing
+    private val frameRects = mutableMapOf<Rectangle, FlamegraphFrame>()
+
+    private val barHeight = 24
+    private val barGap = 1
 
     init {
         preferredSize = Dimension(800, 600)
-        background = JBColor.WHITE
+        background = JBColor(Color(30, 30, 30), Color(30, 30, 30))
 
-        // Mouse interactions
+        // Mouse click - jump to source
         addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 val frame = getFrameAtPoint(e.x, e.y)
                 if (frame != null) {
                     highlightedFrame = frame
                     repaint()
-                    // TODO: Jump to source code
+
+                    // Double-click to jump to source
+                    if (e.clickCount == 2) {
+                        jumpToSource(frame)
+                    }
                 }
             }
         })
 
+        // Mouse hover - show tooltip
         addMouseMotionListener(object : MouseAdapter() {
             override fun mouseMoved(e: MouseEvent) {
                 val frame = getFrameAtPoint(e.x, e.y)
-                if (frame != null) {
-                    toolTipText = buildTooltip(frame)
-                } else {
-                    toolTipText = null
-                }
+                toolTipText = frame?.let { buildTooltip(it) }
+                cursor = if (frame != null) Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                         else Cursor.getDefaultCursor()
             }
         })
+
+        // Mouse wheel - zoom
+        addMouseWheelListener { e: MouseWheelEvent ->
+            val oldZoom = zoomLevel
+            if (e.wheelRotation < 0) {
+                zoomLevel = (zoomLevel * 1.1).coerceAtMost(10.0)
+            } else {
+                zoomLevel = (zoomLevel / 1.1).coerceAtLeast(0.1)
+            }
+
+            // Adjust pan to keep mouse position stable
+            val mouseX = e.x
+            panX = mouseX - (mouseX - panX) * (zoomLevel / oldZoom)
+
+            updatePreferredSize()
+            repaint()
+        }
     }
 
     fun setData(data: FlamegraphData) {
         this.data = data
+        zoomLevel = 1.0
+        panX = 0.0
+        updatePreferredSize()
         repaint()
+    }
+
+    private fun updatePreferredSize() {
+        data?.let { flamegraph ->
+            val height = (flamegraph.statistics.maxDepth + 2) * (barHeight + barGap) + 40
+            val width = ((parent?.width ?: 800) * zoomLevel).toInt()
+            preferredSize = Dimension(width, height)
+            revalidate()
+        }
     }
 
     fun resetZoom() {
         zoomLevel = 1.0
-        offsetX = 0
-        offsetY = 0
+        panX = 0.0
+        updatePreferredSize()
+        repaint()
+    }
+
+    fun zoomIn() {
+        zoomLevel = (zoomLevel * 1.2).coerceAtMost(10.0)
+        updatePreferredSize()
+        repaint()
+    }
+
+    fun zoomOut() {
+        zoomLevel = (zoomLevel / 1.2).coerceAtLeast(0.1)
+        updatePreferredSize()
         repaint()
     }
 
     fun searchFunction(query: String) {
+        searchQuery = query
         data?.let { flamegraph ->
             val matches = flamegraph.frames.filter { it.name.contains(query, ignoreCase = true) }
             if (matches.isNotEmpty()) {
                 highlightedFrame = matches.first()
-                repaint()
             }
         }
+        repaint()
     }
 
     override fun paintComponent(g: Graphics) {
         super.paintComponent(g)
         val g2d = g as Graphics2D
         g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g2d.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
+
+        // Clear frame cache
+        frameRects.clear()
 
         data?.let { flamegraph ->
             drawFlamegraph(g2d, flamegraph)
+        } ?: run {
+            // Draw placeholder
+            g2d.color = JBColor.GRAY
+            g2d.drawString("No flamegraph data. Run your application with TrueFlow tracing enabled.", 20, 30)
         }
     }
 
     private fun drawFlamegraph(g2d: Graphics2D, flamegraph: FlamegraphData) {
-        val width = width
-        val barHeight = 20
+        val totalWidth = (width * zoomLevel).toInt()
+        val totalDuration = flamegraph.statistics.totalDurationMs
 
-        // Build tree structure
-        val rootFrames = flamegraph.frames.filter { it.parentId == null }
+        if (totalDuration <= 0) return
 
-        var y = 10
+        // Build parent-child map for efficient lookup
+        val childrenMap = flamegraph.frames.groupBy { it.parentId }
+
+        // Draw root frames (those with no parent)
+        val rootFrames = childrenMap[null] ?: emptyList()
+
+        var currentX = 10
         for (rootFrame in rootFrames) {
-            y = drawFrame(g2d, rootFrame, 0, y, width, barHeight, flamegraph)
+            val frameWidth = ((rootFrame.value / totalDuration) * (totalWidth - 20)).toInt()
+            drawFrameRecursive(g2d, rootFrame, currentX, 10, frameWidth, childrenMap, totalDuration)
+            currentX += frameWidth + 2
         }
     }
 
-    private fun drawFrame(
+    private fun drawFrameRecursive(
         g2d: Graphics2D,
         frame: FlamegraphFrame,
         x: Int,
         y: Int,
-        maxWidth: Int,
-        barHeight: Int,
-        flamegraph: FlamegraphData
-    ): Int {
-        // Calculate width based on duration percentage
-        val totalDuration = flamegraph.statistics.totalDurationMs
-        val widthRatio = if (totalDuration > 0) frame.value / totalDuration else 0.0
-        val frameWidth = (maxWidth * widthRatio).toInt()
+        availableWidth: Int,
+        childrenMap: Map<String?, List<FlamegraphFrame>>,
+        totalDuration: Double
+    ) {
+        // Minimum width to draw
+        if (availableWidth < 2) return
 
-        // Color by duration (green = fast, red = slow)
-        val color = getColorForDuration(frame.value)
-        g2d.color = if (frame == highlightedFrame) JBColor.CYAN else color
-        g2d.fillRect(x, y, frameWidth, barHeight)
+        val rect = Rectangle(x, y, availableWidth, barHeight)
 
-        // Border
-        g2d.color = JBColor.BLACK
-        g2d.drawRect(x, y, frameWidth, barHeight)
+        // Store for hit testing
+        frameRects[rect] = frame
 
-        // Text label
-        g2d.color = JBColor.BLACK
-        val label = truncateText(frame.name, frameWidth - 4)
-        g2d.drawString(label, x + 2, y + barHeight - 5)
-
-        // Draw children
-        val children = flamegraph.frames.filter { it.parentId == frame.callId }
-        var childY = y + barHeight + 2
-
-        for (child in children) {
-            childY = drawFrame(g2d, child, x, childY, frameWidth, barHeight, flamegraph)
+        // Determine color
+        val baseColor = getColorForDuration(frame.value)
+        val color = when {
+            frame == highlightedFrame -> JBColor.CYAN
+            searchQuery.isNotEmpty() && frame.name.contains(searchQuery, ignoreCase = true) -> JBColor.YELLOW
+            else -> baseColor
         }
 
-        return childY
+        // Draw frame rectangle
+        g2d.color = color
+        g2d.fillRect(x, y, availableWidth, barHeight)
+
+        // Border
+        g2d.color = JBColor(Color(20, 20, 20), Color(20, 20, 20))
+        g2d.drawRect(x, y, availableWidth, barHeight)
+
+        // Text label (dark text for readability)
+        g2d.color = JBColor.BLACK
+        val label = truncateText(frame.name, availableWidth - 6, g2d)
+        if (label.isNotEmpty()) {
+            g2d.drawString(label, x + 3, y + barHeight - 7)
+        }
+
+        // Draw children below
+        val children = childrenMap[frame.callId] ?: emptyList()
+        if (children.isNotEmpty()) {
+            var childX = x
+            val childY = y + barHeight + barGap
+
+            // Sort children by value (duration) for consistent layout
+            val sortedChildren = children.sortedByDescending { it.value }
+
+            for (child in sortedChildren) {
+                val childWidth = if (frame.value > 0) {
+                    ((child.value / frame.value) * availableWidth).toInt()
+                } else {
+                    availableWidth / children.size
+                }
+
+                if (childWidth >= 2) {
+                    drawFrameRecursive(g2d, child, childX, childY, childWidth, childrenMap, totalDuration)
+                    childX += childWidth
+                }
+            }
+        }
     }
 
     private fun getColorForDuration(durationMs: Double): Color {
-        // Green (fast) to Red (slow) gradient
+        // Warm color palette (flame-like): fast=cool, slow=hot
         return when {
-            durationMs < 10 -> Color(144, 238, 144) // Light green
-            durationMs < 50 -> Color(255, 255, 153) // Light yellow
-            durationMs < 100 -> Color(255, 204, 153) // Light orange
-            else -> Color(255, 153, 153) // Light red
+            durationMs < 1 -> Color(70, 130, 180)     // Steel blue (very fast)
+            durationMs < 10 -> Color(144, 238, 144)   // Light green (fast)
+            durationMs < 50 -> Color(255, 255, 153)   // Light yellow (moderate)
+            durationMs < 100 -> Color(255, 200, 100)  // Orange (slow)
+            durationMs < 500 -> Color(255, 140, 100)  // Dark orange (very slow)
+            else -> Color(255, 100, 100)              // Red (critical)
         }
     }
 
-    private fun truncateText(text: String, maxWidth: Int): String {
-        val charWidth = 7 // Approximate character width
-        val maxChars = maxWidth / charWidth
-        return if (text.length > maxChars) {
-            text.substring(0, maxChars.coerceAtLeast(0)) + "..."
-        } else {
-            text
+    private fun truncateText(text: String, maxWidth: Int, g2d: Graphics2D): String {
+        if (maxWidth < 20) return ""
+
+        val metrics = g2d.fontMetrics
+        var truncated = text
+
+        while (metrics.stringWidth(truncated) > maxWidth && truncated.length > 3) {
+            truncated = truncated.substring(0, truncated.length - 4) + "..."
         }
+
+        return if (metrics.stringWidth(truncated) <= maxWidth) truncated else ""
     }
 
     private fun getFrameAtPoint(x: Int, y: Int): FlamegraphFrame? {
-        // TODO: Implement hit testing
+        // Search through cached rectangles
+        for ((rect, frame) in frameRects) {
+            if (rect.contains(x, y)) {
+                return frame
+            }
+        }
         return null
+    }
+
+    private fun jumpToSource(frame: FlamegraphFrame) {
+        try {
+            val virtualFile = LocalFileSystem.getInstance().findFileByPath(frame.file)
+            if (virtualFile != null) {
+                val descriptor = OpenFileDescriptor(project, virtualFile, frame.line - 1, 0)
+                FileEditorManager.getInstance(project).openTextEditor(descriptor, true)
+            }
+        } catch (e: Exception) {
+            PluginLogger.warn("Could not open file: ${frame.file}:${frame.line} - ${e.message}")
+        }
     }
 
     private fun buildTooltip(frame: FlamegraphFrame): String {
         return """
             <html>
-            <b>${frame.name}</b><br>
-            Duration: ${String.format("%.2f", frame.value)}ms<br>
-            File: ${frame.file}:${frame.line}<br>
-            Depth: ${frame.depth}<br>
-            ${if (frame.framework != null) "Framework: ${frame.framework}<br>" else ""}
-            ${if (frame.isAiAgent) "<b>AI Agent</b><br>" else ""}
+            <div style="padding: 5px;">
+            <b style="font-size: 12px;">${escapeHtml(frame.name)}</b><br><br>
+            <b>Duration:</b> ${String.format("%.2f", frame.value)}ms<br>
+            <b>File:</b> ${escapeHtml(frame.file)}:${frame.line}<br>
+            <b>Depth:</b> ${frame.depth}<br>
+            ${if (frame.framework != null) "<b>Framework:</b> ${frame.framework}<br>" else ""}
+            ${if (frame.isAiAgent) "<b style='color: #4ec9b0;'>AI Agent</b><br>" else ""}
+            <br><i>Double-click to jump to source</i>
+            </div>
             </html>
         """.trimIndent()
+    }
+
+    private fun escapeHtml(text: String): String {
+        return text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
     }
 }
 

@@ -53,6 +53,16 @@
         "command": "trueflow.exportDiagram",
         "title": "TrueFlow: Export Diagram",
         "icon": "$(export)"
+      },
+      {
+        "command": "trueflow.connectSocket",
+        "title": "TrueFlow: Connect to Trace Server",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "trueflow.disconnectSocket",
+        "title": "TrueFlow: Disconnect from Trace Server",
+        "icon": "$(debug-stop)"
       }
     ],
     "viewsContainers": {
@@ -98,6 +108,11 @@
           "type": "string",
           "default": "python",
           "description": "Path to Python interpreter"
+        },
+        "trueflow.socketHost": {
+          "type": "string",
+          "default": "localhost",
+          "description": "Host for real-time trace streaming"
         },
         "trueflow.socketPort": {
           "type": "number",

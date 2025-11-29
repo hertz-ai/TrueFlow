@@ -297,31 +297,162 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
         envFile.writeText(envContent)
     }
 
-    private fun copyRuntimeInjectorToProject() {
-        // Copy runtime_instrumentor.py, sitecustomize.py, and enable_tracing.bat to project (embedded in plugin JAR)
+    /**
+     * Check if runtime injector is already deployed and up-to-date.
+     * Returns true if injection can be skipped, false if (re)injection needed.
+     */
+    private fun isRuntimeInjectorDeployed(): Pair<Boolean, String> {
         val pluginDir = File("${project.basePath}/.pycharm_plugin")
-        pluginDir.mkdirs()
+        val runtimeInjectorDir = File(pluginDir, "runtime_injector")
 
-        // Copy python_runtime_instrumentor.py
-        val injectorSource = javaClass.getResourceAsStream("/runtime_injector/python_runtime_instrumentor.py")
-        val injectorDest = File(pluginDir, "python_runtime_instrumentor.py")
-        injectorDest.writeBytes(injectorSource?.readBytes() ?: return)
-
-        // Copy sitecustomize.py
-        val sitecustomizeSource = javaClass.getResourceAsStream("/runtime_injector/sitecustomize.py")
-        val sitecustomizeDest = File(pluginDir, "sitecustomize.py")
-        sitecustomizeDest.writeBytes(sitecustomizeSource?.readBytes() ?: return)
-
-        // Copy enable_tracing.bat for direct .bat execution
-        val batSource = javaClass.getResourceAsStream("/runtime_injector/enable_tracing.bat")
-        if (batSource != null) {
-            val batDest = File(pluginDir, "enable_tracing.bat")
-            batDest.writeBytes(batSource.readBytes())
-            println("[Plugin] Copied enable_tracing.bat to: ${batDest.absolutePath}")
+        // Check if directory exists
+        if (!runtimeInjectorDir.exists()) {
+            return Pair(false, "Runtime injector directory not found")
         }
 
-        println("[Plugin] Copied runtime injector to: ${injectorDest.absolutePath}")
-        println("[Plugin] Copied sitecustomize.py to: ${sitecustomizeDest.absolutePath}")
+        // Check for essential files
+        val essentialFiles = listOf(
+            "python_runtime_instrumentor.py",
+            "sitecustomize.py",
+            "enable_tracing.bat",
+            "enable_tracing.sh",
+            "enable_tracing.ps1",
+            "tracing_wrapper.py"
+        )
+
+        val missingFiles = essentialFiles.filter { !File(runtimeInjectorDir, it).exists() }
+        if (missingFiles.isNotEmpty()) {
+            return Pair(false, "Missing files: ${missingFiles.joinToString(", ")}")
+        }
+
+        // Check version marker file (if present)
+        val versionFile = File(runtimeInjectorDir, ".version")
+        val currentVersion = "1.0.13"  // Should match plugin version
+
+        if (versionFile.exists()) {
+            val deployedVersion = versionFile.readText().trim()
+            if (deployedVersion == currentVersion) {
+                return Pair(true, "Already deployed (version $deployedVersion)")
+            } else {
+                return Pair(false, "Version mismatch: deployed=$deployedVersion, current=$currentVersion")
+            }
+        }
+
+        // Files exist but no version marker - assume needs update
+        return Pair(false, "No version marker found, will update")
+    }
+
+    private fun copyRuntimeInjectorToProject(): Boolean {
+        // Check if already deployed
+        val (isDeployed, statusMessage) = isRuntimeInjectorDeployed()
+
+        if (isDeployed) {
+            println("[Plugin] Runtime injector: $statusMessage - skipping deployment")
+            return true
+        }
+
+        println("[Plugin] Runtime injector: $statusMessage - deploying...")
+
+        // Copy ALL runtime_injector files to .pycharm_plugin/runtime_injector/
+        // This includes sitecustomize.py, project_scanner.py, local_llm_server.py, etc.
+        val pluginDir = File("${project.basePath}/.pycharm_plugin")
+        val runtimeInjectorDir = File(pluginDir, "runtime_injector")
+        runtimeInjectorDir.mkdirs()
+
+        var deployedCount = 0
+        var failedCount = 0
+
+        try {
+            // Get resource URL for the runtime_injector directory
+            val resourceUrl = javaClass.getResource("/runtime_injector")
+
+            if (resourceUrl != null) {
+                val jarFile = (resourceUrl.openConnection() as? java.net.JarURLConnection)?.jarFile
+
+                if (jarFile != null) {
+                    // Iterate through JAR entries and copy ALL files
+                    val entries = jarFile.entries()
+                    while (entries.hasMoreElements()) {
+                        val entry = entries.nextElement()
+                        val entryName = entry.name
+
+                        // Process ALL files in runtime_injector (not just specific ones)
+                        if (entryName.startsWith("runtime_injector/") && !entry.isDirectory) {
+                            try {
+                                val relativePath = entryName.substringAfter("runtime_injector/")
+                                if (relativePath.isEmpty()) continue
+
+                                val targetFile = File(runtimeInjectorDir, relativePath)
+
+                                // Create parent directories for subdirectories
+                                targetFile.parentFile?.mkdirs()
+
+                                // Extract file
+                                jarFile.getInputStream(entry).use { input ->
+                                    targetFile.outputStream().use { output ->
+                                        input.copyTo(output)
+                                    }
+                                }
+
+                                deployedCount++
+                            } catch (e: Exception) {
+                                println("[Plugin] Failed to extract ${entry.name}: ${e.message}")
+                                failedCount++
+                            }
+                        }
+                    }
+                } else {
+                    // Development mode - copy from source directory
+                    println("[Plugin] Development mode: copying from source directory")
+
+                    // Try multiple possible source locations
+                    val possibleSourceDirs = listOf(
+                        File("${project.basePath}/pycharm-plugin/runtime_injector"),
+                        File(System.getProperty("user.home") + "/PycharmProjects/TrueFlow/src/main/resources/runtime_injector")
+                    )
+
+                    val sourceDir = possibleSourceDirs.find { it.exists() && it.isDirectory }
+
+                    if (sourceDir != null) {
+                        sourceDir.walk().filter { it.isFile }.forEach { sourceFile ->
+                            try {
+                                val relativePath = sourceFile.relativeTo(sourceDir).path
+                                val targetFile = File(runtimeInjectorDir, relativePath)
+                                targetFile.parentFile?.mkdirs()
+                                sourceFile.copyTo(targetFile, overwrite = true)
+                                deployedCount++
+                            } catch (e: Exception) {
+                                println("[Plugin] Failed to copy ${sourceFile.name}: ${e.message}")
+                                failedCount++
+                            }
+                        }
+                    } else {
+                        println("[Plugin] ERROR: Source directory not found in any expected location")
+                        failedCount++
+                    }
+                }
+            } else {
+                println("[Plugin] WARNING: Resources not found in JAR")
+            }
+        } catch (e: Exception) {
+            println("[Plugin] ERROR deploying runtime injector: ${e.message}")
+            e.printStackTrace()
+            return false
+        }
+
+        // Write version marker for future checks
+        if (deployedCount > 0) {
+            try {
+                val versionFile = File(runtimeInjectorDir, ".version")
+                versionFile.writeText("1.0.13")
+                println("[Plugin] Version marker written: 1.0.13")
+            } catch (e: Exception) {
+                println("[Plugin] Warning: Could not write version marker: ${e.message}")
+            }
+        }
+
+        println("[Plugin] Runtime injector deployment complete: $deployedCount deployed, $failedCount failed to: ${runtimeInjectorDir.absolutePath}")
+        return deployedCount > 0 && failedCount == 0
     }
 
     private fun createRunConfiguration(
@@ -343,13 +474,16 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
             // Determine configuration type based on file extension
             val isBatchFile = entryPoint.name.endsWith(".bat") || entryPoint.name.endsWith(".cmd")
             val isShellScript = entryPoint.name.endsWith(".sh")
+            val isPowerShell = entryPoint.name.endsWith(".ps1")
+            val isScriptFile = isBatchFile || isShellScript || isPowerShell
 
             val configType = when {
-                isBatchFile || isShellScript -> {
-                    // Find Shell Script / Batch configuration type
+                isScriptFile -> {
+                    // Find Shell Script / Batch / PowerShell configuration type
                     allConfigTypes.find {
                         it.displayName.contains("Shell Script", ignoreCase = true) ||
-                        it.displayName.contains("Batch", ignoreCase = true)
+                        it.displayName.contains("Batch", ignoreCase = true) ||
+                        it.displayName.contains("PowerShell", ignoreCase = true)
                     }
                 }
                 else -> {
@@ -361,15 +495,27 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
             }
 
             if (configType == null) {
-                val typeName = if (isBatchFile || isShellScript) "Shell Script/Batch" else "Python"
+                val typeName = when {
+                    isBatchFile -> "Batch"
+                    isShellScript -> "Shell Script"
+                    isPowerShell -> "PowerShell"
+                    else -> "Python"
+                }
+                val runtimeInjectorDir = "$pluginDir/runtime_injector"
                 Messages.showWarningDialog(
                     project,
                     "$typeName plugin not found. Please install the plugin and manually create run configuration.\n\n" +
-                    "For .bat files, use: .pycharm_plugin\\enable_tracing.bat ${entryPoint.name}\n\n" +
+                    "Run with tracing from command line:\n" +
+                    "  Batch:      .pycharm_plugin\\runtime_injector\\enable_tracing.bat ${entryPoint.name}\n" +
+                    "  PowerShell: .pycharm_plugin\\runtime_injector\\enable_tracing.ps1 ${entryPoint.name}\n" +
+                    "  Shell:      .pycharm_plugin/runtime_injector/enable_tracing.sh ${entryPoint.name}\n\n" +
+                    "Or for Python directly:\n" +
+                    "  python .pycharm_plugin\\runtime_injector\\tracing_wrapper.py ${entryPoint.name}\n\n" +
                     "Environment variables needed:\n" +
                     "PYCHARM_PLUGIN_TRACE_ENABLED=1\n" +
+                    "PYCHARM_PLUGIN_SOCKET_TRACE=1\n" +
                     "CRAWL4AI_TRACE_DIR=$traceDir\n" +
-                    "PYTHONPATH=$pluginDir",
+                    "PYTHONPATH=$runtimeInjectorDir",
                     "$typeName Plugin Required"
                 )
                 return
@@ -388,40 +534,70 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
 
             // Set script path and environment using reflection
             try {
-                if (isBatchFile || isShellScript) {
-                    // Batch/Shell configuration uses different methods
-                    // Try to set script name/path
-                    try {
-                        val setScriptMethod = runConfig.javaClass.getMethod("setScriptName", String::class.java)
-                        setScriptMethod.invoke(runConfig, entryPoint.path)
-                    } catch (e: NoSuchMethodException) {
-                        // Try alternative method names
-                        val setPathMethod = runConfig.javaClass.getMethod("setScriptPath", String::class.java)
-                        setPathMethod.invoke(runConfig, entryPoint.path)
+                if (isScriptFile) {
+                    // For batch/shell/PowerShell files, configure to use enable_tracing wrapper
+                    val runtimeInjectorDir = "$pluginDir/runtime_injector"
+                    val wrapperScript = when {
+                        isBatchFile -> "$runtimeInjectorDir/enable_tracing.bat"
+                        isPowerShell -> "$runtimeInjectorDir/enable_tracing.ps1"
+                        else -> "$runtimeInjectorDir/enable_tracing.sh"
                     }
 
-                    // For batch files, we need to wrap with enable_tracing.bat
+                    // Try to set the wrapper script as the entry point with original script as argument
+                    try {
+                        val setScriptMethod = runConfig.javaClass.getMethod("setScriptName", String::class.java)
+                        setScriptMethod.invoke(runConfig, wrapperScript)
+
+                        // Set the original script as script parameters
+                        try {
+                            val setParamsMethod = runConfig.javaClass.getMethod("setScriptParameters", String::class.java)
+                            setParamsMethod.invoke(runConfig, entryPoint.path)
+                        } catch (e: NoSuchMethodException) {
+                            // Some versions use different method names
+                            println("[Plugin] Could not set script parameters: ${e.message}")
+                        }
+                    } catch (e: NoSuchMethodException) {
+                        // Fallback: Try alternative method names
+                        try {
+                            val setPathMethod = runConfig.javaClass.getMethod("setScriptPath", String::class.java)
+                            setPathMethod.invoke(runConfig, wrapperScript)
+                        } catch (e2: Exception) {
+                            println("[Plugin] Could not set script path: ${e2.message}")
+                        }
+                    }
+
+                    // Show helpful message about the wrapper setup
+                    val wrapperType = when {
+                        isBatchFile -> "Batch (.bat)"
+                        isPowerShell -> "PowerShell (.ps1)"
+                        else -> "Shell (.sh)"
+                    }
                     Messages.showInfoMessage(
                         project,
                         """
-                        Batch file detected: ${entryPoint.name}
+                        $wrapperType file detected: ${entryPoint.name}
 
-                        IMPORTANT: To enable tracing for .bat files, you need to:
+                        TrueFlow has configured a tracing wrapper:
 
-                        Option 1 (Recommended): Modify the run configuration
-                        1. Edit run configuration "$configName"
-                        2. Change Script path to: .pycharm_plugin\enable_tracing.bat
-                        3. Add Script parameters: ${entryPoint.path}
+                        Wrapper:    ${wrapperScript.replace(project.basePath ?: "", ".")}
+                        Target:     ${entryPoint.path.replace(project.basePath ?: "", ".")}
 
-                        Option 2: Run directly from command line
-                        .pycharm_plugin\enable_tracing.bat ${entryPoint.name}
+                        The run configuration uses enable_tracing wrapper which:
+                        - Sets up PYTHONPATH for sitecustomize.py
+                        - Enables socket tracing on port 5678
+                        - Creates trace output directory
 
-                        The batch configuration was created but needs manual adjustment.
+                        Run from command line (choose your shell):
+                          Batch:      .pycharm_plugin\runtime_injector\enable_tracing.bat ${entryPoint.name}
+                          PowerShell: .pycharm_plugin\runtime_injector\enable_tracing.ps1 ${entryPoint.name}
+                          Bash/Sh:    .pycharm_plugin/runtime_injector/enable_tracing.sh ${entryPoint.name}
                         """.trimIndent(),
-                        "Batch File Configuration"
+                        "$wrapperType Tracing Configuration"
                     )
                 } else {
                     // Python configuration
+                    val runtimeInjectorDir = "$pluginDir/runtime_injector"
+
                     val setScriptPathMethod = runConfig.javaClass.getMethod("setScriptName", String::class.java)
                     setScriptPathMethod.invoke(runConfig, entryPoint.path)
 
@@ -429,10 +605,14 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
                     setWorkingDirMethod.invoke(runConfig, project.basePath)
 
                     // Set environment variables (Python config)
+                    // PYTHONPATH must point to runtime_injector for sitecustomize.py to work
                     val envVars = mutableMapOf<String, String>()
                     envVars["PYCHARM_PLUGIN_TRACE_ENABLED"] = "1"
+                    envVars["PYCHARM_PLUGIN_SOCKET_TRACE"] = "1"
+                    envVars["PYCHARM_PLUGIN_TRACE_PORT"] = "5678"
+                    envVars["PYCHARM_PLUGIN_TRACE_HOST"] = "127.0.0.1"
                     envVars["CRAWL4AI_TRACE_DIR"] = traceDir
-                    envVars["PYTHONPATH"] = pluginDir
+                    envVars["PYTHONPATH"] = runtimeInjectorDir
 
                     if (modulesToTrace.isNotEmpty()) {
                         envVars["CRAWL4AI_TRACE_MODULES"] = modulesToTrace.joinToString(",")

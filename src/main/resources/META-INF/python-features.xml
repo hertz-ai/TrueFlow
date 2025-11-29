@@ -1,0 +1,28 @@
+<!--
+  Python-specific features for TrueFlow plugin.
+  This file is only loaded when the Python plugin is available.
+  Without Python support, core visualization features still work.
+-->
+<idea-plugin>
+    <!-- Python-specific extensions -->
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Python run configuration integration -->
+        <!-- Uncomment when implementing Python-specific run configs
+        <runConfigurationProducer
+                implementation="com.crawl4ai.learningviz.python.TrueFlowPythonConfigurationProducer"/>
+        -->
+    </extensions>
+
+    <!-- Python-specific actions -->
+    <actions>
+        <!-- Context menu for Python files -->
+        <action id="TrueFlow.TracePythonFile"
+                class="com.crawl4ai.learningviz.actions.TracePythonFileAction"
+                text="Trace with TrueFlow"
+                description="Run this Python file with TrueFlow tracing enabled"
+                icon="AllIcons.Actions.Execute">
+            <add-to-group group-id="RunContextPopupGroup" anchor="last"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

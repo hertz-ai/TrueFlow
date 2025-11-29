@@ -61,6 +61,8 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private val diagramPanel = JBPanel<JBPanel<*>>(BorderLayout())
     private val diagramTextArea = JTextArea()
     private val diagramTypeCombo = JComboBox(arrayOf("Mermaid", "PlantUML"))
+    private var mermaidPreviewPanel: MermaidPreviewPanel? = null
+    private var showMermaidPreview = true // Toggle between code and preview
 
     // Tab 2: Performance Metrics
     private val performancePanel = JBPanel<JBPanel<*>>(BorderLayout())
@@ -91,6 +93,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
     // Tab 9: Manim Animations (Real-time execution flow videos)
     private val manimVideoPanel = ManimVideoPanel(project)
+
+    // Tab 10: AI Explanation (Qwen3-VL powered local LLM)
+    private val aiExplanationPanel = AIExplanationPanel(project)
 
     // Manim Auto-Renderer (triggers rendering on new correlation IDs)
     private val manimAutoRenderer = ManimAutoRenderer(project) { videoFile ->
@@ -404,8 +409,18 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             updateDiagramDisplay()
         }
 
+        // Toggle preview/code button
+        val togglePreviewButton = JButton("Show Code")
+        togglePreviewButton.toolTipText = "Toggle between live preview and code view"
+        togglePreviewButton.addActionListener {
+            showMermaidPreview = !showMermaidPreview
+            togglePreviewButton.text = if (showMermaidPreview) "Show Code" else "Show Preview"
+            updateDiagramViewMode()
+        }
+        typePanel.add(togglePreviewButton)
+
         // Preview button - opens diagram in IntelliJ's renderer
-        val previewButton = JButton("Preview Diagram")
+        val previewButton = JButton("Open in Editor")
         previewButton.toolTipText = "Open diagram in IntelliJ's preview window"
         previewButton.addActionListener {
             previewDiagram()
@@ -428,17 +443,55 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
         topPanel.add(typePanel, BorderLayout.NORTH)
 
-        // Diagram display
+        // Create split pane with code on left and preview on right
+        val splitPane = javax.swing.JSplitPane(javax.swing.JSplitPane.HORIZONTAL_SPLIT)
+        splitPane.resizeWeight = 0.4 // 40% for code, 60% for preview
+
+        // Left side: Code view
         diagramTextArea.isEditable = false
         diagramTextArea.lineWrap = true
         diagramTextArea.wrapStyleWord = true
         diagramTextArea.font = java.awt.Font("Monospaced", java.awt.Font.PLAIN, 12)
+        val codeScrollPane = JBScrollPane(diagramTextArea)
+        codeScrollPane.minimumSize = java.awt.Dimension(200, 100)
 
-        val scrollPane = JBScrollPane(diagramTextArea)
-        topPanel.add(scrollPane, BorderLayout.CENTER)
+        // Right side: Mermaid preview (JCEF browser)
+        try {
+            mermaidPreviewPanel = MermaidPreviewPanel(project)
+            mermaidPreviewPanel!!.minimumSize = java.awt.Dimension(300, 100)
+            splitPane.leftComponent = codeScrollPane
+            splitPane.rightComponent = mermaidPreviewPanel
+            topPanel.add(splitPane, BorderLayout.CENTER)
+        } catch (e: Exception) {
+            // Fallback if JCEF not available
+            PluginLogger.warn("JCEF not available, using code-only view: ${e.message}")
+            topPanel.add(codeScrollPane, BorderLayout.CENTER)
+        }
 
         diagramPanel.add(topPanel, BorderLayout.CENTER)
         tabbedPane.addTab("Diagram", diagramPanel)
+    }
+
+    private fun updateDiagramViewMode() {
+        // Update visibility based on toggle state
+        val splitPane = diagramPanel.components
+            .filterIsInstance<JBPanel<*>>()
+            .firstOrNull()
+            ?.components
+            ?.filterIsInstance<javax.swing.JSplitPane>()
+            ?.firstOrNull()
+
+        if (splitPane != null) {
+            if (showMermaidPreview) {
+                // Show both code and preview
+                splitPane.leftComponent?.isVisible = true
+                splitPane.rightComponent?.isVisible = true
+                splitPane.dividerLocation = (splitPane.width * 0.4).toInt()
+            } else {
+                // Show only code (expand to full width)
+                splitPane.dividerLocation = splitPane.width
+            }
+        }
     }
 
     private fun createPerformanceTab() {
@@ -658,6 +711,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         tabbedPane.addTab("Live Metrics", liveMetricsPanel)
         tabbedPane.addTab("Distributed", distributedPanel)
         tabbedPane.addTab("Manim Videos", manimVideoPanel)
+        tabbedPane.addTab("AI Explain", aiExplanationPanel)
     }
 
     private fun expandAllTreeNodes(tree: JTree) {
@@ -1222,6 +1276,46 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
         // Update Flamegraph visualization
         updateFlamegraphFromSocketTrace()
+
+        // Update AI Explanation panel with trace data
+        updateAIExplanationPanel()
+    }
+
+    private fun updateAIExplanationPanel() {
+        // Build trace data JSON for AI explanation
+        val traceJson = com.google.gson.JsonObject()
+
+        // Add function calls
+        val callsArray = com.google.gson.JsonArray()
+        socketTraceCalls.entries.take(50).forEach { (funcKey, count) ->
+            val parts = funcKey.split(".")
+            val module = parts.dropLast(1).joinToString(".")
+            val function = parts.lastOrNull() ?: funcKey
+            val (file, line) = socketTraceFileLineMap[funcKey] ?: Pair("-", 0)
+
+            val callObj = com.google.gson.JsonObject()
+            callObj.addProperty("function", function)
+            callObj.addProperty("module", module)
+            callObj.addProperty("file", file)
+            callObj.addProperty("line", line)
+            callObj.addProperty("count", count)
+            callsArray.add(callObj)
+        }
+        traceJson.add("calls", callsArray)
+
+        // Add modules
+        val modulesArray = com.google.gson.JsonArray()
+        socketTraceParticipants.forEach { modulesArray.add(it) }
+        traceJson.add("modules", modulesArray)
+
+        // Add dead functions
+        val deadFunctions = socketAllDefinedFunctions.filter { it !in socketTraceCalls }
+        val deadArray = com.google.gson.JsonArray()
+        deadFunctions.take(20).forEach { deadArray.add(it) }
+        traceJson.add("dead_functions", deadArray)
+
+        // Pass to AI panel
+        aiExplanationPanel.setTraceData(traceJson)
     }
 
     private fun updatePerformanceFromSocketTrace(event: TraceEvent) {
@@ -1706,9 +1800,14 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         when (diagramTypeCombo.selectedItem) {
             "PlantUML" -> {
                 diagramTextArea.text = rawPlantUMLContent
+                // PlantUML preview not supported in JCEF, show message
+                mermaidPreviewPanel?.updateDiagram("sequenceDiagram\n    Note over User: PlantUML preview not available.\n    Note over User: Switch to Mermaid for live preview.")
             }
             "Mermaid" -> {
-                diagramTextArea.text = convertPlantUMLToMermaid(rawPlantUMLContent)
+                val mermaidCode = convertPlantUMLToMermaid(rawPlantUMLContent)
+                diagramTextArea.text = mermaidCode
+                // Update live Mermaid preview
+                mermaidPreviewPanel?.updateDiagram(mermaidCode)
             }
         }
     }
@@ -2441,6 +2540,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
         // Dispose ManimAutoRenderer
         manimAutoRenderer.dispose()
+
+        // Dispose AI Explanation panel (stops llama.cpp server if running)
+        aiExplanationPanel.dispose()
 
         PluginLogger.info("EnhancedLearningFlowToolWindow disposed")
     }

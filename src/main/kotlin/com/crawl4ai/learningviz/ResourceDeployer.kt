@@ -135,53 +135,109 @@ object ResourceDeployer {
 
     /**
      * Deploy runtime injector Python files to .pycharm_plugin/runtime_injector/
+     * Copies ALL files from bundled resources, not just a hardcoded list.
      */
     fun deployRuntimeInjector(project: Project) {
         val targetDir = PluginPaths.getRuntimeInjectorDir(project)
 
         PluginLogger.info("Deploying runtime injector files to: ${targetDir.absolutePath}")
 
-        val pythonFiles = listOf(
-            "__init__.py",
-            "python_runtime_instrumentor.py"
-        )
-
         var deployedCount = 0
         var failedCount = 0
 
-        for (fileName in pythonFiles) {
-            try {
-                val resourcePath = "/runtime_injector/$fileName"
-                val resourceStream: InputStream? = ResourceDeployer::class.java.getResourceAsStream(resourcePath)
+        try {
+            // Get resource URL for the runtime_injector directory
+            val resourceUrl = ResourceDeployer::class.java.getResource("/runtime_injector")
 
-                if (resourceStream != null) {
-                    val targetFile = File(targetDir, fileName)
+            if (resourceUrl != null) {
+                // Resources found in JAR - extract ALL Python files
+                PluginLogger.info("Extracting runtime injector from JAR resources")
 
-                    resourceStream.use { input ->
-                        targetFile.outputStream().use { output ->
-                            input.copyTo(output)
+                val jarFile = (resourceUrl.openConnection() as? java.net.JarURLConnection)?.jarFile
+
+                if (jarFile != null) {
+                    // Iterate through JAR entries
+                    val entries = jarFile.entries()
+                    while (entries.hasMoreElements()) {
+                        val entry = entries.nextElement()
+                        val entryName = entry.name
+
+                        // Process ALL files in runtime_injector (not just .py)
+                        if (entryName.startsWith("runtime_injector/") && !entry.isDirectory) {
+                            try {
+                                val relativePath = entryName.substringAfter("runtime_injector/")
+                                if (relativePath.isEmpty()) continue
+
+                                val targetFile = File(targetDir, relativePath)
+
+                                // Create parent directories
+                                targetFile.parentFile?.mkdirs()
+
+                                // Extract file
+                                jarFile.getInputStream(entry).use { input ->
+                                    targetFile.outputStream().use { output ->
+                                        input.copyTo(output)
+                                    }
+                                }
+
+                                deployedCount++
+                                PluginLogger.debug("Deployed: $relativePath")
+                            } catch (e: Exception) {
+                                PluginLogger.error("Failed to extract ${entry.name}: ${e.message}", e)
+                                failedCount++
+                            }
                         }
                     }
-
-                    deployedCount++
-                    PluginLogger.debug("Deployed: $fileName")
                 } else {
-                    // Fallback to source directory
-                    val sourceFile = File("${project.basePath}/pycharm-plugin/runtime_injector/$fileName")
-                    if (sourceFile.exists()) {
-                        val targetFile = File(targetDir, fileName)
-                        sourceFile.copyTo(targetFile, overwrite = true)
-                        deployedCount++
-                        PluginLogger.debug("Deployed from source: $fileName")
+                    // Not in JAR (development mode) - copy ALL files from filesystem
+                    PluginLogger.info("Development mode: copying ALL runtime_injector files from source directory")
+                    val sourceDir = File("${project.basePath}/pycharm-plugin/runtime_injector")
+
+                    if (sourceDir.exists() && sourceDir.isDirectory) {
+                        sourceDir.walk().filter { it.isFile }.forEach { sourceFile ->
+                            try {
+                                val relativePath = sourceFile.relativeTo(sourceDir).path
+                                val targetFile = File(targetDir, relativePath)
+                                targetFile.parentFile?.mkdirs()
+                                sourceFile.copyTo(targetFile, overwrite = true)
+                                deployedCount++
+                                PluginLogger.debug("Deployed from source: $relativePath")
+                            } catch (e: Exception) {
+                                PluginLogger.error("Failed to copy ${sourceFile.name}: ${e.message}", e)
+                                failedCount++
+                            }
+                        }
                     } else {
-                        PluginLogger.warn("Resource not found: $fileName")
+                        PluginLogger.error("Source directory not found: ${sourceDir.absolutePath}")
                         failedCount++
                     }
                 }
-            } catch (e: Exception) {
-                PluginLogger.error("Failed to deploy $fileName: ${e.message}", e)
-                failedCount++
+            } else {
+                // Fallback: try source directory
+                PluginLogger.warn("Resources not found in JAR, trying source directory")
+                val sourceDir = File("${project.basePath}/pycharm-plugin/runtime_injector")
+
+                if (sourceDir.exists() && sourceDir.isDirectory) {
+                    sourceDir.walk().filter { it.isFile }.forEach { sourceFile ->
+                        try {
+                            val relativePath = sourceFile.relativeTo(sourceDir).path
+                            val targetFile = File(targetDir, relativePath)
+                            targetFile.parentFile?.mkdirs()
+                            sourceFile.copyTo(targetFile, overwrite = true)
+                            deployedCount++
+                            PluginLogger.debug("Deployed from source: $relativePath")
+                        } catch (e: Exception) {
+                            PluginLogger.error("Failed to copy ${sourceFile.name}: ${e.message}", e)
+                            failedCount++
+                        }
+                    }
+                } else {
+                    PluginLogger.error("Neither JAR resources nor source directory found for runtime_injector")
+                }
             }
+        } catch (e: Exception) {
+            PluginLogger.error("Failed to deploy runtime injector: ${e.message}", e)
+            failedCount++
         }
 
         PluginLogger.info("Runtime injector deployment complete: $deployedCount deployed, $failedCount failed")

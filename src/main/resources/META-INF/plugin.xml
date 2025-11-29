@@ -63,8 +63,13 @@
     ]]></description>
 
     <!-- Product and plugin compatibility requirements -->
+    <!-- Core platform - works with all JetBrains IDEs -->
     <depends>com.intellij.modules.platform</depends>
-    <depends>com.intellij.modules.python</depends>
+
+    <!-- Python support - OPTIONAL for IntelliJ IDEA compatibility -->
+    <!-- When Python plugin is installed, we get enhanced Python features -->
+    <!-- Without it, we still work but with limited Python-specific features -->
+    <depends optional="true" config-file="python-features.xml">com.intellij.modules.python</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <!-- Tool Window -->
