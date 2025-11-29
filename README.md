@@ -1,4 +1,55 @@
 # TrueFlow
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  
+  <rect width="128" height="128" rx="14" fill="#08080C"/>
+  
+  <!-- Input nodes -->
+  <circle cx="16" cy="44" r="5" fill="#22C55E"/>
+  <circle cx="16" cy="64" r="6" fill="#22C55E"/>
+  <circle cx="16" cy="84" r="5" fill="#22C55E"/>
+  
+  <!-- Input flows -->
+  <g fill="none" stroke="#22C55E" stroke-width="2" stroke-linecap="round">
+    <path d="M 21 44 Q 32 44 38 54 Q 44 64 48 63"/>
+    <path d="M 22 64 L 48 64"/>
+    <path d="M 21 84 Q 32 84 38 74 Q 44 64 48 65"/>
+  </g>
+  
+  <!-- Dead code - dashed line with X -->
+  <path d="M 26 44 L 32 36" stroke="#EF4444" stroke-width="2" stroke-linecap="round" stroke-dasharray="3 2" opacity="0.6" fill="none"/>
+  <circle cx="36" cy="32" r="5" fill="#EF4444" opacity="0.7"/>
+  <line x1="34" y1="30" x2="38" y2="34" stroke="#08080C" stroke-width="2" stroke-linecap="round"/>
+  <line x1="38" y1="30" x2="34" y2="34" stroke="#08080C" stroke-width="2" stroke-linecap="round"/>
+  
+  <!-- Eye with white sclera -->
+  <path d="M 48 64 Q 56 52 64 52 Q 72 52 80 64 Q 72 76 64 76 Q 56 76 48 64 Z" 
+        fill="#FFFFFF"/>
+  <circle cx="64" cy="64" r="10" fill="#06B6D4"/>
+  <circle cx="64" cy="64" r="7" fill="#0891B2"/>
+  <circle cx="64" cy="64" r="4" fill="#08080C"/>
+  <circle cx="64" cy="64" r="1.5" fill="#22C55E"/>
+  <circle cx="61" cy="61" r="2" fill="#FFFFFF"/>
+  
+  <!-- Output flows -->
+  <path d="M 80 60 Q 88 54 94 44" fill="none" stroke="#22C55E" stroke-width="2" stroke-linecap="round"/>
+  <path d="M 80 64 L 96 64" fill="none" stroke="#F59E0B" stroke-width="2" stroke-linecap="round"/>
+  <path d="M 80 68 Q 88 74 94 84" fill="none" stroke="#A855F7" stroke-width="2" stroke-linecap="round"/>
+  
+  <!-- Outputs -->
+  <rect x="98" y="32" width="18" height="22" rx="3" fill="#22C55E"/>
+  <rect x="102" y="36" width="2" height="14" fill="#08080C"/>
+  <rect x="107" y="36" width="2" height="14" fill="#08080C"/>
+  
+  <rect x="96" y="52" width="22" height="24" rx="3" fill="#F59E0B"/>
+  <rect x="100" y="56" width="14" height="16" rx="2" fill="#08080C"/>
+  <polygon points="104,60 104,68 112,64" fill="#F59E0B"/>
+  
+  <rect x="98" y="78" width="18" height="22" rx="3" fill="#A855F7"/>
+  <rect x="102" y="82" width="10" height="2" fill="#08080C"/>
+  <rect x="102" y="86" width="8" height="2" fill="#08080C"/>
+  <rect x="102" y="90" width="10" height="2" fill="#08080C"/>
+  
+</svg>![trueflow-fixed-small](https://github.com/user-attachments/assets/78c4e766-27d7-4b1d-92e7-0f159bd2170c)
 
 **Deterministic Visualizations & Explanations for Blackbox Code**
 
@@ -113,8 +164,13 @@ Powered by Manim (the engine behind 3Blue1Brown), TrueFlow generates:
 
 ```bash
 python ultimate_architecture_viz.py --trace traces/session_001.json
-# Outputs: execution_flow.mp4
+
+
+
 ```
+# Outputs: execution_flow.mp4
+
+https://github.com/user-attachments/assets/e245296a-32f2-403b-9e13-b2c12e1e97bf
 
 *Finally understand that 500-line async task queue Claude generated.*
 
@@ -201,6 +257,7 @@ build_all.bat              # Windows
 ```
 
 10-tab interface. Real-time visualization. One-click project integration.
+<img width="1753" height="1182" alt="Screenshot 2025-11-29 214453" src="https://github.com/user-attachments/assets/a745a75f-9a64-4954-9aa0-b07c920bb066" />
 
 ---
 
@@ -215,6 +272,7 @@ npx vsce package
 # Install the extension
 code --install-extension trueflow-0.1.0.vsix
 ```
+<img width="2238" height="1168" alt="Screenshot 2025-11-29 214350" src="https://github.com/user-attachments/assets/5a6cf93d-e6ac-40fb-b3e1-5faad77615d6" />
 
 ---
 
