@@ -9,11 +9,21 @@ import time
 import tempfile
 import unittest
 from pathlib import Path
-import requests
+
+# Check if optional dependencies are available
+try:
+    import requests
+    import fastapi
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
+    requests = None  # Mock for type hints
 
 # Add runtime injector to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'runtime_injector'))
 
+
+@unittest.skipUnless(FASTAPI_AVAILABLE, "FastAPI and requests not installed - skipping real-world tests")
 class TestRealWorldAPIServer(unittest.TestCase):
     """
     Real-world test using the actual api_server.py
@@ -57,20 +67,23 @@ class TestRealWorldAPIServer(unittest.TestCase):
 
         # Create a test script that imports and uses the runtime instrumentor
         test_script = os.path.join(self.temp_dir, 'test_server.py')
+        # Use forward slashes for Windows compatibility in Python paths
+        temp_dir_safe = self.temp_dir.replace('\\', '/')
+        runtime_dir_safe = os.path.dirname(self.runtime_instrumentor_path).replace('\\', '/')
         with open(test_script, 'w') as f:
             f.write(f'''
 import sys
 import os
 
 # Set output directory for instrumentation
-os.environ['PYCHARM_PLUGIN_OUTPUT_DIR'] = r"{self.temp_dir}"
+os.environ['PYCHARM_PLUGIN_OUTPUT_DIR'] = "{temp_dir_safe}"
 
 # Import runtime instrumentor FIRST
-sys.path.insert(0, r"{os.path.dirname(self.runtime_instrumentor_path)}")
+sys.path.insert(0, "{runtime_dir_safe}")
 from python_runtime_instrumentor import RuntimeInstrumentor
 
 # Create instrumentor
-instrumentor = RuntimeInstrumentor(output_dir=r"{self.temp_dir}")
+instrumentor = RuntimeInstrumentor(output_dir="{temp_dir_safe}")
 
 # Import FastAPI (this will be traced)
 from fastapi import FastAPI
@@ -137,7 +150,7 @@ asyncio.run(simulate_requests())
 
 # Finalize instrumentation
 instrumentor.finalize()
-print(f"Instrumentation complete. Files in: {self.temp_dir}")
+print(f"Instrumentation complete. Files in: {temp_dir_safe}")
 ''')
 
         # Run the test script
