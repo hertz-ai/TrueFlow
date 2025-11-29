@@ -84,11 +84,13 @@ object PluginPaths {
     }
 
     /**
-     * Manim visualizer directory: .pycharm_plugin/manim_visualizer/
-     * Python Manim visualization scripts.
+     * @deprecated All visualizer files are now in runtime_injector.
+     * Use getRuntimeInjectorDir() instead.
      */
+    @Deprecated("Visualizer files are now in runtime_injector", ReplaceWith("getRuntimeInjectorDir(project)"))
     fun getManimVisualizerDir(project: Project): File {
-        return File(getPluginRoot(project), "manim_visualizer").also { it.mkdirs() }
+        // Redirect to runtime_injector for backwards compatibility
+        return getRuntimeInjectorDir(project)
     }
 
     /**
@@ -117,6 +119,7 @@ object PluginPaths {
 
     /**
      * Initialize all directories - call this during plugin startup.
+     * NOTE: All Python code (including visualizers) is in runtime_injector.
      */
     fun initializeAll(project: Project) {
         getPluginRoot(project)
@@ -128,6 +131,6 @@ object PluginPaths {
         getImagesDir(project)
         getTextsDir(project)
         getRuntimeInjectorDir(project)
-        getManimVisualizerDir(project)
+        // getManimVisualizerDir is deprecated - visualizer files are now in runtime_injector
     }
 }

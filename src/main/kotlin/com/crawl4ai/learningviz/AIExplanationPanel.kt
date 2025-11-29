@@ -1035,49 +1035,101 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private fun installLlamaCpp() {
         CompletableFuture.runAsync {
             try {
-                val pythonScript = """
-                    |import sys
-                    |sys.path.insert(0, '${getResourcePath()}')
-                    |from local_llm_server import LlamaCppServer
-                    |
-                    |server = LlamaCppServer()
-                    |def progress(msg, pct):
-                    |    print(f"PROGRESS:{pct:.0f}:{msg}")
-                    |    sys.stdout.flush()
-                    |
-                    |success = server.install_llama_cpp(progress)
-                    |print(f"RESULT:{'OK' if success else 'FAIL'}")
-                """.trimMargin()
+                // Run llama.cpp installation directly via shell commands (more reliable than Python import)
+                val installDir = File(System.getProperty("user.home"), ".trueflow/llama.cpp")
 
-                val process = ProcessBuilder(
-                    findPython(),
-                    "-c",
-                    pythonScript
+                SwingUtilities.invokeLater {
+                    statusLabel.text = "Installing llama.cpp (this may take several minutes)..."
+                    progressBar.isVisible = true
+                    progressBar.isIndeterminate = true
+                }
+
+                // Step 1: Clone llama.cpp repository
+                SwingUtilities.invokeLater { statusLabel.text = "Cloning llama.cpp repository..." }
+
+                if (installDir.exists()) {
+                    installDir.deleteRecursively()
+                }
+                installDir.parentFile.mkdirs()
+
+                val cloneProcess = ProcessBuilder(
+                    "git", "clone", "--depth", "1",
+                    "https://github.com/ggml-org/llama.cpp",
+                    installDir.absolutePath
                 ).redirectErrorStream(true).start()
 
-                BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-                    var line: String?
-                    while (reader.readLine().also { line = it } != null) {
-                        val text = line ?: continue
-                        if (text.startsWith("PROGRESS:")) {
-                            val msg = text.removePrefix("PROGRESS:").split(":", limit = 2).getOrElse(1) { "" }
-                            SwingUtilities.invokeLater { statusLabel.text = msg }
-                        } else if (text.startsWith("RESULT:")) {
-                            val success = text.contains("OK")
-                            SwingUtilities.invokeLater {
-                                if (success) {
-                                    startServerButton.isEnabled = true
-                                    statusLabel.text = "llama.cpp installed. Click 'Start AI Server'."
-                                } else {
-                                    statusLabel.text = "llama.cpp installation failed"
-                                }
-                            }
-                        }
+                val cloneOutput = BufferedReader(InputStreamReader(cloneProcess.inputStream)).readText()
+                val cloneExitCode = cloneProcess.waitFor()
+
+                if (cloneExitCode != 0) {
+                    PluginLogger.warn("Git clone failed: $cloneOutput")
+                    SwingUtilities.invokeLater {
+                        statusLabel.text = "Failed to clone llama.cpp. Is git installed?"
+                        progressBar.isVisible = false
                     }
+                    return@runAsync
                 }
-                process.waitFor()
+
+                // Step 2: Create build directory and run CMake
+                SwingUtilities.invokeLater { statusLabel.text = "Configuring build (CMake)..." }
+
+                val buildDir = File(installDir, "build")
+                buildDir.mkdirs()
+
+                val cmakeProcess = ProcessBuilder(
+                    "cmake", "..",
+                    "-DBUILD_SHARED_LIBS=OFF",
+                    "-DGGML_CUDA=OFF",
+                    "-DLLAMA_CURL=OFF",
+                    "-DLLAMA_BUILD_SERVER=ON"  // Required to build llama-server executable
+                ).directory(buildDir).redirectErrorStream(true).start()
+
+                val cmakeOutput = BufferedReader(InputStreamReader(cmakeProcess.inputStream)).readText()
+                val cmakeExitCode = cmakeProcess.waitFor()
+
+                if (cmakeExitCode != 0) {
+                    PluginLogger.warn("CMake failed: $cmakeOutput")
+                    SwingUtilities.invokeLater {
+                        statusLabel.text = "CMake failed. Is CMake installed?"
+                        progressBar.isVisible = false
+                    }
+                    return@runAsync
+                }
+
+                // Step 3: Build
+                SwingUtilities.invokeLater { statusLabel.text = "Building llama.cpp (this takes a few minutes)..." }
+
+                val buildProcess = ProcessBuilder(
+                    "cmake", "--build", ".", "--config", "Release", "-j"
+                ).directory(buildDir).redirectErrorStream(true).start()
+
+                val buildOutput = BufferedReader(InputStreamReader(buildProcess.inputStream)).readText()
+                val buildExitCode = buildProcess.waitFor()
+
+                if (buildExitCode != 0) {
+                    PluginLogger.warn("Build failed: $buildOutput")
+                    SwingUtilities.invokeLater {
+                        statusLabel.text = "Build failed. Check CMake and compiler."
+                        progressBar.isVisible = false
+                    }
+                    return@runAsync
+                }
+
+                // Success!
+                SwingUtilities.invokeLater {
+                    progressBar.isVisible = false
+                    progressBar.isIndeterminate = false
+                    startServerButton.isEnabled = true
+                    statusLabel.text = "llama.cpp installed successfully! Click 'Start AI Server'."
+                    PluginLogger.info("llama.cpp installed to: ${installDir.absolutePath}")
+                }
+
             } catch (e: Exception) {
-                SwingUtilities.invokeLater { statusLabel.text = "Installation error: ${e.message}" }
+                PluginLogger.warn("Installation error: ${e.message}")
+                SwingUtilities.invokeLater {
+                    statusLabel.text = "Installation error: ${e.message}"
+                    progressBar.isVisible = false
+                }
             }
         }
     }
@@ -1093,10 +1145,16 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     private fun findLlamaServer(): String? {
+        val home = System.getProperty("user.home")
         val possiblePaths = listOf(
-            System.getProperty("user.home") + "/.trueflow/llama.cpp/build/bin/llama-server",
-            System.getProperty("user.home") + "/.trueflow/llama.cpp/build/bin/llama-server.exe",
+            // Windows MSVC build output (Release config goes to bin/Release/)
+            "$home/.trueflow/llama.cpp/build/bin/Release/llama-server.exe",
+            // Linux/macOS build output
+            "$home/.trueflow/llama.cpp/build/bin/llama-server",
+            // Fallback paths
+            "$home/.trueflow/llama.cpp/build/bin/llama-server.exe",
             "/usr/local/bin/llama-server",
+            "C:/llama.cpp/build/bin/Release/llama-server.exe",
             "C:/llama.cpp/build/bin/llama-server.exe"
         )
         for (path in possiblePaths) {

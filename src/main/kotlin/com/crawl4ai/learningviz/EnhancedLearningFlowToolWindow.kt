@@ -442,6 +442,16 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         }
         typePanel.add(copyButton)
 
+        // Show Dead Call Trees checkbox - toggles display of AST-based dead code
+        val deadCallTreesCheckbox = javax.swing.JCheckBox("Show Dead Call Trees")
+        deadCallTreesCheckbox.toolTipText = "Show functions that were never called (from static AST analysis)"
+        deadCallTreesCheckbox.isSelected = showDeadCallTrees
+        deadCallTreesCheckbox.addActionListener {
+            showDeadCallTrees = deadCallTreesCheckbox.isSelected
+            updateDiagramDisplay()
+        }
+        typePanel.add(deadCallTreesCheckbox)
+
         topPanel.add(typePanel, BorderLayout.NORTH)
 
         // Create split pane with code on left and preview on right
@@ -1186,13 +1196,27 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         // Update diagram view with recent traces (last 100 lines from circular buffer)
         val recentLines = socketTraceBuffer.getRecent(100)
 
-        // Collect dead functions (defined but never called)
-        val deadFunctions = socketAllDefinedFunctions.filter { it !in socketTraceCalls }
+        // Collect ACTIVE participants only - modules that have at least one call in socketTraceCalls
+        val activeParticipants = socketTraceCalls.keys
+            .map { funcKey ->
+                val parts = funcKey.split(".")
+                parts.dropLast(1).lastOrNull() ?: "__main__"
+            }
+            .toSet()
+
+        // Collect dead functions (defined but never called) - only if toggle is enabled
+        val deadFunctions = if (showDeadCallTrees) {
+            socketAllDefinedFunctions.filter { it !in socketTraceCalls }
+        } else {
+            emptyList()
+        }
         val deadParticipants = mutableSetOf<String>()
-        deadFunctions.forEach { funcKey ->
-            val parts = funcKey.split(".")
-            val module = parts.dropLast(1).lastOrNull() ?: "__main__"
-            deadParticipants.add(module)
+        if (showDeadCallTrees) {
+            deadFunctions.forEach { funcKey ->
+                val parts = funcKey.split(".")
+                val module = parts.dropLast(1).lastOrNull() ?: "__main__"
+                deadParticipants.add(module)
+            }
         }
 
         // Build PlantUML diagram with proper participant declarations and dead code coloring
@@ -1209,16 +1233,18 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             appendLine("}")
             appendLine()
 
-            // Add participant declarations - LIVE participants (green background)
-            socketTraceParticipants.forEach { participant ->
+            // Add participant declarations - ONLY ACTIVE participants with actual calls (green background)
+            activeParticipants.forEach { participant ->
                 val safe = escapePlantUML(participant)
                 appendLine("participant \"$safe\" as $safe #90EE90")
             }
 
-            // Add DEAD-only participants (red background) - modules with only dead code
-            deadParticipants.filter { it !in socketTraceParticipants }.forEach { participant ->
-                val safe = escapePlantUML(participant)
-                appendLine("participant \"$safe\" as $safe #FFCCCC")
+            // Add DEAD-only participants (red background) - only if showDeadCallTrees is enabled
+            if (showDeadCallTrees) {
+                deadParticipants.filter { it !in activeParticipants }.forEach { participant ->
+                    val safe = escapePlantUML(participant)
+                    appendLine("participant \"$safe\" as $safe #FFCCCC")
+                }
             }
             appendLine()
 
@@ -1232,11 +1258,11 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
                 }
             }
 
-            // Add dead code section (red arrows, different styling)
-            if (deadFunctions.isNotEmpty()) {
+            // Add dead code section (red arrows) - only if showDeadCallTrees is enabled
+            if (showDeadCallTrees && deadFunctions.isNotEmpty()) {
                 appendLine()
                 appendLine("' === DEAD CODE (Red - Never Called) ===")
-                appendLine("note over ${socketTraceParticipants.firstOrNull() ?: deadParticipants.firstOrNull() ?: "Unknown"}: Dead Code Section")
+                appendLine("note over ${activeParticipants.firstOrNull() ?: deadParticipants.firstOrNull() ?: "Unknown"}: Dead Code Section")
 
                 // Show up to 30 dead functions
                 deadFunctions.take(30).forEach { funcKey ->
@@ -1249,7 +1275,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
                 }
 
                 if (deadFunctions.size > 30) {
-                    appendLine("note over ${socketTraceParticipants.firstOrNull() ?: deadParticipants.firstOrNull() ?: "Unknown"}: ... and ${deadFunctions.size - 30} more dead functions")
+                    appendLine("note over ${activeParticipants.firstOrNull() ?: deadParticipants.firstOrNull() ?: "Unknown"}: ... and ${deadFunctions.size - 30} more dead functions")
                 }
             }
 
@@ -1801,6 +1827,15 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
     private fun updateDiagramDisplay() {
         if (rawPlantUMLContent.isEmpty()) {
+            // Show a helpful message when no data is available
+            val noDataMessage = """
+                |sequenceDiagram
+                |    Note over System: No trace data available yet.
+                |    Note over System: Start a traced Python process to see the diagram.
+                |    Note over System: Use 'Show Dead Call Trees' checkbox to include AST-based dead code.
+            """.trimMargin()
+            diagramTextArea.text = noDataMessage
+            mermaidPreviewPanel?.updateDiagram(noDataMessage)
             return
         }
 

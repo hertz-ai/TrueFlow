@@ -68,3 +68,4 @@ Thumbs.db
 .env
 *.pem
 *.key
+/.pycharm_plugin/

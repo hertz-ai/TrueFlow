@@ -482,16 +482,26 @@ Be concise and technical. When analyzing images, describe what you see and relat
             return;
         }
 
-        const llamaServer = this.findLlamaServer();
+        let llamaServer = this.findLlamaServer();
         if (!llamaServer) {
             const install = await vscode.window.showErrorMessage(
-                'llama.cpp not found. Would you like to see installation instructions?',
-                'Yes', 'No'
+                'llama.cpp not found. Would you like to install it automatically?',
+                'Install', 'Manual Instructions', 'Cancel'
             );
-            if (install === 'Yes') {
+            if (install === 'Install') {
+                const success = await this.installLlamaCpp();
+                if (success) {
+                    llamaServer = this.findLlamaServer();
+                }
+                if (!llamaServer) {
+                    return;
+                }
+            } else if (install === 'Manual Instructions') {
                 vscode.env.openExternal(vscode.Uri.parse('https://github.com/ggerganov/llama.cpp#build'));
+                return;
+            } else {
+                return;
             }
-            return;
         }
 
         this.postMessage({ command: 'serverStarting' });
@@ -587,6 +597,91 @@ Be concise and technical. When analyzing images, describe what you see and relat
         } catch {
             return null;
         }
+    }
+
+    public async installLlamaCpp(): Promise<boolean> {
+        const homeDir = this.getHomeDir();
+        const installDir = path.join(homeDir, '.trueflow', 'llama.cpp');
+
+        return vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: 'Installing llama.cpp',
+            cancellable: false
+        }, async (progress) => {
+            try {
+                // Step 1: Clone llama.cpp repository
+                progress.report({ message: 'Cloning llama.cpp repository...' });
+
+                // Remove existing directory if present
+                if (fs.existsSync(installDir)) {
+                    fs.rmSync(installDir, { recursive: true, force: true });
+                }
+                fs.mkdirSync(path.dirname(installDir), { recursive: true });
+
+                const cloneResult = child_process.spawnSync('git', [
+                    'clone', '--depth', '1',
+                    'https://github.com/ggml-org/llama.cpp',
+                    installDir
+                ], { encoding: 'utf-8', timeout: 300000 });
+
+                if (cloneResult.status !== 0) {
+                    vscode.window.showErrorMessage(`Failed to clone llama.cpp: ${cloneResult.stderr}`);
+                    return false;
+                }
+
+                // Step 2: Configure with CMake
+                progress.report({ message: 'Configuring build with CMake...' });
+
+                const buildDir = path.join(installDir, 'build');
+                fs.mkdirSync(buildDir, { recursive: true });
+
+                const cmakeArgs = ['-B', buildDir, '-S', installDir, '-DCMAKE_BUILD_TYPE=Release'];
+                if (process.platform === 'win32') {
+                    cmakeArgs.push('-G', 'Visual Studio 17 2022', '-A', 'x64');
+                }
+
+                const configResult = child_process.spawnSync('cmake', cmakeArgs, {
+                    encoding: 'utf-8',
+                    timeout: 300000,
+                    cwd: installDir
+                });
+
+                if (configResult.status !== 0) {
+                    vscode.window.showErrorMessage(`CMake configure failed: ${configResult.stderr}`);
+                    return false;
+                }
+
+                // Step 3: Build with CMake
+                progress.report({ message: 'Building llama.cpp (this may take several minutes)...' });
+
+                const cpuCount = require('os').cpus().length;
+                const buildResult = child_process.spawnSync('cmake', [
+                    '--build', buildDir,
+                    '--config', 'Release',
+                    '--parallel', String(cpuCount),
+                    '--target', 'llama-server'
+                ], { encoding: 'utf-8', timeout: 600000, cwd: installDir });
+
+                if (buildResult.status !== 0) {
+                    vscode.window.showErrorMessage(`Build failed: ${buildResult.stderr}`);
+                    return false;
+                }
+
+                // Verify installation
+                const serverPath = this.findLlamaServer();
+                if (serverPath) {
+                    vscode.window.showInformationMessage(`llama.cpp installed successfully at ${serverPath}`);
+                    return true;
+                } else {
+                    vscode.window.showErrorMessage('Build completed but llama-server not found');
+                    return false;
+                }
+
+            } catch (error: any) {
+                vscode.window.showErrorMessage(`Installation failed: ${error.message}`);
+                return false;
+            }
+        });
     }
 
     private getHomeDir(): string {

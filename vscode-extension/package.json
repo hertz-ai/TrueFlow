@@ -104,16 +104,8 @@
       "trueflow-sidebar": [
         {
           "type": "webview",
-          "id": "trueflow.traceViewer",
-          "name": "Trace Viewer"
-        },
-        {
-          "id": "trueflow.performanceMetrics",
-          "name": "Performance Metrics"
-        },
-        {
-          "id": "trueflow.deadCode",
-          "name": "Dead Code"
+          "id": "trueflow.mainView",
+          "name": "TrueFlow"
         }
       ]
     },

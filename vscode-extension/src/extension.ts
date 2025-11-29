@@ -78,6 +78,35 @@ let traceSocketClient: TraceSocketClient | undefined;
 let statusBarItem: vscode.StatusBarItem;
 let sidebarProvider: TrueFlowSidebarProvider | undefined;
 
+// Global trace filter state (applies to all tabs)
+interface TraceFilter {
+    includeModules: string[];  // Modules to include (empty = all)
+    excludeModules: string[];  // Modules to exclude
+    minDepth: number;          // Minimum call depth to show
+    maxDepth: number;          // Maximum call depth to show (0 = unlimited)
+}
+
+let traceFilter: TraceFilter = {
+    includeModules: [],
+    excludeModules: ['logging', 'asyncio', 'concurrent', 'socket', 'threading', '_frozen_importlib'],
+    minDepth: 0,
+    maxDepth: 0
+};
+
+function getFilterStats(): string {
+    const parts: string[] = [];
+    if (traceFilter.includeModules.length > 0) {
+        parts.push(`+${traceFilter.includeModules.length} inc`);
+    }
+    if (traceFilter.excludeModules.length > 0) {
+        parts.push(`-${traceFilter.excludeModules.length} exc`);
+    }
+    if (traceFilter.maxDepth > 0) {
+        parts.push(`depth<=${traceFilter.maxDepth}`);
+    }
+    return parts.length > 0 ? parts.join(', ') : 'None';
+}
+
 /**
  * WebviewViewProvider for the TrueFlow sidebar
  * Shows the full tabbed interface in the activity bar
@@ -122,6 +151,9 @@ class TrueFlowSidebarProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'openAIChat':
                     AIExplanationProvider.getInstance().show(this._extensionContext);
+                    break;
+                case 'manageFilters':
+                    showFilterManagementDialog();
                     break;
                 case 'info':
                     vscode.window.showInformationMessage(message.message);
@@ -243,7 +275,90 @@ async function connectToSocket(): Promise<void> {
 
 function disconnectSocket(): void {
     traceSocketClient?.disconnect();
-    vscode.window.showInformationMessage('Disconnected from trace server');
+    vscode.window.showInformationMessage('Detached from trace server');
+}
+
+async function showFilterManagementDialog(): Promise<void> {
+    // Show a multi-step quick pick dialog for filter management
+    const filterAction = await vscode.window.showQuickPick([
+        { label: '$(add) Add Module to Include', description: 'Only trace these modules', value: 'addInclude' },
+        { label: '$(dash) Add Module to Exclude', description: 'Never trace these modules', value: 'addExclude' },
+        { label: '$(list-flat) Clear Include List', description: 'Remove all include filters', value: 'clearInclude' },
+        { label: '$(list-flat) Clear Exclude List', description: 'Remove all exclude filters', value: 'clearExclude' },
+        { label: '$(layers) Set Max Depth', description: `Current: ${traceFilter.maxDepth || 'unlimited'}`, value: 'setDepth' },
+        { label: '$(info) Show Current Filters', description: 'View all active filters', value: 'show' }
+    ], {
+        placeHolder: 'Manage Trace Filters (applies to all tabs)'
+    });
+
+    if (!filterAction) return;
+
+    switch (filterAction.value) {
+        case 'addInclude': {
+            const module = await vscode.window.showInputBox({
+                prompt: 'Enter module name to include (e.g., myapp, myapp.models)',
+                placeHolder: 'module.name'
+            });
+            if (module) {
+                traceFilter.includeModules.push(module);
+                vscode.window.showInformationMessage(`Added '${module}' to include list`);
+                updateFilterStats();
+            }
+            break;
+        }
+        case 'addExclude': {
+            const module = await vscode.window.showInputBox({
+                prompt: 'Enter module name to exclude (e.g., logging, asyncio)',
+                placeHolder: 'module.name'
+            });
+            if (module) {
+                traceFilter.excludeModules.push(module);
+                vscode.window.showInformationMessage(`Added '${module}' to exclude list`);
+                updateFilterStats();
+            }
+            break;
+        }
+        case 'clearInclude':
+            traceFilter.includeModules = [];
+            vscode.window.showInformationMessage('Cleared include list - now tracing all modules');
+            updateFilterStats();
+            break;
+        case 'clearExclude':
+            traceFilter.excludeModules = [];
+            vscode.window.showInformationMessage('Cleared exclude list - now tracing all modules');
+            updateFilterStats();
+            break;
+        case 'setDepth': {
+            const depthStr = await vscode.window.showInputBox({
+                prompt: 'Enter maximum call depth (0 = unlimited)',
+                value: String(traceFilter.maxDepth),
+                validateInput: (v) => isNaN(parseInt(v)) ? 'Must be a number' : null
+            });
+            if (depthStr !== undefined) {
+                traceFilter.maxDepth = parseInt(depthStr);
+                vscode.window.showInformationMessage(`Set max depth to ${traceFilter.maxDepth || 'unlimited'}`);
+                updateFilterStats();
+            }
+            break;
+        }
+        case 'show': {
+            const message = [
+                `Include modules: ${traceFilter.includeModules.length > 0 ? traceFilter.includeModules.join(', ') : '(all)'}`,
+                `Exclude modules: ${traceFilter.excludeModules.join(', ') || '(none)'}`,
+                `Max depth: ${traceFilter.maxDepth || 'unlimited'}`
+            ].join('\n');
+            vscode.window.showInformationMessage(message, { modal: true });
+            break;
+        }
+    }
+}
+
+function updateFilterStats(): void {
+    const stats = getFilterStats();
+    // Update sidebar
+    sidebarProvider?.postMessage({ type: 'updateFilters', stats });
+    // Update trace viewer if open
+    traceViewerPanel?.webview.postMessage({ type: 'updateFilters', stats });
 }
 
 async function autoIntegrateProject(context: vscode.ExtensionContext): Promise<void> {
@@ -544,6 +659,9 @@ function showTraceViewer(context: vscode.ExtensionContext): void {
         switch (message.type) {
             case 'connect':
                 await connectToSocket();
+                break;
+            case 'manageFilters':
+                await showFilterManagementDialog();
                 break;
             case 'refresh':
                 if (traceSocketClient) {
@@ -876,12 +994,16 @@ function getSidebarHtml(isConnected: boolean): string {
         <div class="status-row">
             <span class="status-label">Connection</span>
             <span id="connection-status" class="status-badge ${isConnected ? 'status-connected' : 'status-disconnected'}">
-                ${isConnected ? 'Connected' : 'Disconnected'}
+                ${isConnected ? 'Attached' : 'Detached'}
             </span>
         </div>
         <div class="status-row">
             <span class="status-label">Events</span>
             <span id="event-count" class="metric-value">0</span>
+        </div>
+        <div class="status-row">
+            <span class="status-label">Filters</span>
+            <span id="filter-stats" class="metric-value" style="font-size: 11px; color: var(--vscode-charts-green);">None</span>
         </div>
     </div>
 
@@ -896,19 +1018,19 @@ function getSidebarHtml(isConnected: boolean): string {
         </div>
     </div>
 
-    <div class="section-title">Quick Actions</div>
+    <div class="section-title">Session Actions</div>
     <div class="action-buttons">
         <button class="action-btn primary" onclick="action('autoIntegrate')">
             <span class="icon">⚡</span>
             <span>Auto-Integrate Project</span>
         </button>
-        <button class="action-btn" onclick="action('${isConnected ? 'disconnect' : 'connect'}')">
+        <button id="attach-btn" class="action-btn" onclick="action('${isConnected ? 'disconnect' : 'connect'}')">
             <span class="icon">${isConnected ? '🔴' : '🟢'}</span>
-            <span>${isConnected ? 'Disconnect' : 'Connect to Server'}</span>
+            <span>${isConnected ? 'Detach from Server' : 'Attach to Server'}</span>
         </button>
-        <button class="action-btn" onclick="action('openFullView')">
-            <span class="icon">📊</span>
-            <span>Open Full Trace Viewer</span>
+        <button class="action-btn" onclick="action('manageFilters')">
+            <span class="icon">🔧</span>
+            <span>Manage Filters</span>
         </button>
         <button class="action-btn" onclick="action('generateVideo')">
             <span class="icon">🎬</span>
@@ -953,12 +1075,19 @@ function getSidebarHtml(isConnected: boolean): string {
                     document.getElementById('stat-depth').textContent = message.depth || 0;
                     break;
                 case 'socketConnected':
-                    document.getElementById('connection-status').textContent = 'Connected';
+                    document.getElementById('connection-status').textContent = 'Attached';
                     document.getElementById('connection-status').className = 'status-badge status-connected';
+                    document.getElementById('attach-btn').innerHTML = '<span class="icon">🔴</span><span>Detach from Server</span>';
+                    document.getElementById('attach-btn').onclick = function() { action('disconnect'); };
                     break;
                 case 'socketDisconnected':
-                    document.getElementById('connection-status').textContent = 'Disconnected';
+                    document.getElementById('connection-status').textContent = 'Detached';
                     document.getElementById('connection-status').className = 'status-badge status-disconnected';
+                    document.getElementById('attach-btn').innerHTML = '<span class="icon">🟢</span><span>Attach to Server</span>';
+                    document.getElementById('attach-btn').onclick = function() { action('connect'); };
+                    break;
+                case 'updateFilters':
+                    document.getElementById('filter-stats').textContent = message.stats || 'None';
                     break;
             }
         });
@@ -1260,12 +1389,14 @@ function getTraceViewerHtml(): string {
         <div class="header-title">
             <span>TrueFlow</span>
             <span id="connection-status" class="status-badge ${isConnected ? 'status-connected' : 'status-disconnected'}">
-                ${isConnected ? 'Connected' : 'Disconnected'}
+                ${isConnected ? 'Attached' : 'Detached'}
             </span>
             <span id="event-counter" class="event-counter"></span>
+            <span id="filter-stats" style="font-size: 11px; color: var(--vscode-charts-green); margin-left: 10px;">Filters: ${getFilterStats()}</span>
         </div>
         <div class="header-actions">
-            <button onclick="connectSocket()">Connect</button>
+            <button onclick="connectSocket()">${isConnected ? 'Detach' : 'Attach'}</button>
+            <button onclick="manageFilters()">Manage Filters</button>
             <button onclick="refreshData()">Refresh</button>
         </div>
     </div>
@@ -1289,6 +1420,10 @@ function getTraceViewerHtml(): string {
                 <option value="mermaid" selected>Mermaid</option>
                 <option value="plantuml">PlantUML</option>
             </select>
+            <label style="display: flex; align-items: center; gap: 4px; margin-left: 10px;">
+                <input type="checkbox" id="show-dead-call-trees" onchange="toggleDeadCallTrees()">
+                <span style="font-size: 11px;">Show Dead Call Trees</span>
+            </label>
             <button onclick="renderDiagram()">Render</button>
             <button onclick="copyDiagram()">Copy</button>
             <span id="diagram-status"></span>
@@ -1451,6 +1586,9 @@ function getTraceViewerHtml(): string {
         let eventsPerSecond = 0;
         let performanceData = [];
         let callTrace = [];
+        let showDeadCallTrees = false;
+        let activeParticipants = new Set();  // Modules that have at least one call
+        let allDefinedFunctions = new Set(); // All functions from static analysis (AST)
 
         // Initialize Mermaid
         mermaid.initialize({
@@ -1523,8 +1661,80 @@ function getTraceViewerHtml(): string {
             vscode.postMessage({ type: 'info', message: 'Diagram code copied!' });
         }
 
+        function toggleDeadCallTrees() {
+            showDeadCallTrees = document.getElementById('show-dead-call-trees').checked;
+            updateDiagramFromTrace();
+        }
+
+        // Generate diagram showing only active participants (with at least one call)
+        // and optionally dead call trees from AST analysis
+        function updateDiagramFromTrace() {
+            if (callTrace.length === 0) {
+                const noDataMessage = showDeadCallTrees
+                    ? 'sequenceDiagram\\n    Note over System: No trace data yet.\\n    Note over System: Dead call trees will show AST-based uncalled functions.\\n    Note over System: Start a traced process to see live data.'
+                    : 'sequenceDiagram\\n    Note over System: No trace data yet.\\n    Note over System: Start a traced Python process to see the diagram.\\n    Note over System: Enable Show Dead Call Trees for static analysis.';
+                document.getElementById('diagram-code').value = noDataMessage;
+                renderDiagram();
+                return;
+            }
+
+            // Build participants only from modules that have actual calls
+            const activeModules = new Set();
+            const calls = [];
+
+            for (const event of callTrace) {
+                if (event.type === 'call') {
+                    const module = event.module || '__main__';
+                    activeModules.add(module);
+                    calls.push(event);
+                }
+            }
+
+            // Build the Mermaid sequence diagram
+            let diagram = 'sequenceDiagram\\n';
+
+            // Add only ACTIVE participants (modules with at least one call)
+            for (const module of activeModules) {
+                const safeName = module.replace(/[^a-zA-Z0-9_]/g, '_');
+                diagram += '    participant ' + safeName + ' as ' + module + '\\n';
+            }
+
+            // Add calls between participants
+            let prevModule = null;
+            for (const event of calls.slice(-30)) { // Last 30 calls
+                const module = (event.module || '__main__').replace(/[^a-zA-Z0-9_]/g, '_');
+                const func = event.function || 'unknown';
+
+                if (prevModule && prevModule !== module) {
+                    diagram += '    ' + prevModule + '->>' + module + ': ' + func + '()\\n';
+                } else if (prevModule === module) {
+                    diagram += '    ' + module + '->>+' + module + ': ' + func + '()\\n';
+                    diagram += '    ' + module + '-->>-' + module + ': return\\n';
+                }
+                prevModule = module;
+            }
+
+            // If showDeadCallTrees is enabled, add note about dead code
+            if (showDeadCallTrees && allDefinedFunctions.size > 0) {
+                const deadFunctions = [...allDefinedFunctions].filter(f => !activeParticipants.has(f));
+                if (deadFunctions.length > 0) {
+                    diagram += '    Note over System: Dead functions (never called):\\n';
+                    for (const func of deadFunctions.slice(0, 10)) {
+                        diagram += '    Note over System: - ' + func + '\\n';
+                    }
+                }
+            }
+
+            document.getElementById('diagram-code').value = diagram;
+            renderDiagram();
+        }
+
         function connectSocket() {
             vscode.postMessage({ type: 'connect' });
+        }
+
+        function manageFilters() {
+            vscode.postMessage({ type: 'manageFilters' });
         }
 
         function refreshData() {
@@ -1631,13 +1841,17 @@ function getTraceViewerHtml(): string {
 
             switch (message.type) {
                 case 'socketConnected':
-                    document.getElementById('connection-status').textContent = 'Connected';
+                    document.getElementById('connection-status').textContent = 'Attached';
                     document.getElementById('connection-status').className = 'status-badge status-connected';
                     break;
 
                 case 'socketDisconnected':
-                    document.getElementById('connection-status').textContent = 'Disconnected';
+                    document.getElementById('connection-status').textContent = 'Detached';
                     document.getElementById('connection-status').className = 'status-badge status-disconnected';
+                    break;
+
+                case 'updateFilters':
+                    document.getElementById('filter-stats').textContent = 'Filters: ' + (message.stats || 'None');
                     break;
 
                 case 'traceEvent':
@@ -1653,10 +1867,20 @@ function getTraceViewerHtml(): string {
                     lastEventTime = now;
                     document.getElementById('metric-rate').textContent = eventsPerSecond;
 
+                    // Track active participants (modules with calls)
+                    if (message.event.type === 'call' && message.event.module) {
+                        activeParticipants.add(message.event.module + '.' + message.event.function);
+                    }
+
                     // Add to call trace
                     callTrace.push(message.event);
                     if (callTrace.length > 1000) callTrace.shift();
                     updateCallTrace(callTrace);
+
+                    // Update diagram with active participants only (throttled)
+                    if (eventCount % 10 === 0) {
+                        updateDiagramFromTrace();
+                    }
                     break;
 
                 case 'updatePerformance':
