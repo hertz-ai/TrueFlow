@@ -1,15 +1,68 @@
-# TrueFlow VS Code Extension
+# TrueFlow - Deterministic Code Visualizer
 
-> Deterministic Code Visualizer & Explainer for VS Code
+Unblackbox your code with deterministic truth. Zero-code Python runtime instrumentation with 3D animated execution videos.
 
 ## Features
 
-- **Zero-Code Instrumentation** - Auto-integrate tracing into any Python project
-- **Real-Time Trace Viewer** - Watch execution flow as your code runs
-- **3D Manim Videos** - Generate animated execution visualizations
-- **Multi-Format Export** - PlantUML, Mermaid, D2, JSON, Markdown
+- **Zero-Code Instrumentation**: Automatically trace Python code execution without modifying source files
+- **Real-Time Trace Viewer**: Watch function calls and execution flow in real-time via WebSocket streaming
+- **3D Manim Visualizations**: Generate beautiful animated videos of code execution using Manim
+- **Performance Analysis**: Identify bottlenecks with flamegraph-style performance views
+- **Dead Code Detection**: Find unreachable or unused code paths
+- **AI-Powered Explanations**: Local LLM integration for explaining code behavior (supports vision models)
+- **Multiple Export Formats**: PlantUML, Mermaid, D2, JSON, and Markdown exports
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `TrueFlow: Auto-Integrate into Project` | Add tracing to your Python project |
+| `TrueFlow: Show Trace Viewer` | Open the trace visualization panel |
+| `TrueFlow: Generate Manim Video` | Create an animated execution video |
+| `TrueFlow: Export Diagram` | Export trace as PlantUML/Mermaid diagram |
+| `TrueFlow: Connect to Trace Server` | Start real-time trace streaming |
+| `TrueFlow: Download AI Model` | Download local LLM for explanations |
+| `TrueFlow: Start AI Server` | Start the local llama.cpp server |
+| `TrueFlow: Open AI Chat` | Open AI chat panel for code explanations |
+
+## Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `trueflow.traceDirectory` | `./traces` | Directory to store trace files |
+| `trueflow.autoRefresh` | `true` | Auto-refresh on new traces |
+| `trueflow.pythonPath` | `python` | Path to Python interpreter |
+| `trueflow.socketHost` | `localhost` | Host for trace streaming |
+| `trueflow.socketPort` | `5678` | Port for trace streaming |
+| `trueflow.manimQuality` | `medium_quality` | Video quality setting |
+
+## Quick Start
+
+1. Open a Python project in VS Code
+2. Run `TrueFlow: Auto-Integrate into Project` from the command palette
+3. Execute your Python code normally
+4. View traces in the TrueFlow sidebar panel
+5. Generate Manim videos or export diagrams
+
+## Requirements
+
+- Python 3.8+
+- Manim (optional, for video generation)
+- llama.cpp (optional, for AI explanations)
+
+## AI Explanation Panel
+
+The AI panel supports:
+- **Context injection** from dead code, performance, and call trace panels
+- **Vision models** (Qwen3-VL) for analyzing screenshots and diagrams
+- **Conversation history** with context awareness
+- **Local inference** via llama.cpp server
 
 ## Installation
+
+### From VS Code Marketplace / Open VSX
+
+Search for "TrueFlow" in the Extensions view.
 
 ### From VSIX
 
@@ -27,36 +80,11 @@ npm run compile
 
 Then press F5 to launch Extension Development Host.
 
-## Quick Start
+## License
 
-1. Open a Python project in VS Code
-2. Open Command Palette (Ctrl+Shift+P)
-3. Run "TrueFlow: Auto-Integrate into Project"
-4. Select your entry point (main.py, app.py, etc.)
-5. Run your application with the generated configuration
-6. Open "TrueFlow: Show Trace Viewer" to see execution flow
+MIT
 
-## Commands
+## Links
 
-| Command | Description |
-|---------|-------------|
-| `TrueFlow: Auto-Integrate into Project` | Set up tracing for current project |
-| `TrueFlow: Show Trace Viewer` | Open the trace visualization panel |
-| `TrueFlow: Generate Manim Video` | Create 3D animated execution video |
-| `TrueFlow: Export Diagram` | Export trace to various formats |
-
-## Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `trueflow.traceDirectory` | `./traces` | Directory for trace files |
-| `trueflow.autoRefresh` | `true` | Auto-refresh on new traces |
-| `trueflow.pythonPath` | `python` | Python interpreter path |
-| `trueflow.socketPort` | `5678` | Real-time streaming port |
-| `trueflow.manimQuality` | `medium_quality` | Manim video quality |
-
-## Development Status
-
-This extension is currently in early development. The PyCharm plugin is more mature.
-
-See the main [TrueFlow README](../README.md) for full documentation.
+- [GitHub Repository](https://github.com/hevolve-ai/trueflow)
+- [Report Issues](https://github.com/hevolve-ai/trueflow/issues)
