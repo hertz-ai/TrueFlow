@@ -76,6 +76,66 @@ let currentModelPath: string | undefined;
 let traceViewerPanel: vscode.WebviewPanel | undefined;
 let traceSocketClient: TraceSocketClient | undefined;
 let statusBarItem: vscode.StatusBarItem;
+let sidebarProvider: TrueFlowSidebarProvider | undefined;
+
+/**
+ * WebviewViewProvider for the TrueFlow sidebar
+ * Shows the full tabbed interface in the activity bar
+ */
+class TrueFlowSidebarProvider implements vscode.WebviewViewProvider {
+    public static readonly viewType = 'trueflow.mainView';
+    private _view?: vscode.WebviewView;
+
+    constructor(private readonly _extensionContext: vscode.ExtensionContext) {}
+
+    public resolveWebviewView(
+        webviewView: vscode.WebviewView,
+        context: vscode.WebviewViewResolveContext,
+        _token: vscode.CancellationToken
+    ) {
+        this._view = webviewView;
+
+        webviewView.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [this._extensionContext.extensionUri]
+        };
+
+        webviewView.webview.html = getSidebarHtml(traceSocketClient?.isConnected() || false);
+
+        // Handle messages from webview
+        webviewView.webview.onDidReceiveMessage(async message => {
+            switch (message.type) {
+                case 'connect':
+                    await connectToSocket();
+                    break;
+                case 'disconnect':
+                    disconnectSocket();
+                    break;
+                case 'openFullView':
+                    showTraceViewer(this._extensionContext);
+                    break;
+                case 'autoIntegrate':
+                    autoIntegrateProject(this._extensionContext);
+                    break;
+                case 'generateVideo':
+                    generateManimVideo(this._extensionContext);
+                    break;
+                case 'openAIChat':
+                    AIExplanationProvider.getInstance().show(this._extensionContext);
+                    break;
+                case 'info':
+                    vscode.window.showInformationMessage(message.message);
+                    break;
+            }
+        });
+    }
+
+    public postMessage(message: any) {
+        if (this._view) {
+            this._view.webview.postMessage(message);
+        }
+    }
+}
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('TrueFlow extension is now active');
@@ -91,6 +151,12 @@ export function activate(context: vscode.ExtensionContext) {
     // Initialize socket client
     traceSocketClient = new TraceSocketClient();
     setupSocketClientHandlers();
+
+    // Register sidebar webview provider
+    sidebarProvider = new TrueFlowSidebarProvider(context);
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(TrueFlowSidebarProvider.viewType, sidebarProvider)
+    );
 
     // Register commands
     const commands = [
@@ -645,6 +711,260 @@ function setupTraceWatcher(context: vscode.ExtensionContext): void {
     });
 
     context.subscriptions.push(watcher);
+}
+
+/**
+ * Get HTML for the sidebar view - a compact dashboard with quick actions
+ */
+function getSidebarHtml(isConnected: boolean): string {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrueFlow</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: var(--vscode-font-family);
+            background-color: var(--vscode-sideBar-background);
+            color: var(--vscode-sideBar-foreground);
+            padding: 12px;
+            font-size: 13px;
+        }
+        .logo {
+            text-align: center;
+            padding: 10px 0 15px;
+            border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border);
+            margin-bottom: 15px;
+        }
+        .logo h2 {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--vscode-sideBarTitle-foreground);
+        }
+        .logo p {
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            margin-top: 4px;
+        }
+        .status-section {
+            background: var(--vscode-sideBarSectionHeader-background);
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 12px;
+        }
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .status-row:last-child { margin-bottom: 0; }
+        .status-label {
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+        }
+        .status-badge {
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: 600;
+        }
+        .status-connected { background: #2e7d32; color: white; }
+        .status-disconnected { background: #c62828; color: white; }
+        .metric-value {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--vscode-charts-blue);
+        }
+        .action-buttons {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .action-btn {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 12px;
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            text-align: left;
+            transition: background 0.2s;
+        }
+        .action-btn:hover {
+            background: var(--vscode-button-secondaryHoverBackground);
+        }
+        .action-btn.primary {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+        }
+        .action-btn.primary:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        .action-btn .icon {
+            font-size: 14px;
+            width: 16px;
+            text-align: center;
+        }
+        .section-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--vscode-sideBarSectionHeader-foreground);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin: 15px 0 10px;
+        }
+        .quick-stats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .stat-card {
+            background: var(--vscode-sideBarSectionHeader-background);
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--vscode-charts-green);
+        }
+        .stat-label {
+            font-size: 10px;
+            color: var(--vscode-descriptionForeground);
+            margin-top: 2px;
+        }
+        .tabs {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-bottom: 12px;
+        }
+        .tab {
+            padding: 6px 10px;
+            background: var(--vscode-sideBarSectionHeader-background);
+            border: none;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            color: var(--vscode-sideBar-foreground);
+        }
+        .tab:hover {
+            background: var(--vscode-list-hoverBackground);
+        }
+        .tab.active {
+            background: var(--vscode-focusBorder);
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="logo">
+        <h2>TrueFlow</h2>
+        <p>Deterministic Code Visualizer</p>
+    </div>
+
+    <div class="status-section">
+        <div class="status-row">
+            <span class="status-label">Connection</span>
+            <span id="connection-status" class="status-badge ${isConnected ? 'status-connected' : 'status-disconnected'}">
+                ${isConnected ? 'Connected' : 'Disconnected'}
+            </span>
+        </div>
+        <div class="status-row">
+            <span class="status-label">Events</span>
+            <span id="event-count" class="metric-value">0</span>
+        </div>
+    </div>
+
+    <div class="quick-stats">
+        <div class="stat-card">
+            <div id="stat-functions" class="stat-value">0</div>
+            <div class="stat-label">Functions</div>
+        </div>
+        <div class="stat-card">
+            <div id="stat-depth" class="stat-value">0</div>
+            <div class="stat-label">Max Depth</div>
+        </div>
+    </div>
+
+    <div class="section-title">Quick Actions</div>
+    <div class="action-buttons">
+        <button class="action-btn primary" onclick="action('autoIntegrate')">
+            <span class="icon">⚡</span>
+            <span>Auto-Integrate Project</span>
+        </button>
+        <button class="action-btn" onclick="action('${isConnected ? 'disconnect' : 'connect'}')">
+            <span class="icon">${isConnected ? '🔴' : '🟢'}</span>
+            <span>${isConnected ? 'Disconnect' : 'Connect to Server'}</span>
+        </button>
+        <button class="action-btn" onclick="action('openFullView')">
+            <span class="icon">📊</span>
+            <span>Open Full Trace Viewer</span>
+        </button>
+        <button class="action-btn" onclick="action('generateVideo')">
+            <span class="icon">🎬</span>
+            <span>Generate Manim Video</span>
+        </button>
+        <button class="action-btn" onclick="action('openAIChat')">
+            <span class="icon">🤖</span>
+            <span>AI Code Explainer</span>
+        </button>
+    </div>
+
+    <div class="section-title">View Tabs</div>
+    <div class="tabs">
+        <button class="tab active" onclick="openTab('diagram')">Diagram</button>
+        <button class="tab" onclick="openTab('performance')">Perf</button>
+        <button class="tab" onclick="openTab('deadcode')">Dead</button>
+        <button class="tab" onclick="openTab('trace')">Trace</button>
+        <button class="tab" onclick="openTab('flamegraph')">Flame</button>
+        <button class="tab" onclick="openTab('sql')">SQL</button>
+        <button class="tab" onclick="openTab('manim')">Video</button>
+    </div>
+
+    <script>
+        const vscode = acquireVsCodeApi();
+
+        function action(type) {
+            vscode.postMessage({ type: type });
+        }
+
+        function openTab(tab) {
+            // Open full view with specific tab
+            vscode.postMessage({ type: 'openFullView', tab: tab });
+        }
+
+        // Handle messages from extension
+        window.addEventListener('message', event => {
+            const message = event.data;
+            switch (message.type) {
+                case 'updateStats':
+                    document.getElementById('event-count').textContent = message.events || 0;
+                    document.getElementById('stat-functions').textContent = message.functions || 0;
+                    document.getElementById('stat-depth').textContent = message.depth || 0;
+                    break;
+                case 'socketConnected':
+                    document.getElementById('connection-status').textContent = 'Connected';
+                    document.getElementById('connection-status').className = 'status-badge status-connected';
+                    break;
+                case 'socketDisconnected':
+                    document.getElementById('connection-status').textContent = 'Disconnected';
+                    document.getElementById('connection-status').className = 'status-badge status-disconnected';
+                    break;
+            }
+        });
+    </script>
+</body>
+</html>`;
 }
 
 function getTraceViewerHtml(): string {

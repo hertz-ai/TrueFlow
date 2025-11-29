@@ -63,6 +63,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private val diagramTypeCombo = JComboBox(arrayOf("Mermaid", "PlantUML"))
     private var mermaidPreviewPanel: MermaidPreviewPanel? = null
     private var showMermaidPreview = true // Toggle between code and preview
+    private var showDeadCallTrees = false // Toggle for showing dead code in diagrams
 
     // Tab 2: Performance Metrics
     private val performancePanel = JBPanel<JBPanel<*>>(BorderLayout())
