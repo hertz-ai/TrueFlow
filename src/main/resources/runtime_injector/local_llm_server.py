@@ -47,21 +47,44 @@ class ModelConfig:
     description: str
 
 
-# Available models
+# Available models - from https://docs.unsloth.ai/models/qwen3-vl-how-to-run-and-fine-tune
 MODELS = {
+    # Qwen3-VL Vision-Language Models (recommended for code understanding)
     "qwen3-vl-2b": ModelConfig(
         repo_id="unsloth/Qwen3-VL-2B-Instruct-GGUF",
         model_file="Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf",
         mmproj_file="mmproj-F16.gguf",  # Vision projector
         size_mb=1500,
-        description="Qwen3-VL 2B - Vision-language model for code understanding"
+        description="Qwen3-VL 2B - Vision+text, best for code analysis with diagrams"
     ),
+    "qwen3-vl-2b-thinking": ModelConfig(
+        repo_id="unsloth/Qwen3-VL-2B-Thinking-GGUF",
+        model_file="Qwen3-VL-2B-Thinking-UD-Q4_K_XL.gguf",
+        mmproj_file="mmproj-F16.gguf",
+        size_mb=1500,
+        description="Qwen3-VL 2B Thinking - Chain-of-thought reasoning"
+    ),
+    "qwen3-vl-4b": ModelConfig(
+        repo_id="unsloth/Qwen3-VL-4B-Instruct-GGUF",
+        model_file="Qwen3-VL-4B-Instruct-UD-Q4_K_XL.gguf",
+        mmproj_file="mmproj-F16.gguf",
+        size_mb=2800,
+        description="Qwen3-VL 4B - Better quality, needs ~6GB RAM"
+    ),
+    "qwen3-vl-8b": ModelConfig(
+        repo_id="unsloth/Qwen3-VL-8B-Instruct-GGUF",
+        model_file="Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf",
+        mmproj_file="mmproj-F16.gguf",
+        size_mb=5000,
+        description="Qwen3-VL 8B - Best quality, needs ~10GB RAM"
+    ),
+    # Text-only models (faster, no vision support)
     "qwen3-2b-text": ModelConfig(
         repo_id="unsloth/Qwen3-2B-Instruct-GGUF",
         model_file="Qwen3-2B-Instruct-Q4_K_M.gguf",
         mmproj_file=None,  # Text-only
-        size_mb=1200,
-        description="Qwen3 2B - Text-only model (smaller, faster)"
+        size_mb=1100,
+        description="Qwen3 2B - Text-only, fastest"
     ),
 }
 
@@ -531,10 +554,23 @@ class LocalLLMService:
         service = LocalLLMService()
         service.ensure_ready()  # Downloads model and starts server if needed
         response = service.generate("Explain this code...")
+
+    Supports:
+        - Preset models by name (e.g., "qwen3-vl-2b")
+        - Custom model paths (e.g., "/path/to/model.gguf")
+        - Custom HuggingFace URLs
     """
 
-    def __init__(self, model_name: str = "qwen3-vl-2b"):
+    def __init__(self, model_name: str = "qwen3-vl-2b", model_path: Optional[str] = None):
+        """
+        Initialize the LLM service.
+
+        Args:
+            model_name: Preset model name (used if model_path is None)
+            model_path: Direct path to a GGUF model file (overrides model_name)
+        """
         self.model_name = model_name
+        self.model_path = model_path  # Custom model path
         self.server = LlamaCppServer()
         self.model_manager = ModelManager()
 
@@ -546,6 +582,7 @@ class LocalLLMService:
         Ensure the LLM service is ready to use.
 
         Downloads model and starts server if needed.
+        Supports custom model paths - if model_path is set, uses that directly.
         """
         def report(msg: str, pct: float):
             if progress_callback:
@@ -561,19 +598,29 @@ class LocalLLMService:
         else:
             report("llama.cpp found", 25)
 
-        # Step 2: Check/download model
-        if not self.model_manager.is_downloaded(self.model_name):
-            report(f"Downloading {self.model_name}...", 25)
-            if not self.model_manager.download_model(self.model_name, progress_callback):
+        # Step 2: Check model availability
+        if self.model_path:
+            # Using custom model path
+            if not Path(self.model_path).exists():
+                logger.error(f"Custom model not found: {self.model_path}")
                 return False
-            report("Model downloaded", 75)
+            report(f"Using custom model: {Path(self.model_path).name}", 75)
         else:
-            report("Model found", 75)
+            # Using preset model
+            if not self.model_manager.is_downloaded(self.model_name):
+                report(f"Downloading {self.model_name}...", 25)
+                if not self.model_manager.download_model(self.model_name, progress_callback):
+                    return False
+                report("Model downloaded", 75)
+            else:
+                report("Model found", 75)
 
         # Step 3: Start server
         if not self.server.is_running():
             report("Starting LLM server...", 75)
-            if not self.server.start(self.model_name):
+            # Use custom path or preset
+            model_to_load = self.model_path if self.model_path else self.model_name
+            if not self.server.start(model_to_load):
                 return False
             report("Server ready", 100)
         else:

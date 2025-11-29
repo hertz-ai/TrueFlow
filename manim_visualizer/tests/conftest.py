@@ -1,11 +1,39 @@
 """
-Pytest configuration and shared fixtures.
+Pytest configuration and shared fixtures for manim_visualizer tests.
+
+This conftest.py ensures proper PYTHONPATH setup for manim tests.
+IMPORTANT: Path setup must happen FIRST, before any imports that might
+trigger manim_visualizer/__init__.py imports.
 """
 
+import sys
+import os
+from pathlib import Path
+
+# Get paths - do this BEFORE any other imports
+MANIM_VISUALIZER_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = MANIM_VISUALIZER_ROOT.parent
+
+# Add all necessary paths to sys.path - ORDER MATTERS!
+# manim_visualizer must be first so logging_config can be found
+paths_to_add = [
+    str(MANIM_VISUALIZER_ROOT),  # For logging_config, etc.
+    str(PROJECT_ROOT / "src" / "main" / "resources" / "runtime_injector"),
+    str(PROJECT_ROOT / "src" / "main" / "resources"),
+    str(PROJECT_ROOT),
+]
+
+for path in paths_to_add:
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+# Also set PYTHONPATH environment variable for any subprocesses
+os.environ["PYTHONPATH"] = os.pathsep.join(paths_to_add + [os.environ.get("PYTHONPATH", "")])
+
+# Now safe to import
 import pytest
 import json
 import tempfile
-from pathlib import Path
 from typing import Dict, List
 
 

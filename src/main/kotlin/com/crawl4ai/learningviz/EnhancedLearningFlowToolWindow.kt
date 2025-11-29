@@ -1314,8 +1314,14 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         deadFunctions.take(20).forEach { deadArray.add(it) }
         traceJson.add("dead_functions", deadArray)
 
-        // Pass to AI panel
-        aiExplanationPanel.setTraceData(traceJson)
+        // Add called functions
+        val calledArray = com.google.gson.JsonArray()
+        socketTraceCalls.keys.forEach { calledArray.add(it) }
+        traceJson.add("called_functions", calledArray)
+
+        // Pass to AI panel - use the new separate setters
+        aiExplanationPanel.setDeadCodeData(traceJson)
+        aiExplanationPanel.setCallTraceData(traceJson)
     }
 
     private fun updatePerformanceFromSocketTrace(event: TraceEvent) {

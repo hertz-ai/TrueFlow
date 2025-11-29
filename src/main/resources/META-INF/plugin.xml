@@ -1,7 +1,7 @@
 <idea-plugin>
-    <id>com.trueflow</id>
+    <id>ai.hevolve.trueflow</id>
     <name>TrueFlow - Deterministic Code Visualizer</name>
-    <vendor email="support@trueflow.dev" url="https://trueflow.dev">TrueFlow</vendor>
+    <vendor email="support@hevolve.ai" url="https://hevolve.ai">hevolve.ai</vendor>
 
     <description><![CDATA[
     <h1>TrueFlow - Deterministic Code Visualizer & Explainer</h1>
@@ -57,8 +57,8 @@
 
     <h2>Support</h2>
     <ul>
-        <li>Documentation: <a href="https://github.com/trueflow/trueflow">GitHub</a></li>
-        <li>Issues: <a href="https://github.com/trueflow/trueflow/issues">Bug Reports</a></li>
+        <li>Documentation: <a href="https://github.com/hevolve-ai/trueflow">GitHub</a></li>
+        <li>Issues: <a href="https://github.com/hevolve-ai/trueflow/issues">Bug Reports</a></li>
     </ul>
     ]]></description>
 

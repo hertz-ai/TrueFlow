@@ -3,10 +3,16 @@
   "displayName": "TrueFlow - Deterministic Code Visualizer",
   "description": "Unblackbox LLM code with deterministic truth. Zero-code Python runtime instrumentation with 3D animated execution videos.",
   "version": "0.1.0",
-  "publisher": "trueflow",
+  "publisher": "hevolve-ai",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "homepage": "https://github.com/hevolve-ai/trueflow",
+  "bugs": {
+    "url": "https://github.com/hevolve-ai/trueflow/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/trueflow/trueflow"
+    "url": "https://github.com/hevolve-ai/trueflow"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -63,6 +69,26 @@
         "command": "trueflow.disconnectSocket",
         "title": "TrueFlow: Disconnect from Trace Server",
         "icon": "$(debug-stop)"
+      },
+      {
+        "command": "trueflow.downloadAIModel",
+        "title": "TrueFlow: Download AI Model",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "trueflow.startAIServer",
+        "title": "TrueFlow: Start AI Server",
+        "icon": "$(server-process)"
+      },
+      {
+        "command": "trueflow.stopAIServer",
+        "title": "TrueFlow: Stop AI Server",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "trueflow.showAIChat",
+        "title": "TrueFlow: Open AI Chat",
+        "icon": "$(comment-discussion)"
       }
     ],
     "viewsContainers": {

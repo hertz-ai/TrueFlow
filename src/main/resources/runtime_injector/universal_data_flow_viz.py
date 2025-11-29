@@ -715,16 +715,10 @@ class UniversalDataFlowScene(ThreeDScene):
         if hasattr(self.camera, 'frame'):
             try:
                 # ThreeDCamera doesn't have 'frame' attribute, skip camera operations for 3D scenes
-                if hasattr(self.camera, 'frame'):
-                    try:
-                    self.play(
-                        self.camera.frame.animate.shift(LEFT * 5),
-                        run_time=1.5
-                    )
-                    except AttributeError as e:
-                        logger.debug(f"Camera operation skipped: {e}")
-                else:
-                    logger.debug("ThreeDCamera detected, skipping frame operation")
+                self.play(
+                    self.camera.frame.animate.shift(LEFT * 5),
+                    run_time=1.5
+                )
             except AttributeError as e:
                 logger.debug(f"Camera shift skipped: {e}")
         else:
@@ -988,17 +982,13 @@ class UniversalDataFlowScene(ThreeDScene):
 
             # Pan camera to the right
             if hasattr(self.camera, 'frame'):
-                # ThreeDCamera doesn't have 'frame' attribute, skip camera operations for 3D scenes
-                if hasattr(self.camera, 'frame'):
-                    try:
+                try:
                     self.play(
                         self.camera.frame.animate.shift(RIGHT * 6 + OUT * 2),
                         run_time=2
                     )
-                    except AttributeError as e:
-                        logger.debug(f"Camera operation skipped: {e}")
-                else:
-                    logger.debug("ThreeDCamera detected, skipping frame operation")
+                except AttributeError as e:
+                    logger.debug(f"Camera operation skipped: {e}")
 
             subtitle = BillboardText("Anti-Patterns Detected!", font_size=28, color=RED)
             subtitle.move_to([6, 3, -2])
@@ -1062,17 +1052,13 @@ class UniversalDataFlowScene(ThreeDScene):
 
             # Pan camera back to center
             if hasattr(self.camera, 'frame'):
-                # ThreeDCamera doesn't have 'frame' attribute, skip camera operations for 3D scenes
-                if hasattr(self.camera, 'frame'):
-                    try:
+                try:
                     self.play(
                         self.camera.frame.animate.shift(LEFT * 6 + IN * 2),
                         run_time=2
                     )
-                    except AttributeError as e:
-                        logger.debug(f"Camera operation skipped: {e}")
-                else:
-                    logger.debug("ThreeDCamera detected, skipping frame operation")
+                except AttributeError as e:
+                    logger.debug(f"Camera operation skipped: {e}")
 
         except Exception as e:
             logger.error(f"Failed to extract architecture: {e}", exc_info=True)
@@ -1091,17 +1077,13 @@ class UniversalDataFlowScene(ThreeDScene):
 
             # Pan camera to the left
             if hasattr(self.camera, 'frame'):
-                # ThreeDCamera doesn't have 'frame' attribute, skip camera operations for 3D scenes
-                if hasattr(self.camera, 'frame'):
-                    try:
+                try:
                     self.play(
                         self.camera.frame.animate.shift(LEFT * 6 + OUT * 2),
                         run_time=2
                     )
-                    except AttributeError as e:
-                        logger.debug(f"Camera operation skipped: {e}")
-                else:
-                    logger.debug("ThreeDCamera detected, skipping frame operation")
+                except AttributeError as e:
+                    logger.debug(f"Camera operation skipped: {e}")
 
             subtitle = BillboardText("Recommendations", font_size=28, color=GREEN)
             subtitle.move_to([-6, 3, -2])
@@ -1164,17 +1146,13 @@ class UniversalDataFlowScene(ThreeDScene):
 
             # Pan camera back to center
             if hasattr(self.camera, 'frame'):
-                # ThreeDCamera doesn't have 'frame' attribute, skip camera operations for 3D scenes
-                if hasattr(self.camera, 'frame'):
-                    try:
+                try:
                     self.play(
                         self.camera.frame.animate.shift(RIGHT * 6 + IN * 2),
                         run_time=2
                     )
-                    except AttributeError as e:
-                        logger.debug(f"Camera operation skipped: {e}")
-                else:
-                    logger.debug("ThreeDCamera detected, skipping frame operation")
+                except AttributeError as e:
+                    logger.debug(f"Camera operation skipped: {e}")
 
             return recommendations
 
@@ -1564,20 +1542,12 @@ class UniversalDataFlowScene(ThreeDScene):
                 # Smooth 3Blue1Brown style pan to keep current function centered
                 if hasattr(self.camera, 'frame'):
                     try:
-                        # ThreeDCamera doesn't have 'frame' attribute, skip camera operations for 3D scenes
-                        if hasattr(self.camera, 'frame'):
-                            try:
-                            self.play(
-                                self.camera.frame.animate.move_to(position),
-                                run_time=0.8,  # Slower, more deliberate
-                                rate_func=rate_functions.ease_in_out_cubic  # Smooth acceleration/deceleration
-                            )
-                            except AttributeError as e:
-                                logger.debug(f"Camera operation skipped: {e}")
-                        else:
-                            logger.debug("ThreeDCamera detected, skipping frame operation")
+                        self.play(
+                            self.camera.frame.animate.move_to(position),
+                            run_time=0.8,  # Slower, more deliberate
+                            rate_func=rate_functions.ease_in_out_cubic  # Smooth acceleration/deceleration
+                        )
                     except AttributeError as e:
-                        # Fallback if frame exists but operation fails
                         logger.debug(f"Camera tracking failed: {e}")
                 else:
                     logger.debug("ThreeDCamera detected, skipping camera tracking")

@@ -1,8 +1,64 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as https from 'https';
 import * as child_process from 'child_process';
 import { TraceSocketClient, TraceEvent, PerformanceData } from './TraceSocketClient';
+import { AIExplanationProvider } from './AIExplanationWebview';
+
+// Model presets for AI explanation
+interface ModelPreset {
+    displayName: string;
+    repoId: string;
+    fileName: string;
+    sizeMB: number;
+    description: string;
+}
+
+// Model presets from https://docs.unsloth.ai/models/qwen3-vl-how-to-run-and-fine-tune
+const MODEL_PRESETS: ModelPreset[] = [
+    // Qwen3-VL Vision-Language Models (recommended for code understanding)
+    {
+        displayName: "Qwen3-VL-2B Instruct Q4_K_XL (Recommended)",
+        repoId: "unsloth/Qwen3-VL-2B-Instruct-GGUF",
+        fileName: "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf",
+        sizeMB: 1500,
+        description: "Vision+text, best for code analysis with diagrams"
+    },
+    {
+        displayName: "Qwen3-VL-2B Thinking Q4_K_XL",
+        repoId: "unsloth/Qwen3-VL-2B-Thinking-GGUF",
+        fileName: "Qwen3-VL-2B-Thinking-UD-Q4_K_XL.gguf",
+        sizeMB: 1500,
+        description: "Vision+text with chain-of-thought reasoning"
+    },
+    // Larger models for better quality (need more RAM)
+    {
+        displayName: "Qwen3-VL-4B Instruct Q4_K_XL",
+        repoId: "unsloth/Qwen3-VL-4B-Instruct-GGUF",
+        fileName: "Qwen3-VL-4B-Instruct-UD-Q4_K_XL.gguf",
+        sizeMB: 2800,
+        description: "Larger model, better quality, needs ~6GB RAM"
+    },
+    {
+        displayName: "Qwen3-VL-8B Instruct Q4_K_XL",
+        repoId: "unsloth/Qwen3-VL-8B-Instruct-GGUF",
+        fileName: "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf",
+        sizeMB: 5000,
+        description: "Best quality for complex code, needs ~10GB RAM"
+    },
+    // Text-only models (faster, no vision support)
+    {
+        displayName: "Qwen3-2B Text-Only Q4_K_M",
+        repoId: "unsloth/Qwen3-2B-Instruct-GGUF",
+        fileName: "Qwen3-2B-Instruct-Q4_K_M.gguf",
+        sizeMB: 1100,
+        description: "Text-only, fastest, no vision support"
+    }
+];
+
+let llmServerProcess: child_process.ChildProcess | undefined;
+let currentModelPath: string | undefined;
 
 /**
  * TrueFlow VS Code Extension
@@ -43,7 +99,11 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('trueflow.generateManimVideo', () => generateManimVideo(context)),
         vscode.commands.registerCommand('trueflow.exportDiagram', () => exportDiagram()),
         vscode.commands.registerCommand('trueflow.connectSocket', () => connectToSocket()),
-        vscode.commands.registerCommand('trueflow.disconnectSocket', () => disconnectSocket())
+        vscode.commands.registerCommand('trueflow.disconnectSocket', () => disconnectSocket()),
+        vscode.commands.registerCommand('trueflow.downloadAIModel', () => downloadAIModel()),
+        vscode.commands.registerCommand('trueflow.startAIServer', () => startAIServer()),
+        vscode.commands.registerCommand('trueflow.stopAIServer', () => stopAIServer()),
+        vscode.commands.registerCommand('trueflow.showAIChat', () => AIExplanationProvider.getInstance().show(context))
     ];
 
     context.subscriptions.push(...commands);
@@ -1308,11 +1368,273 @@ function getTraceViewerHtml(): string {
 </html>`;
 }
 
+// AI Model Download and Server Management
+
+async function downloadAIModel(): Promise<void> {
+    // Let user select model
+    const modelItems = MODEL_PRESETS.map(m => ({
+        label: m.displayName,
+        description: `${m.sizeMB}MB - ${m.description}`,
+        preset: m
+    }));
+
+    // Add custom URL option
+    modelItems.push({
+        label: "Custom HuggingFace Model...",
+        description: "Enter a custom GGUF model URL",
+        preset: null as any
+    });
+
+    const selected = await vscode.window.showQuickPick(modelItems, {
+        placeHolder: 'Select an AI model to download'
+    });
+
+    if (!selected) {
+        return;
+    }
+
+    let downloadUrl: string;
+    let fileName: string;
+
+    if (selected.preset) {
+        downloadUrl = `https://huggingface.co/${selected.preset.repoId}/resolve/main/${selected.preset.fileName}`;
+        fileName = selected.preset.fileName;
+    } else {
+        // Custom URL
+        const customUrl = await vscode.window.showInputBox({
+            prompt: 'Enter HuggingFace GGUF model URL',
+            placeHolder: 'https://huggingface.co/user/repo/resolve/main/model.gguf',
+            validateInput: (value) => {
+                if (!value.endsWith('.gguf')) {
+                    return 'URL must point to a .gguf file';
+                }
+                return null;
+            }
+        });
+
+        if (!customUrl) {
+            return;
+        }
+
+        downloadUrl = customUrl;
+        fileName = customUrl.split('/').pop() || 'model.gguf';
+    }
+
+    // Create models directory
+    const modelsDir = path.join(getHomeDir(), '.trueflow', 'models');
+    if (!fs.existsSync(modelsDir)) {
+        fs.mkdirSync(modelsDir, { recursive: true });
+    }
+
+    const destPath = path.join(modelsDir, fileName);
+
+    // Check if already downloaded
+    if (fs.existsSync(destPath)) {
+        const overwrite = await vscode.window.showWarningMessage(
+            `Model ${fileName} already exists. Overwrite?`,
+            'Yes', 'No'
+        );
+        if (overwrite !== 'Yes') {
+            currentModelPath = destPath;
+            vscode.window.showInformationMessage(`Using existing model: ${fileName}`);
+            return;
+        }
+    }
+
+    // Download with progress
+    await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: `Downloading ${fileName}...`,
+        cancellable: true
+    }, async (progress, token) => {
+        return new Promise<void>((resolve, reject) => {
+            const file = fs.createWriteStream(destPath);
+            let downloadedBytes = 0;
+            let totalBytes = 0;
+
+            const request = https.get(downloadUrl, {
+                headers: { 'User-Agent': 'TrueFlow/1.0' }
+            }, (response) => {
+                // Handle redirects
+                if (response.statusCode === 302 || response.statusCode === 301) {
+                    const redirectUrl = response.headers.location;
+                    if (redirectUrl) {
+                        https.get(redirectUrl, {
+                            headers: { 'User-Agent': 'TrueFlow/1.0' }
+                        }, handleResponse).on('error', reject);
+                        return;
+                    }
+                }
+                handleResponse(response);
+            });
+
+            function handleResponse(response: any) {
+                totalBytes = parseInt(response.headers['content-length'] || '0', 10);
+
+                response.pipe(file);
+
+                response.on('data', (chunk: Buffer) => {
+                    downloadedBytes += chunk.length;
+                    const pct = totalBytes > 0 ? Math.round((downloadedBytes / totalBytes) * 100) : 0;
+                    const downloadedMB = Math.round(downloadedBytes / (1024 * 1024));
+                    const totalMB = Math.round(totalBytes / (1024 * 1024));
+                    progress.report({
+                        increment: pct / 100,
+                        message: `${downloadedMB}MB / ${totalMB}MB (${pct}%)`
+                    });
+                });
+
+                file.on('finish', () => {
+                    file.close();
+                    currentModelPath = destPath;
+                    vscode.window.showInformationMessage(`Model downloaded: ${fileName}`);
+                    resolve();
+                });
+            }
+
+            request.on('error', (err) => {
+                fs.unlink(destPath, () => {});
+                reject(err);
+            });
+
+            token.onCancellationRequested(() => {
+                request.destroy();
+                fs.unlink(destPath, () => {});
+                reject(new Error('Download cancelled'));
+            });
+        });
+    });
+}
+
+async function startAIServer(): Promise<void> {
+    if (llmServerProcess) {
+        vscode.window.showWarningMessage('AI server is already running');
+        return;
+    }
+
+    // Find model
+    const modelsDir = path.join(getHomeDir(), '.trueflow', 'models');
+    if (!fs.existsSync(modelsDir)) {
+        vscode.window.showErrorMessage('No models found. Please download a model first.');
+        return;
+    }
+
+    const modelFiles = fs.readdirSync(modelsDir).filter(f => f.endsWith('.gguf'));
+    if (modelFiles.length === 0) {
+        vscode.window.showErrorMessage('No GGUF models found. Please download a model first.');
+        return;
+    }
+
+    // Let user select model if multiple
+    let modelPath: string;
+    if (modelFiles.length === 1) {
+        modelPath = path.join(modelsDir, modelFiles[0]);
+    } else {
+        const selected = await vscode.window.showQuickPick(modelFiles, {
+            placeHolder: 'Select model to load'
+        });
+        if (!selected) {
+            return;
+        }
+        modelPath = path.join(modelsDir, selected);
+    }
+
+    // Find llama-server
+    const llamaServer = findLlamaServer();
+    if (!llamaServer) {
+        const install = await vscode.window.showErrorMessage(
+            'llama.cpp not found. Would you like to see installation instructions?',
+            'Yes', 'No'
+        );
+        if (install === 'Yes') {
+            vscode.env.openExternal(vscode.Uri.parse('https://github.com/ggerganov/llama.cpp#build'));
+        }
+        return;
+    }
+
+    // Start server
+    const cpuCount = require('os').cpus().length;
+    const args = [
+        '--model', modelPath,
+        '--port', '8080',
+        '--ctx-size', '4096',
+        '--threads', String(cpuCount),
+        '--host', '127.0.0.1'
+    ];
+
+    vscode.window.showInformationMessage('Starting AI server...');
+
+    llmServerProcess = child_process.spawn(llamaServer, args);
+
+    llmServerProcess.stdout?.on('data', (data) => {
+        console.log('[LLM Server]', data.toString());
+    });
+
+    llmServerProcess.stderr?.on('data', (data) => {
+        console.log('[LLM Server]', data.toString());
+    });
+
+    llmServerProcess.on('close', (code) => {
+        llmServerProcess = undefined;
+        if (code !== 0) {
+            vscode.window.showErrorMessage(`AI server exited with code ${code}`);
+        }
+    });
+
+    // Wait for server to be ready
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    vscode.window.showInformationMessage('AI server started on port 8080');
+}
+
+function stopAIServer(): void {
+    if (llmServerProcess) {
+        llmServerProcess.kill();
+        llmServerProcess = undefined;
+        vscode.window.showInformationMessage('AI server stopped');
+    } else {
+        vscode.window.showWarningMessage('AI server is not running');
+    }
+}
+
+function findLlamaServer(): string | null {
+    const homeDir = getHomeDir();
+    const possiblePaths = [
+        path.join(homeDir, '.trueflow', 'llama.cpp', 'build', 'bin', 'llama-server'),
+        path.join(homeDir, '.trueflow', 'llama.cpp', 'build', 'bin', 'llama-server.exe'),
+        path.join(homeDir, 'llama.cpp', 'build', 'bin', 'llama-server'),
+        path.join(homeDir, 'llama.cpp', 'build', 'bin', 'llama-server.exe'),
+        '/usr/local/bin/llama-server',
+        'C:\\llama.cpp\\build\\bin\\llama-server.exe'
+    ];
+
+    for (const p of possiblePaths) {
+        if (fs.existsSync(p)) {
+            return p;
+        }
+    }
+
+    // Check PATH
+    try {
+        const which = process.platform === 'win32' ? 'where' : 'which';
+        const result = child_process.execSync(`${which} llama-server`, { encoding: 'utf-8' });
+        return result.trim().split('\n')[0];
+    } catch {
+        return null;
+    }
+}
+
+function getHomeDir(): string {
+    return process.env.HOME || process.env.USERPROFILE || '';
+}
+
 export function deactivate() {
     if (traceViewerPanel) {
         traceViewerPanel.dispose();
     }
     if (traceSocketClient) {
         traceSocketClient.disconnect();
+    }
+    if (llmServerProcess) {
+        llmServerProcess.kill();
     }
 }
