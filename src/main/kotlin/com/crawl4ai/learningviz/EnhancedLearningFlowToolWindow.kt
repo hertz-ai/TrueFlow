@@ -267,6 +267,23 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         autoIntegrateButton.foreground = java.awt.Color.WHITE
         toolbar.add(autoIntegrateButton)
 
+        // Attach/Detach button (second button - most important after auto-integrate)
+        attachButton = JButton("Attach to Server")
+        attachButton.toolTipText = "Connect to running Python process via socket (real-time tracing)"
+        attachButton.addActionListener {
+            if (currentTraceMode == TraceMode.SOCKET_REALTIME && traceSocketClient?.isConnected() == true) {
+                // Currently connected, so detach
+                disconnectSocketTrace()
+                updateAttachButtonState(false)
+            } else {
+                // Not connected, so attach
+                showAttachDialog()
+            }
+        }
+        attachButton.background = java.awt.Color(33, 150, 243) // Blue highlight
+        attachButton.foreground = java.awt.Color.WHITE
+        toolbar.add(attachButton)
+
         toolbar.addSeparator()
 
         // Refresh button
@@ -292,25 +309,6 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             selectTraceDirectory()
         }
         toolbar.add(selectDirButton)
-
-        toolbar.addSeparator()
-
-        // Attach/Detach button (toggles based on connection state)
-        attachButton = JButton("Attach to Server")
-        attachButton.toolTipText = "Connect to running Python process via socket (real-time tracing)"
-        attachButton.addActionListener {
-            if (currentTraceMode == TraceMode.SOCKET_REALTIME && traceSocketClient?.isConnected() == true) {
-                // Currently connected, so detach
-                disconnectSocketTrace()
-                updateAttachButtonState(false)
-            } else {
-                // Not connected, so attach
-                showAttachDialog()
-            }
-        }
-        attachButton.background = java.awt.Color(33, 150, 243) // Blue highlight
-        attachButton.foreground = java.awt.Color.WHITE
-        toolbar.add(attachButton)
 
         toolbar.addSeparator()
 

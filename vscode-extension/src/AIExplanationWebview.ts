@@ -420,7 +420,7 @@ export class AIExplanationProvider {
 
         try {
             // Search Hugging Face API for GGUF models
-            const searchUrl = `https://huggingface.co/api/models?search=${encodeURIComponent(query)}&library=gguf&sort=trending&limit=20`;
+            const searchUrl = `https://huggingface.co/api/models?search=${encodeURIComponent(query + ' gguf')}&sort=downloads&limit=20`;
 
             const results = await this.fetchJSON(searchUrl);
 
@@ -1407,7 +1407,9 @@ Be concise and technical. When analyzing images, describe what you see and relat
     }
 
     public async askQuestion(question: string, context: string = '', callback: (response: string) => void): Promise<void> {
-        if (!this.serverProcess) {
+        // Check if server is running (either our local process or external server)
+        const serverRunning = await this.isServerRunningAnywhere();
+        if (!serverRunning) {
             callback('AI server not running. Please start it from the AI Explanation tab.');
             return;
         }
@@ -1450,7 +1452,9 @@ Explain:
     }
 
     public async getMethodSummary(methodName: string, methodCode: string, callback: (summary: string) => void): Promise<void> {
-        if (!this.serverProcess) {
+        // Check if server is running (either our local process or external server)
+        const serverRunning = await this.isServerRunningAnywhere();
+        if (!serverRunning) {
             callback(methodName);
             return;
         }
@@ -1472,8 +1476,8 @@ ${methodCode}
         }
     }
 
-    public isServerRunning(): boolean {
-        return !!this.serverProcess;
+    public async isServerRunning(): Promise<boolean> {
+        return await this.isServerRunningAnywhere();
     }
 
     public dispose(): void {

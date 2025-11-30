@@ -439,8 +439,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         serverPanel.add(downloadButton)
         serverPanel.add(startServerButton)
 
-        // HuggingFace search panel
+        // HuggingFace search panel (hidden by default, shown when "Custom HuggingFace Model..." selected)
         hfSearchPanel.border = BorderFactory.createTitledBorder("Search HuggingFace GGUF Models")
+        hfSearchPanel.isVisible = false  // Hidden by default to save space
         val hfSearchInputPanel = JPanel(FlowLayout(FlowLayout.LEFT))
         hfSearchField.preferredSize = Dimension(300, 30)
         hfSearchField.toolTipText = "Search for GGUF models (e.g., qwen, llama, gemma)"
@@ -1088,7 +1089,10 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         val selectedIndex = modelComboBox.selectedIndex
         val preset = modelPresets[selectedIndex]
 
-        customUrlPanel.isVisible = preset.repoId.isEmpty()
+        // Show custom URL panel and HuggingFace search when "Custom HuggingFace Model..." is selected
+        val isCustomModel = preset.repoId.isEmpty()
+        customUrlPanel.isVisible = isCustomModel
+        hfSearchPanel.isVisible = isCustomModel
 
         if (preset.sizeMB > 0) {
             downloadButton.text = "Download Model (${preset.sizeMB}MB)"
@@ -1468,7 +1472,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
         CompletableFuture.runAsync {
             try {
-                val searchUrl = "https://huggingface.co/api/models?search=${java.net.URLEncoder.encode(query, "UTF-8")}&library=gguf&sort=trending&limit=20"
+                val searchUrl = "https://huggingface.co/api/models?search=${java.net.URLEncoder.encode(query + " gguf", "UTF-8")}&sort=downloads&limit=20"
                 val url = URL(searchUrl)
                 val conn = url.openConnection() as HttpURLConnection
                 conn.setRequestProperty("User-Agent", "TrueFlow/1.0")
