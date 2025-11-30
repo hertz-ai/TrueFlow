@@ -69,3 +69,5 @@ Thumbs.db
 *.pem
 *.key
 /.pycharm_plugin/
+/vscode-extension/out/
+/vscode-extension/out/

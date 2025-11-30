@@ -582,7 +582,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             return
         }
 
-        if (serverProcess == null || !serverProcess!!.isAlive) {
+        // Check if server is running (either our local process or external server)
+        val serverRunning = (serverProcess != null && serverProcess!!.isAlive) || checkServerHealth()
+        if (!serverRunning) {
             appendToChat("System", "Please start the AI server first.")
             return
         }
@@ -955,7 +957,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         image: String? = null,
         callback: (String) -> Unit
     ) {
-        if (serverProcess == null || !serverProcess!!.isAlive) {
+        // Check if server is running (either our local process or external server)
+        val serverRunning = (serverProcess != null && serverProcess!!.isAlive) || checkServerHealth()
+        if (!serverRunning) {
             callback("AI server not running. Please start it from the AI Explanation tab.")
             return
         }
@@ -1048,7 +1052,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             |```
         """.trimMargin()
 
-        if (serverProcess == null || !serverProcess!!.isAlive) {
+        // Check if server is running (either our local process or external server)
+        val serverRunning = (serverProcess != null && serverProcess!!.isAlive) || checkServerHealth()
+        if (!serverRunning) {
             callback(methodName)  // Fallback to just method name
             return
         }
@@ -1070,10 +1076,10 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     /**
-     * Check if AI server is running.
+     * Check if AI server is running (either our local process or external server).
      */
     fun isServerRunning(): Boolean {
-        return serverProcess != null && serverProcess!!.isAlive
+        return (serverProcess != null && serverProcess!!.isAlive) || checkServerHealth()
     }
 
     // ==================== Model & Server Management ====================
