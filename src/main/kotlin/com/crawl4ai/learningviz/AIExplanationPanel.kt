@@ -56,6 +56,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     )
 
     private val modelPresets = listOf(
+        // Qwen3-VL models - excellent for code analysis
         ModelPreset(
             "Qwen3-VL-2B Instruct Q4_K_XL (Recommended)",
             "unsloth/Qwen3-VL-2B-Instruct-GGUF",
@@ -80,14 +81,33 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             "Larger model, better quality, needs ~6GB RAM",
             hasVision = true
         ),
+        // Gemma 3 models - Google's multimodal
         ModelPreset(
-            "Qwen3-VL-8B Instruct Q4_K_XL",
-            "unsloth/Qwen3-VL-8B-Instruct-GGUF",
-            "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf",
-            5000,
-            "Best quality for complex code, needs ~10GB RAM",
+            "Gemma-3-4B IT Q4_K_XL",
+            "unsloth/gemma-3-4b-it-GGUF",
+            "gemma-3-4b-it-Q4_K_XL.gguf",
+            2700,
+            "Vision+text, Google Gemma 3, well-tested multimodal",
             hasVision = true
         ),
+        ModelPreset(
+            "Gemma-3-1B IT Q4_K_M",
+            "unsloth/gemma-3-1b-it-GGUF",
+            "gemma-3-1b-it-Q4_K_M.gguf",
+            600,
+            "Vision+text, compact & fast, good for quick analysis",
+            hasVision = true
+        ),
+        // SmolVLM - ultra-compact vision model
+        ModelPreset(
+            "SmolVLM-256M-Instruct",
+            "ggml-org/SmolVLM-256M-Instruct-GGUF",
+            "SmolVLM-256M-Instruct-Q8_0.gguf",
+            280,
+            "Tiny vision model, ultra-fast, basic image analysis",
+            hasVision = true
+        ),
+        // Text-only option
         ModelPreset(
             "Qwen3-2B Text-Only Q4_K_M",
             "unsloth/Qwen3-2B-Instruct-GGUF",
@@ -133,6 +153,14 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private val downloadButton = JButton("Download Model")
     private val startServerButton = JButton("Start AI Server")
 
+    // HuggingFace search
+    private val hfSearchField = JBTextField()
+    private val hfSearchButton = JButton("Search HF")
+    private val hfResultsList = JList<String>()
+    private val hfSearchPanel = JPanel(BorderLayout())
+    private var hfSearchResults = mutableListOf<Pair<String, Int>>()  // (model_id, downloads)
+    private var selectedHFModel: String? = null
+
     // Context injection
     private val contextComboBox = ComboBox(arrayOf(
         "No additional context",
@@ -149,6 +177,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private var serverProcess: Process? = null
     private val apiBase = "http://127.0.0.1:8080/v1"
     private val modelsDir = File(System.getProperty("user.home"), ".trueflow/models")
+    private val serverStatusFile = File(System.getProperty("user.home"), ".trueflow/server_status.json")
+    private var statusCheckTimer: javax.swing.Timer? = null
 
     // Cross-tab data references (set by EnhancedLearningFlowToolWindow)
     private var deadCodeData: JsonObject? = null
@@ -156,10 +186,228 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private var callTraceData: JsonObject? = null
     private var currentDiagramData: String? = null
 
+    // Hub client for real-time cross-IDE coordination
+    private val hubClient = HubClient.getInstance()
+
+    // Server status data class for cross-IDE coordination
+    data class ServerStatus(
+        val running: Boolean,
+        val pid: Int?,
+        val port: Int,
+        val model: String?,
+        val startedBy: String,
+        val startedAt: String
+    )
+
     init {
         modelsDir.mkdirs()
         setupUI()
+        setupHubHandlers()
         checkModelStatus()
+        connectToHub()
+    }
+
+    private fun setupHubHandlers() {
+        // Handle AI server status updates from other IDEs
+        hubClient.on("ai_server_status") { message ->
+            val data = message.data ?: return@on
+            val running = data.get("running")?.asBoolean ?: false
+            val startedBy = data.get("started_by")?.asString ?: "external"
+
+            SwingUtilities.invokeLater {
+                if (running && serverProcess == null) {
+                    // Server started by another IDE
+                    startServerButton.text = "Using External Server ($startedBy)"
+                    startServerButton.isEnabled = false
+                    sendButton.isEnabled = true
+                    statusLabel.text = "AI Server running (started by $startedBy) - Ready!"
+                } else if (!running) {
+                    // Server stopped
+                    startServerButton.text = "Start AI Server"
+                    startServerButton.isEnabled = true
+                    sendButton.isEnabled = false
+                    statusLabel.text = "AI Server stopped"
+                }
+            }
+        }
+
+        // Handle legacy commands from MCP Hub
+        hubClient.on("command") { message ->
+            val command = message.command ?: return@on
+
+            when (command) {
+                "start_ai_server" -> SwingUtilities.invokeLater { startServer() }
+                "stop_ai_server" -> SwingUtilities.invokeLater { stopServer() }
+            }
+        }
+
+        // Handle RPC requests from MCP Hub (with response)
+        // NOTE: This handler runs on a background thread (not EDT) for performance
+        hubClient.on("rpc_request") { message ->
+            val requestId = message.request_id ?: return@on
+            val command = message.command ?: return@on
+            val args = message.args ?: JsonObject()
+
+            val responseData = JsonObject()
+
+            when (command) {
+                "get_trace_data" -> {
+                    // Safe read-only access to cached data
+                    callTraceData?.let { responseData.add("calls", it.getAsJsonArray("calls")) }
+                    responseData.addProperty("total_calls", callTraceData?.get("total_calls")?.asInt ?: 0)
+                    hubClient.sendRpcResponse(requestId, responseData)
+                }
+
+                "get_dead_code" -> {
+                    deadCodeData?.let {
+                        responseData.add("dead_functions", it.getAsJsonArray("dead_functions"))
+                        responseData.add("called_functions", it.getAsJsonArray("called_functions"))
+                    }
+                    hubClient.sendRpcResponse(requestId, responseData)
+                }
+
+                "get_performance_data" -> {
+                    performanceData?.let {
+                        responseData.add("hotspots", it.getAsJsonArray("hotspots"))
+                        responseData.addProperty("total_time_ms", it.get("total_time_ms")?.asDouble ?: 0.0)
+                    }
+                    hubClient.sendRpcResponse(requestId, responseData)
+                }
+
+                "export_diagram" -> {
+                    val format = args.get("format")?.asString ?: "plantuml"
+                    responseData.addProperty("format", format)
+                    responseData.addProperty("diagram", currentDiagramData ?: "")
+                    hubClient.sendRpcResponse(requestId, responseData)
+                }
+
+                "start_ai_server" -> {
+                    // Start server on EDT, respond when done
+                    ApplicationManager.getApplication().invokeLater {
+                        startServer()
+                        // Server start is async, respond with acknowledgment
+                        val startResponse = JsonObject().apply {
+                            addProperty("status", "started")
+                            addProperty("port", 8080)
+                        }
+                        hubClient.sendRpcResponse(requestId, startResponse)
+                    }
+                    // Don't send response here - will be sent after server starts
+                    return@on
+                }
+
+                "stop_ai_server" -> {
+                    ApplicationManager.getApplication().invokeLater {
+                        stopServer()
+                    }
+                    responseData.addProperty("status", "stopped")
+                    hubClient.sendRpcResponse(requestId, responseData)
+                }
+
+                else -> {
+                    responseData.addProperty("error", "Unknown command: $command")
+                    hubClient.sendRpcResponse(requestId, responseData)
+                }
+            }
+        }
+    }
+
+    private fun connectToHub() {
+        // Connect to MCP Hub for real-time cross-IDE coordination
+        CompletableFuture.runAsync {
+            hubClient.setProject(project)
+            val connected = hubClient.connect()
+            if (connected) {
+                PluginLogger.info("[TrueFlow] Connected to MCP Hub for cross-IDE coordination")
+            } else {
+                PluginLogger.info("[TrueFlow] Hub not available, using file-based status polling")
+                // Fall back to polling if hub not available
+                SwingUtilities.invokeLater { startStatusPolling() }
+            }
+        }
+    }
+
+    private fun readServerStatus(): ServerStatus? {
+        return try {
+            if (serverStatusFile.exists()) {
+                val content = serverStatusFile.readText()
+                val json = Gson().fromJson(content, JsonObject::class.java)
+                ServerStatus(
+                    running = json.get("running")?.asBoolean ?: false,
+                    pid = json.get("pid")?.asInt,
+                    port = json.get("port")?.asInt ?: 8080,
+                    model = json.get("model")?.asString,
+                    startedBy = json.get("startedBy")?.asString ?: "unknown",
+                    startedAt = json.get("startedAt")?.asString ?: ""
+                )
+            } else null
+        } catch (e: Exception) {
+            PluginLogger.warn("Failed to read server status: ${e.message}")
+            null
+        }
+    }
+
+    private fun writeServerStatus(status: ServerStatus?) {
+        try {
+            if (status == null) {
+                if (serverStatusFile.exists()) {
+                    serverStatusFile.delete()
+                }
+            } else {
+                val json = JsonObject().apply {
+                    addProperty("running", status.running)
+                    status.pid?.let { addProperty("pid", it) }
+                    addProperty("port", status.port)
+                    status.model?.let { addProperty("model", it) }
+                    addProperty("startedBy", status.startedBy)
+                    addProperty("startedAt", status.startedAt)
+                }
+                serverStatusFile.writeText(Gson().toJson(json))
+            }
+        } catch (e: Exception) {
+            PluginLogger.warn("Failed to write server status: ${e.message}")
+        }
+    }
+
+    private fun checkServerHealth(): Boolean {
+        return try {
+            val conn = URL("http://127.0.0.1:8080/health").openConnection() as HttpURLConnection
+            conn.connectTimeout = 2000
+            conn.readTimeout = 2000
+            conn.responseCode == 200
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun startStatusPolling() {
+        statusCheckTimer = javax.swing.Timer(2000) {
+            val status = readServerStatus()
+            val isRunning = checkServerHealth()
+
+            SwingUtilities.invokeLater {
+                if (isRunning && serverProcess == null && status?.running == true) {
+                    // Server running from another IDE
+                    startServerButton.text = "Using External Server (${status.startedBy})"
+                    startServerButton.isEnabled = false
+                    sendButton.isEnabled = true
+                    statusLabel.text = "AI Server running (started by ${status.startedBy})"
+                } else if (!isRunning && serverProcess != null) {
+                    // Our server died
+                    serverProcess = null
+                    startServerButton.text = "Start AI Server"
+                    startServerButton.isEnabled = true
+                    sendButton.isEnabled = false
+                    statusLabel.text = "AI Server stopped unexpectedly"
+                }
+            }
+        }
+        statusCheckTimer?.start()
+    }
+
+    private fun stopStatusPolling() {
+        statusCheckTimer?.stop()
+        statusCheckTimer = null
     }
 
     private fun setupUI() {
@@ -191,6 +439,33 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         serverPanel.add(downloadButton)
         serverPanel.add(startServerButton)
 
+        // HuggingFace search panel
+        hfSearchPanel.border = BorderFactory.createTitledBorder("Search HuggingFace GGUF Models")
+        val hfSearchInputPanel = JPanel(FlowLayout(FlowLayout.LEFT))
+        hfSearchField.preferredSize = Dimension(300, 30)
+        hfSearchField.toolTipText = "Search for GGUF models (e.g., qwen, llama, gemma)"
+        hfSearchButton.addActionListener { searchHuggingFace() }
+        hfSearchInputPanel.add(hfSearchField)
+        hfSearchInputPanel.add(hfSearchButton)
+
+        hfResultsList.selectionMode = ListSelectionModel.SINGLE_SELECTION
+        hfResultsList.addListSelectionListener { e ->
+            if (!e.valueIsAdjusting && hfResultsList.selectedIndex >= 0) {
+                val selected = hfSearchResults.getOrNull(hfResultsList.selectedIndex)
+                if (selected != null) {
+                    selectedHFModel = selected.first
+                    startServerButton.text = "Start with HF Model"
+                    startServerButton.isEnabled = true
+                    statusLabel.text = "Selected: ${selected.first}"
+                }
+            }
+        }
+        val hfScrollPane = JBScrollPane(hfResultsList)
+        hfScrollPane.preferredSize = Dimension(400, 120)
+
+        hfSearchPanel.add(hfSearchInputPanel, BorderLayout.NORTH)
+        hfSearchPanel.add(hfScrollPane, BorderLayout.CENTER)
+
         // Context selection
         val contextPanel = JPanel(FlowLayout(FlowLayout.LEFT))
         contextPanel.add(JBLabel("Context: "))
@@ -200,6 +475,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         topPanel.add(modelPanel)
         topPanel.add(customUrlPanel)
         topPanel.add(serverPanel)
+        topPanel.add(hfSearchPanel)
         topPanel.add(contextPanel)
 
         add(topPanel, BorderLayout.NORTH)
@@ -937,12 +1213,26 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private fun toggleServer() {
         if (serverProcess != null && serverProcess!!.isAlive) {
             stopServer()
+        } else if (selectedHFModel != null) {
+            startServerWithHF(selectedHFModel!!)
         } else {
             startServer()
         }
     }
 
     private fun startServer() {
+        // Check if server is already running from another IDE
+        val existingStatus = readServerStatus()
+        if (existingStatus?.running == true && checkServerHealth()) {
+            SwingUtilities.invokeLater {
+                startServerButton.text = "Using External Server (${existingStatus.startedBy})"
+                startServerButton.isEnabled = false
+                sendButton.isEnabled = true
+                statusLabel.text = "AI Server already running (started by ${existingStatus.startedBy})"
+            }
+            return
+        }
+
         val modelFile = currentModelFile
         if (modelFile == null) {
             statusLabel.text = "No model selected. Please download a model first."
@@ -971,8 +1261,17 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     "--port", "8080",
                     "--ctx-size", "4096",
                     "--threads", "${Runtime.getRuntime().availableProcessors()}",
-                    "--host", "127.0.0.1"
+                    "--host", "127.0.0.1",
+                    "--jinja"  // Required for chat template support
                 )
+
+                // Add vision model flags
+                if (modelFile.contains("-VL-", ignoreCase = true) ||
+                    modelFile.contains("gemma-3", ignoreCase = true) ||
+                    modelFile.contains("smol", ignoreCase = true)) {
+                    cmd.add("--kv-unified")
+                    cmd.add("--no-mmproj-offload")
+                }
 
                 if (mmproj.exists() && modelFile.contains("-VL-", ignoreCase = true)) {
                     cmd.addAll(listOf("--mmproj", mmproj.absolutePath))
@@ -1002,6 +1301,21 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
                 SwingUtilities.invokeLater {
                     if (ready) {
+                        val modelName = File(modelFile).name
+
+                        // Write shared status so other IDEs know the server is running (file-based fallback)
+                        writeServerStatus(ServerStatus(
+                            running = true,
+                            pid = null,  // Java Process doesn't easily expose PID
+                            port = 8080,
+                            model = modelName,
+                            startedBy = "pycharm",
+                            startedAt = java.time.Instant.now().toString()
+                        ))
+
+                        // Notify via WebSocket hub (real-time)
+                        hubClient.notifyAIServerStarted(8080, modelName)
+
                         startServerButton.text = "Stop AI Server"
                         startServerButton.isEnabled = true
                         sendButton.isEnabled = true
@@ -1027,22 +1341,194 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private fun stopServer() {
         serverProcess?.destroyForcibly()
         serverProcess = null
+
+        // Clear shared status so other IDEs know server stopped (file-based fallback)
+        writeServerStatus(null)
+
+        // Notify via WebSocket hub (real-time)
+        hubClient.notifyAIServerStopped()
+
         startServerButton.text = "Start AI Server"
         sendButton.isEnabled = false
         statusLabel.text = "AI Server stopped"
+        selectedHFModel = null
+    }
+
+    private fun startServerWithHF(hfModel: String) {
+        startServerButton.isEnabled = false
+        statusLabel.text = "Starting AI server with HuggingFace model..."
+
+        CompletableFuture.runAsync {
+            try {
+                val llamaServer = findLlamaServer()
+
+                if (llamaServer == null) {
+                    SwingUtilities.invokeLater {
+                        statusLabel.text = "llama.cpp not found. Installing..."
+                        installLlamaCpp()
+                    }
+                    return@runAsync
+                }
+
+                val isVisionModel = hfModel.contains("vl", ignoreCase = true) ||
+                        hfModel.contains("vision", ignoreCase = true) ||
+                        hfModel.contains("gemma-3", ignoreCase = true) ||
+                        hfModel.contains("smol", ignoreCase = true)
+
+                val cmd = mutableListOf(
+                    llamaServer,
+                    "-hf", hfModel,  // Direct HuggingFace loading
+                    "--port", "8080",
+                    "--ctx-size", "4096",
+                    "--threads", "${Runtime.getRuntime().availableProcessors()}",
+                    "--host", "127.0.0.1",
+                    "--jinja"  // Required for chat template support
+                )
+
+                if (isVisionModel) {
+                    cmd.add("--kv-unified")  // Fix KV cache issues for vision models
+                    cmd.add("--no-mmproj-offload")  // CPU compatibility
+                }
+
+                PluginLogger.info("Starting server with HF model: $hfModel")
+                serverProcess = ProcessBuilder(cmd)
+                    .redirectErrorStream(true)
+                    .start()
+
+                // Wait for server ready (longer timeout for HF download)
+                var ready = false
+                for (i in 1..120) {
+                    Thread.sleep(1000)
+                    try {
+                        val conn = URL("http://127.0.0.1:8080/health").openConnection() as HttpURLConnection
+                        conn.connectTimeout = 2000
+                        if (conn.responseCode == 200) {
+                            ready = true
+                            break
+                        }
+                    } catch (e: Exception) { }
+
+                    SwingUtilities.invokeLater {
+                        statusLabel.text = "Downloading and loading model... ($i/120)"
+                    }
+                }
+
+                SwingUtilities.invokeLater {
+                    if (ready) {
+                        // Write shared status for file-based fallback
+                        writeServerStatus(ServerStatus(
+                            running = true,
+                            pid = null,
+                            port = 8080,
+                            model = hfModel,
+                            startedBy = "pycharm",
+                            startedAt = java.time.Instant.now().toString()
+                        ))
+
+                        // Notify via WebSocket hub (real-time)
+                        hubClient.notifyAIServerStarted(8080, hfModel)
+
+                        startServerButton.text = "Stop AI Server"
+                        startServerButton.isEnabled = true
+                        sendButton.isEnabled = true
+                        statusLabel.text = "AI Server running with $hfModel"
+                    } else {
+                        serverProcess?.destroyForcibly()
+                        serverProcess = null
+                        startServerButton.isEnabled = true
+                        statusLabel.text = "Server failed to start"
+                    }
+                }
+
+            } catch (e: Exception) {
+                SwingUtilities.invokeLater {
+                    startServerButton.isEnabled = true
+                    statusLabel.text = "Server error: ${e.message}"
+                    PluginLogger.warn("Server start failed: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun searchHuggingFace() {
+        val query = hfSearchField.text.trim()
+        if (query.length < 2) {
+            statusLabel.text = "Search query too short"
+            return
+        }
+
+        hfSearchButton.isEnabled = false
+        statusLabel.text = "Searching HuggingFace..."
+
+        CompletableFuture.runAsync {
+            try {
+                val searchUrl = "https://huggingface.co/api/models?search=${java.net.URLEncoder.encode(query, "UTF-8")}&library=gguf&sort=trending&limit=20"
+                val url = URL(searchUrl)
+                val conn = url.openConnection() as HttpURLConnection
+                conn.setRequestProperty("User-Agent", "TrueFlow/1.0")
+                conn.connectTimeout = 10000
+
+                val response = BufferedReader(InputStreamReader(conn.inputStream)).readText()
+                val models = Gson().fromJson(response, JsonArray::class.java)
+
+                hfSearchResults.clear()
+                val displayList = mutableListOf<String>()
+
+                models.forEach { modelElement ->
+                    val model = modelElement.asJsonObject
+                    val id = model.get("id")?.asString ?: model.get("modelId")?.asString ?: return@forEach
+                    val downloads = model.get("downloads")?.asInt ?: 0
+                    hfSearchResults.add(Pair(id, downloads))
+                    displayList.add("$id (${formatNumber(downloads)} downloads)")
+                }
+
+                SwingUtilities.invokeLater {
+                    hfResultsList.setListData(displayList.toTypedArray())
+                    hfSearchButton.isEnabled = true
+                    statusLabel.text = "Found ${hfSearchResults.size} GGUF models"
+                }
+
+            } catch (e: Exception) {
+                SwingUtilities.invokeLater {
+                    hfSearchButton.isEnabled = true
+                    statusLabel.text = "Search error: ${e.message}"
+                }
+            }
+        }
+    }
+
+    private fun formatNumber(num: Int): String {
+        return when {
+            num >= 1000000 -> String.format("%.1fM", num / 1000000.0)
+            num >= 1000 -> String.format("%.1fK", num / 1000.0)
+            else -> num.toString()
+        }
     }
 
     private fun installLlamaCpp() {
         CompletableFuture.runAsync {
             try {
-                // Run llama.cpp installation directly via shell commands (more reliable than Python import)
                 val installDir = File(System.getProperty("user.home"), ".trueflow/llama.cpp")
 
                 SwingUtilities.invokeLater {
-                    statusLabel.text = "Installing llama.cpp (this may take several minutes)..."
+                    statusLabel.text = "Installing llama.cpp..."
                     progressBar.isVisible = true
                     progressBar.isIndeterminate = true
                 }
+
+                // First try to download prebuilt binaries (faster and more reliable)
+                if (tryDownloadPrebuiltLlama(installDir)) {
+                    SwingUtilities.invokeLater {
+                        progressBar.isVisible = false
+                        progressBar.isIndeterminate = false
+                        startServerButton.isEnabled = true
+                        statusLabel.text = "llama.cpp installed successfully!"
+                    }
+                    return@runAsync
+                }
+
+                // Fall back to building from source
+                SwingUtilities.invokeLater { statusLabel.text = "Prebuilt not available, building from source..." }
 
                 // Step 1: Clone llama.cpp repository
                 SwingUtilities.invokeLater { statusLabel.text = "Cloning llama.cpp repository..." }
@@ -1134,6 +1620,105 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
     }
 
+    private fun tryDownloadPrebuiltLlama(installDir: File): Boolean {
+        try {
+            SwingUtilities.invokeLater { statusLabel.text = "Checking for prebuilt binaries..." }
+
+            // Fetch latest release info from GitHub API
+            val releaseUrl = URL("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest")
+            val conn = releaseUrl.openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", "TrueFlow/1.0")
+            conn.connectTimeout = 10000
+
+            val releaseJson = BufferedReader(InputStreamReader(conn.inputStream)).readText()
+            val release = Gson().fromJson(releaseJson, JsonObject::class.java)
+            val tagName = release.get("tag_name")?.asString ?: return false
+
+            // Determine the right binary for this platform
+            val osName = System.getProperty("os.name").lowercase()
+            val assetName = when {
+                osName.contains("win") -> "llama-$tagName-bin-win-cpu-x64.zip"
+                osName.contains("mac") -> "llama-$tagName-bin-macos-arm64.zip"
+                else -> "llama-$tagName-bin-ubuntu-x64.zip"
+            }
+
+            // Find the asset URL
+            val assets = release.getAsJsonArray("assets")
+            val asset = assets?.firstOrNull { it.asJsonObject.get("name")?.asString == assetName }?.asJsonObject
+            val downloadUrl = asset?.get("browser_download_url")?.asString ?: return false
+
+            SwingUtilities.invokeLater { statusLabel.text = "Downloading prebuilt llama.cpp ($tagName)..." }
+
+            // Create install directory
+            installDir.mkdirs()
+
+            // Download the zip file
+            val zipFile = File(installDir, assetName)
+            downloadFileWithProgress(downloadUrl, zipFile) { downloaded, total ->
+                val pct = if (total > 0) ((downloaded.toDouble() / total) * 100).toInt() else 0
+                SwingUtilities.invokeLater { statusLabel.text = "Downloading... $pct%" }
+            }
+
+            SwingUtilities.invokeLater { statusLabel.text = "Extracting binaries..." }
+
+            // Extract the zip using PowerShell on Windows or unzip on Unix
+            if (osName.contains("win")) {
+                val extractProcess = ProcessBuilder(
+                    "powershell", "-Command",
+                    "Expand-Archive -Path '${zipFile.absolutePath}' -DestinationPath '${installDir.absolutePath}' -Force"
+                ).redirectErrorStream(true).start()
+                extractProcess.waitFor()
+            } else {
+                val extractProcess = ProcessBuilder("unzip", "-o", zipFile.absolutePath, "-d", installDir.absolutePath)
+                    .redirectErrorStream(true).start()
+                extractProcess.waitFor()
+            }
+
+            // Clean up zip file
+            zipFile.delete()
+
+            // Create build/bin/Release structure for compatibility
+            val binDir = File(installDir, "build/bin/Release")
+            binDir.mkdirs()
+
+            val serverExe = if (osName.contains("win")) "llama-server.exe" else "llama-server"
+            val platformDir = when {
+                osName.contains("win") -> "win-cpu-x64"
+                osName.contains("mac") -> "macos-arm64"
+                else -> "ubuntu-x64"
+            }
+            val extractedBinDir = File(installDir, "llama-$tagName-bin-$platformDir")
+            val srcServer = File(extractedBinDir, serverExe)
+            val destServer = File(binDir, serverExe)
+
+            if (srcServer.exists()) {
+                srcServer.copyTo(destServer, overwrite = true)
+                if (!osName.contains("win")) {
+                    destServer.setExecutable(true)
+                }
+                PluginLogger.info("Installed llama-server to: ${destServer.absolutePath}")
+                return true
+            } else {
+                // Try root folder
+                val altSrcServer = File(installDir, serverExe)
+                if (altSrcServer.exists()) {
+                    altSrcServer.copyTo(destServer, overwrite = true)
+                    if (!osName.contains("win")) {
+                        destServer.setExecutable(true)
+                    }
+                    PluginLogger.info("Installed llama-server to: ${destServer.absolutePath}")
+                    return true
+                }
+            }
+
+            return false
+
+        } catch (e: Exception) {
+            PluginLogger.warn("Prebuilt download failed: ${e.message}")
+            return false
+        }
+    }
+
     private fun findPython(): String {
         val paths = listOf("python", "python3", "C:/Python310/python.exe", "C:/Python311/python.exe", "C:/Python312/python.exe")
         for (path in paths) {
@@ -1173,6 +1758,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     fun dispose() {
+        stopStatusPolling()
         stopServer()
+        hubClient.disconnect()
     }
 }

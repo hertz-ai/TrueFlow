@@ -54,6 +54,7 @@ intellij {
 dependencies {
     implementation("com.google.code.gson:gson:2.10.1")
     implementation("org.commonmark:commonmark:0.21.0")
+    implementation("org.java-websocket:Java-WebSocket:1.5.6")  // WebSocket client for Hub communication
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.1")
 }
 

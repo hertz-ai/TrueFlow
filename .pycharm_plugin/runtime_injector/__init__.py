@@ -1,6 +1,3 @@
-from logging_config import setup_logger
-logger = setup_logger(__name__)
-
 """
 Manim Trace Visualizer
 
@@ -13,56 +10,60 @@ Features:
 - Parallel execution path visualization with synchronized timelines
 - Multiple camera system for tracking parallel flows
 - Project-agnostic filtering (optional path filtering)
+
+NOTE: All imports are lazy to avoid import errors during pytest discovery.
+Use explicit imports when needed, e.g.:
+    from manim_visualizer.trace_to_manim import TraceParser
 """
 
-from .trace_to_manim import (
-    TraceParser,
-    ExecutionFlowScene,
-    DataFlowScene,
-    CallVisualization,
-    generate_visualization
-)
+# Lazy imports to avoid import errors during test discovery
+def __getattr__(name):
+    """Lazy import handler for module attributes."""
+    # Map attribute names to their module sources
+    _imports = {
+        # trace_to_manim
+        'TraceParser': 'trace_to_manim',
+        'ExecutionFlowScene': 'trace_to_manim',
+        'DataFlowScene': 'trace_to_manim',
+        'CallVisualization': 'trace_to_manim',
+        'generate_visualization': 'trace_to_manim',
+        # realtime_visualizer
+        'RealtimeTraceVisualizer': 'realtime_visualizer',
+        'BatchTraceVisualizer': 'realtime_visualizer',
+        # config
+        'VisualizationConfig': 'config',
+        'get_config': 'config',
+        'QUALITY_PRESETS': 'config',
+        # auto_recorder
+        'AutoRecorder': 'auto_recorder',
+        'ExecutionSession': 'auto_recorder',
+        'get_recorder': 'auto_recorder',
+        'track_execution': 'auto_recorder',
+        'tracked_execution': 'auto_recorder',
+        # unified_tracing
+        'UnifiedTracer': 'unified_tracing',
+        'trace': 'unified_tracing',
+        'traced': 'unified_tracing',
+        'start_unified_tracing': 'unified_tracing',
+        'stop_unified_tracing': 'unified_tracing',
+        # high_performance_integration
+        'HighPerformanceInstrumentor': 'high_performance_integration',
+        'enable_high_performance_tracing': 'high_performance_integration',
+        'disable_high_performance_tracing': 'high_performance_integration',
+        'high_performance_tracing': 'high_performance_integration',
+        'traced_with_sampling': 'high_performance_integration',
+        # learning_cycle_tracer
+        'LearningCycleTracer': 'learning_cycle_tracer',
+        'LearningCycle': 'learning_cycle_tracer',
+        'learning_cycle': 'learning_cycle_tracer',
+    }
 
-from .realtime_visualizer import (
-    RealtimeTraceVisualizer,
-    BatchTraceVisualizer
-)
+    if name in _imports:
+        import importlib
+        module = importlib.import_module(f'.{_imports[name]}', __name__)
+        return getattr(module, name)
 
-from .config import (
-    VisualizationConfig,
-    get_config,
-    QUALITY_PRESETS
-)
-
-from .auto_recorder import (
-    AutoRecorder,
-    ExecutionSession,
-    get_recorder,
-    track_execution,
-    tracked_execution
-)
-
-from .unified_tracing import (
-    UnifiedTracer,
-    trace,
-    traced,
-    start_unified_tracing,
-    stop_unified_tracing
-)
-
-from .high_performance_integration import (
-    HighPerformanceInstrumentor,
-    enable_high_performance_tracing,
-    disable_high_performance_tracing,
-    high_performance_tracing,
-    traced_with_sampling
-)
-
-from .learning_cycle_tracer import (
-    LearningCycleTracer,
-    LearningCycle,
-    learning_cycle
-)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # === RECOMMENDED FOR LEARNING: Cycle-Based Tracing ===

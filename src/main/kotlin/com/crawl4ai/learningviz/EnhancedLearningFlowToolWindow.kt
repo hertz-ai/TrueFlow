@@ -442,6 +442,17 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         }
         typePanel.add(copyButton)
 
+        // Open in Browser button - fullscreen view
+        val browserButton = JButton("View Fullscreen")
+        browserButton.toolTipText = "Open diagram fullscreen in browser with zoom controls"
+        browserButton.addActionListener {
+            mermaidPreviewPanel?.openInBrowser(
+                showDeadCallTrees = showDeadCallTrees,
+                diagramType = diagramTypeCombo.selectedItem?.toString()?.lowercase() ?: "mermaid"
+            )
+        }
+        typePanel.add(browserButton)
+
         // Show Dead Call Trees checkbox - toggles display of AST-based dead code
         val deadCallTreesCheckbox = javax.swing.JCheckBox("Show Dead Call Trees")
         deadCallTreesCheckbox.toolTipText = "Show functions that were never called (from static AST analysis)"

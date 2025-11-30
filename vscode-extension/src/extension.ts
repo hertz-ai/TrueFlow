@@ -141,7 +141,7 @@ class TrueFlowSidebarProvider implements vscode.WebviewViewProvider {
                     disconnectSocket();
                     break;
                 case 'openFullView':
-                    showTraceViewer(this._extensionContext);
+                    showTraceViewer(this._extensionContext, message.tab);
                     break;
                 case 'autoIntegrate':
                     autoIntegrateProject(this._extensionContext);
@@ -636,9 +636,15 @@ async function createLaunchConfiguration(workspaceRoot: string, entryPoint: stri
     vscode.window.showInformationMessage('TrueFlow launch configuration created!');
 }
 
-function showTraceViewer(context: vscode.ExtensionContext): void {
+function showTraceViewer(context: vscode.ExtensionContext, initialTab?: string): void {
+    const needsTabSelection = traceViewerPanel && initialTab;
+
     if (traceViewerPanel) {
         traceViewerPanel.reveal();
+        // If panel already exists and a tab was specified, select it
+        if (initialTab) {
+            traceViewerPanel.webview.postMessage({ type: 'selectTab', tab: initialTab });
+        }
         return;
     }
 
@@ -658,7 +664,7 @@ function showTraceViewer(context: vscode.ExtensionContext): void {
         }
     );
 
-    traceViewerPanel.webview.html = getTraceViewerHtml();
+    traceViewerPanel.webview.html = getTraceViewerHtml(initialTab);
 
     // Handle messages from webview
     traceViewerPanel.webview.onDidReceiveMessage(async message => {
@@ -1102,8 +1108,25 @@ function getSidebarHtml(isConnected: boolean): string {
 </html>`;
 }
 
-function getTraceViewerHtml(): string {
+function getTraceViewerHtml(initialTab?: string): string {
     const isConnected = traceSocketClient?.isConnected() || false;
+    // Map tab names to their data-tab values
+    const tabMap: {[key: string]: string} = {
+        'diagram': 'diagram',
+        'performance': 'performance',
+        'perf': 'performance',
+        'deadcode': 'deadcode',
+        'dead': 'deadcode',
+        'trace': 'trace',
+        'flamegraph': 'flamegraph',
+        'flame': 'flamegraph',
+        'sql': 'sql',
+        'metrics': 'metrics',
+        'distributed': 'distributed',
+        'manim': 'manim',
+        'video': 'manim'
+    };
+    const activeTab = initialTab ? (tabMap[initialTab.toLowerCase()] || 'diagram') : 'diagram';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1408,19 +1431,19 @@ function getTraceViewerHtml(): string {
     </div>
 
     <div class="tab-container">
-        <div class="tab active" data-tab="diagram">Diagram</div>
-        <div class="tab" data-tab="performance">Performance</div>
-        <div class="tab" data-tab="deadcode">Dead Code</div>
-        <div class="tab" data-tab="trace">Call Trace</div>
-        <div class="tab" data-tab="flamegraph">Flamegraph</div>
-        <div class="tab" data-tab="sql">SQL Analyzer</div>
-        <div class="tab" data-tab="metrics">Live Metrics</div>
-        <div class="tab" data-tab="distributed">Distributed</div>
-        <div class="tab" data-tab="manim">Manim Video</div>
+        <div class="tab${activeTab === 'diagram' ? ' active' : ''}" data-tab="diagram">Diagram</div>
+        <div class="tab${activeTab === 'performance' ? ' active' : ''}" data-tab="performance">Performance</div>
+        <div class="tab${activeTab === 'deadcode' ? ' active' : ''}" data-tab="deadcode">Dead Code</div>
+        <div class="tab${activeTab === 'trace' ? ' active' : ''}" data-tab="trace">Call Trace</div>
+        <div class="tab${activeTab === 'flamegraph' ? ' active' : ''}" data-tab="flamegraph">Flamegraph</div>
+        <div class="tab${activeTab === 'sql' ? ' active' : ''}" data-tab="sql">SQL Analyzer</div>
+        <div class="tab${activeTab === 'metrics' ? ' active' : ''}" data-tab="metrics">Live Metrics</div>
+        <div class="tab${activeTab === 'distributed' ? ' active' : ''}" data-tab="distributed">Distributed</div>
+        <div class="tab${activeTab === 'manim' ? ' active' : ''}" data-tab="manim">Manim Video</div>
     </div>
 
     <!-- Diagram Tab -->
-    <div class="content active" id="diagram-content">
+    <div class="content${activeTab === 'diagram' ? ' active' : ''}" id="diagram-content">
         <div class="diagram-toolbar">
             <select id="diagram-type" onchange="updateDiagramType()">
                 <option value="mermaid" selected>Mermaid</option>
@@ -1432,6 +1455,7 @@ function getTraceViewerHtml(): string {
             </label>
             <button onclick="renderDiagram()">Render</button>
             <button onclick="copyDiagram()">Copy</button>
+            <button onclick="openDiagramInBrowser()" title="Open fullscreen in browser">View Fullscreen</button>
             <span id="diagram-status"></span>
         </div>
         <div class="diagram-container">
@@ -1473,7 +1497,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Performance Tab -->
-    <div class="content" id="performance-content">
+    <div class="content${activeTab === 'performance' ? ' active' : ''}" id="performance-content">
         <table class="data-table">
             <thead>
                 <tr>
@@ -1493,7 +1517,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Dead Code Tab -->
-    <div class="content" id="deadcode-content">
+    <div class="content${activeTab === 'deadcode' ? ' active' : ''}" id="deadcode-content">
         <div id="deadcode-list">
             <div class="placeholder">
                 <p>Run your application with TrueFlow to detect uncovered functions.</p>
@@ -1502,7 +1526,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Call Trace Tab -->
-    <div class="content" id="trace-content">
+    <div class="content${activeTab === 'trace' ? ' active' : ''}" id="trace-content">
         <div id="call-tree" class="call-tree">
             <div class="placeholder">
                 <p>Connect to trace server to see live call traces.</p>
@@ -1511,7 +1535,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Flamegraph Tab -->
-    <div class="content" id="flamegraph-content">
+    <div class="content${activeTab === 'flamegraph' ? ' active' : ''}" id="flamegraph-content">
         <div class="flamegraph-container">
             <div class="flamegraph-canvas" id="flamegraph">
                 <div class="placeholder">
@@ -1522,7 +1546,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- SQL Analyzer Tab -->
-    <div class="content" id="sql-content">
+    <div class="content${activeTab === 'sql' ? ' active' : ''}" id="sql-content">
         <h3>SQL Query Analyzer</h3>
         <p>SQL queries and potential N+1 problems will appear here.</p>
         <div id="sql-queries">
@@ -1533,7 +1557,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Live Metrics Tab -->
-    <div class="content" id="metrics-content">
+    <div class="content${activeTab === 'metrics' ? ' active' : ''}" id="metrics-content">
         <div class="metrics-grid">
             <div class="metric-card">
                 <div class="metric-value" id="metric-events">0</div>
@@ -1555,7 +1579,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Distributed Tab -->
-    <div class="content" id="distributed-content">
+    <div class="content${activeTab === 'distributed' ? ' active' : ''}" id="distributed-content">
         <h3>Distributed Architecture</h3>
         <p>WebSocket, gRPC, Kafka, and other distributed calls will appear here.</p>
         <div id="distributed-calls">
@@ -1566,7 +1590,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Manim Video Tab -->
-    <div class="content" id="manim-content">
+    <div class="content${activeTab === 'manim' ? ' active' : ''}" id="manim-content">
         <h3>Manim Video</h3>
         <p>Use "TrueFlow: Generate Manim Video" command to create visualizations.</p>
         <div id="video-container">
@@ -1665,6 +1689,243 @@ function getTraceViewerHtml(): string {
             const code = document.getElementById('diagram-code').value;
             navigator.clipboard.writeText(code);
             vscode.postMessage({ type: 'info', message: 'Diagram code copied!' });
+        }
+
+        function openDiagramInBrowser() {
+            const code = document.getElementById('diagram-code').value;
+            const diagramType = document.getElementById('diagram-type').value;
+            const showingDeadTrees = document.getElementById('show-dead-call-trees').checked;
+
+            // Build a standalone HTML page with the diagram
+            const htmlContent = \`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrueFlow Sequence Diagram - Fullscreen</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"><\\/script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            background: #252526;
+            padding: 12px 20px;
+            border-bottom: 1px solid #3c3c3c;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .header h1 {
+            font-size: 16px;
+            font-weight: 500;
+            color: #569cd6;
+        }
+        .header-info {
+            font-size: 12px;
+            color: #808080;
+        }
+        .header-info span {
+            margin-left: 15px;
+            padding: 3px 8px;
+            background: #3c3c3c;
+            border-radius: 3px;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .controls button {
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .controls button:hover {
+            background: #1177bb;
+        }
+        .controls button.secondary {
+            background: #3c3c3c;
+        }
+        .controls button.secondary:hover {
+            background: #4c4c4c;
+        }
+        .diagram-container {
+            flex: 1;
+            overflow: auto;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+        }
+        .mermaid {
+            background: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            min-width: 300px;
+        }
+        .mermaid svg {
+            max-width: 100%;
+            height: auto;
+        }
+        .zoom-controls {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            gap: 5px;
+            background: #252526;
+            padding: 8px;
+            border-radius: 5px;
+            border: 1px solid #3c3c3c;
+        }
+        .zoom-controls button {
+            width: 32px;
+            height: 32px;
+            background: #3c3c3c;
+            border: none;
+            color: white;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .zoom-controls button:hover {
+            background: #4c4c4c;
+        }
+        .zoom-level {
+            padding: 0 10px;
+            line-height: 32px;
+            font-size: 12px;
+        }
+        @media print {
+            .header, .zoom-controls { display: none; }
+            body { background: white; }
+            .diagram-container { padding: 0; }
+            .mermaid { background: white; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>TrueFlow Sequence Diagram</h1>
+            <div class="header-info">
+                <span>Type: \${diagramType === 'mermaid' ? 'Mermaid' : 'PlantUML'}</span>
+                <span>\${showingDeadTrees ? 'Including Dead Call Trees' : 'Runtime Calls Only'}</span>
+                <span>Generated: \${new Date().toLocaleString()}</span>
+            </div>
+        </div>
+        <div class="controls">
+            <button onclick="window.print()" class="secondary">Print / Save PDF</button>
+            <button onclick="downloadSVG()">Download SVG</button>
+        </div>
+    </div>
+    <div class="diagram-container" id="diagram-container">
+        <div class="mermaid" id="mermaid-diagram">
+\${code}
+        </div>
+    </div>
+    <div class="zoom-controls">
+        <button onclick="zoomOut()">-</button>
+        <span class="zoom-level" id="zoom-level">100%</span>
+        <button onclick="zoomIn()">+</button>
+        <button onclick="resetZoom()">Reset</button>
+    </div>
+    <script>
+        let currentZoom = 1;
+        const container = document.getElementById('diagram-container');
+        const diagram = document.getElementById('mermaid-diagram');
+
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            securityLevel: 'loose',
+            sequence: {
+                diagramMarginX: 50,
+                diagramMarginY: 10,
+                actorMargin: 50,
+                width: 150,
+                height: 65,
+                boxMargin: 10,
+                boxTextMargin: 5,
+                noteMargin: 10,
+                messageMargin: 35,
+                mirrorActors: true,
+                useMaxWidth: false
+            }
+        });
+
+        function zoomIn() {
+            currentZoom = Math.min(currentZoom + 0.1, 3);
+            applyZoom();
+        }
+
+        function zoomOut() {
+            currentZoom = Math.max(currentZoom - 0.1, 0.3);
+            applyZoom();
+        }
+
+        function resetZoom() {
+            currentZoom = 1;
+            applyZoom();
+        }
+
+        function applyZoom() {
+            diagram.style.transform = 'scale(' + currentZoom + ')';
+            diagram.style.transformOrigin = 'top center';
+            document.getElementById('zoom-level').textContent = Math.round(currentZoom * 100) + '%';
+        }
+
+        function downloadSVG() {
+            const svg = diagram.querySelector('svg');
+            if (!svg) {
+                alert('No diagram rendered yet');
+                return;
+            }
+            const svgData = new XMLSerializer().serializeToString(svg);
+            const blob = new Blob([svgData], { type: 'image/svg+xml' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'trueflow-sequence-diagram.svg';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.key === '+' || e.key === '=') zoomIn();
+            if (e.key === '-') zoomOut();
+            if (e.key === '0') resetZoom();
+            if (e.key === 'p' && e.ctrlKey) { e.preventDefault(); window.print(); }
+        });
+    </script>
+</body>
+</html>\`;
+
+            // Create a Blob and open in new tab
+            const blob = new Blob([htmlContent], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            window.open(url, '_blank');
+
+            // Clean up the URL after a short delay
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+            vscode.postMessage({ type: 'info', message: 'Diagram opened in browser!' });
         }
 
         function toggleDeadCallTrees() {
@@ -1900,6 +2161,25 @@ function getTraceViewerHtml(): string {
 
                 case 'newTrace':
                     document.getElementById('diagram-status').textContent = 'New trace: ' + message.path;
+                    break;
+
+                case 'selectTab':
+                    // Programmatically select a tab
+                    const targetTab = message.tab;
+                    if (targetTab) {
+                        // Deselect all tabs
+                        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                        document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
+
+                        // Select the target tab
+                        const tabEl = document.querySelector('.tab[data-tab="' + targetTab + '"]');
+                        const contentEl = document.getElementById(targetTab + '-content');
+                        if (tabEl) tabEl.classList.add('active');
+                        if (contentEl) contentEl.classList.add('active');
+
+                        // Show zoom controls only for diagram tab
+                        document.getElementById('zoom-controls').classList.toggle('visible', targetTab === 'diagram');
+                    }
                     break;
             }
         });

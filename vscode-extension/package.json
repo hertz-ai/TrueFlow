@@ -2,7 +2,7 @@
   "name": "trueflow",
   "displayName": "TrueFlow - Deterministic Code Visualizer",
   "description": "Unblackbox LLM code with deterministic truth. Zero-code Python runtime instrumentation with 3D animated execution videos.",
-  "version": "0.1.2",
+  "version": "0.1.5",
   "publisher": "hevolve-ai",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -139,7 +139,11 @@
         },
         "trueflow.manimQuality": {
           "type": "string",
-          "enum": ["low_quality", "medium_quality", "high_quality"],
+          "enum": [
+            "low_quality",
+            "medium_quality",
+            "high_quality"
+          ],
           "default": "medium_quality",
           "description": "Quality setting for Manim video generation"
         }
@@ -179,6 +183,7 @@
     "typescript": "^5.3.0"
   },
   "dependencies": {
-    "ws": "^8.14.0"
+    "@types/ws": "^8.18.1",
+    "ws": "^8.18.3"
   }
 }
