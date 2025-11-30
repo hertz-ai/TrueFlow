@@ -51,6 +51,7 @@ class HubClient private constructor() : Disposable {
         }
 
         private const val HUB_URL = "ws://127.0.0.1:5680"
+        private val STATUS_FILE = java.io.File(System.getProperty("user.home"), ".trueflow/hub_status.json")
     }
 
     // State
@@ -233,7 +234,72 @@ class HubClient private constructor() : Disposable {
         }
     }
 
+    /**
+     * Check if hub is already running by reading status file and verifying process.
+     */
+    private fun isHubRunning(): Boolean {
+        try {
+            if (!STATUS_FILE.exists()) {
+                return false
+            }
+
+            val content = STATUS_FILE.readText()
+            val status = gson.fromJson(content, JsonObject::class.java)
+
+            val running = status.get("running")?.asBoolean ?: false
+            val pid = status.get("pid")?.asLong
+
+            if (!running || pid == null) {
+                return false
+            }
+
+            // Check if the process is still alive
+            return try {
+                // On Windows, use tasklist; on Unix, use kill -0
+                val isWindows = System.getProperty("os.name").lowercase().contains("win")
+                val process = if (isWindows) {
+                    ProcessBuilder("tasklist", "/FI", "PID eq $pid", "/NH")
+                        .redirectErrorStream(true)
+                        .start()
+                } else {
+                    ProcessBuilder("kill", "-0", pid.toString())
+                        .redirectErrorStream(true)
+                        .start()
+                }
+
+                val exitCode = process.waitFor()
+                if (isWindows) {
+                    // tasklist returns 0 even if process not found, need to check output
+                    val output = process.inputStream.bufferedReader().readText()
+                    val isAlive = output.contains(pid.toString())
+                    if (isAlive) {
+                        PluginLogger.info("[TrueFlow Hub] Hub already running (PID: $pid)")
+                    }
+                    isAlive
+                } else {
+                    // kill -0 returns 0 if process exists
+                    if (exitCode == 0) {
+                        PluginLogger.info("[TrueFlow Hub] Hub already running (PID: $pid)")
+                    }
+                    exitCode == 0
+                }
+            } catch (e: Exception) {
+                // Process doesn't exist, status file is stale
+                PluginLogger.info("[TrueFlow Hub] Stale status file, hub not running")
+                false
+            }
+        } catch (e: Exception) {
+            return false
+        }
+    }
+
     private fun startHub() {
+        // Check if hub is already running before starting a new one
+        if (isHubRunning()) {
+            PluginLogger.info("[TrueFlow Hub] Hub already running, skipping start")
+            return
+        }
+
         try {
             // Find the hub script in various locations
             val homeDir = System.getProperty("user.home")
