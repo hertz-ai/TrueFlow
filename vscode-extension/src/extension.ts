@@ -638,14 +638,20 @@ async function createLaunchConfiguration(workspaceRoot: string, entryPoint: stri
 
 function showTraceViewer(context: vscode.ExtensionContext): void {
     if (traceViewerPanel) {
-        traceViewerPanel.reveal(vscode.ViewColumn.Two);
+        traceViewerPanel.reveal();
         return;
     }
+
+    // Use ViewColumn.Beside to add to existing editor group, or Active if there's already content
+    // This prevents creating unnecessary new editor groups
+    const viewColumn = vscode.window.activeTextEditor?.viewColumn === vscode.ViewColumn.One
+        ? vscode.ViewColumn.Beside
+        : vscode.ViewColumn.Active;
 
     traceViewerPanel = vscode.window.createWebviewPanel(
         'trueflowTraceViewer',
         'TrueFlow Trace Viewer',
-        vscode.ViewColumn.Two,
+        { viewColumn, preserveFocus: false },
         {
             enableScripts: true,
             retainContextWhenHidden: true

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "trueflow": {
+      "command": "python",
+      "args": [
+        "src/main/resources/runtime_injector/trueflow_mcp_server.py"
+      ],
+      "env": {
+        "TRUEFLOW_PROJECT_DIR": "."
+      }
+    }
+  }
+}

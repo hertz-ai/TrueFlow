@@ -104,10 +104,16 @@ export class AIExplanationProvider {
             return;
         }
 
+        // Use ViewColumn.Beside to add to existing editor group, or Active if there's already content
+        // This prevents creating unnecessary new editor groups
+        const viewColumn = vscode.window.activeTextEditor?.viewColumn === vscode.ViewColumn.One
+            ? vscode.ViewColumn.Beside
+            : vscode.ViewColumn.Active;
+
         this.panel = vscode.window.createWebviewPanel(
             'trueflowAI',
             'TrueFlow AI Assistant',
-            vscode.ViewColumn.Two,
+            { viewColumn, preserveFocus: false },
             {
                 enableScripts: true,
                 retainContextWhenHidden: true
@@ -576,11 +582,17 @@ Be concise and technical. When analyzing images, describe what you see and relat
     private findLlamaServer(): string | null {
         const homeDir = this.getHomeDir();
         const possiblePaths = [
+            // Windows MSVC build output (Release config goes to bin/Release/)
+            path.join(homeDir, '.trueflow', 'llama.cpp', 'build', 'bin', 'Release', 'llama-server.exe'),
+            // Linux/macOS build output
             path.join(homeDir, '.trueflow', 'llama.cpp', 'build', 'bin', 'llama-server'),
+            // Fallback paths
             path.join(homeDir, '.trueflow', 'llama.cpp', 'build', 'bin', 'llama-server.exe'),
+            path.join(homeDir, 'llama.cpp', 'build', 'bin', 'Release', 'llama-server.exe'),
             path.join(homeDir, 'llama.cpp', 'build', 'bin', 'llama-server'),
             path.join(homeDir, 'llama.cpp', 'build', 'bin', 'llama-server.exe'),
             '/usr/local/bin/llama-server',
+            'C:\\llama.cpp\\build\\bin\\Release\\llama-server.exe',
             'C:\\llama.cpp\\build\\bin\\llama-server.exe'
         ];
 
@@ -635,7 +647,12 @@ Be concise and technical. When analyzing images, describe what you see and relat
                 const buildDir = path.join(installDir, 'build');
                 fs.mkdirSync(buildDir, { recursive: true });
 
-                const cmakeArgs = ['-B', buildDir, '-S', installDir, '-DCMAKE_BUILD_TYPE=Release'];
+                const cmakeArgs = [
+                    '-B', buildDir,
+                    '-S', installDir,
+                    '-DCMAKE_BUILD_TYPE=Release',
+                    '-DLLAMA_BUILD_SERVER=ON'  // Required to build llama-server executable
+                ];
                 if (process.platform === 'win32') {
                     cmakeArgs.push('-G', 'Visual Studio 17 2022', '-A', 'x64');
                 }
