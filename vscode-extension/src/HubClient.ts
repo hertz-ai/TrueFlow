@@ -2,6 +2,8 @@ import WebSocket from 'ws';
 import * as vscode from 'vscode';
 import * as child_process from 'child_process';
 import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
 
 /**
  * TrueFlow Hub Client - WebSocket connection to MCP Hub
@@ -36,6 +38,7 @@ export class HubClient {
     private isConnecting = false;
 
     private readonly HUB_URL = 'ws://127.0.0.1:5680';
+    private readonly STATUS_FILE = path.join(os.homedir(), '.trueflow', 'hub_status.json');
 
     private constructor() {
         // Generate project ID from workspace
@@ -194,7 +197,44 @@ export class HubClient {
         }, delay);
     }
 
+    /**
+     * Check if hub is already running by reading status file and verifying process.
+     */
+    private isHubRunning(): boolean {
+        try {
+            if (!fs.existsSync(this.STATUS_FILE)) {
+                return false;
+            }
+
+            const content = fs.readFileSync(this.STATUS_FILE, 'utf-8');
+            const status = JSON.parse(content);
+
+            if (!status.running || !status.pid) {
+                return false;
+            }
+
+            // Check if the process is still alive
+            try {
+                process.kill(status.pid, 0); // Signal 0 just checks if process exists
+                console.log(`[TrueFlow Hub] Hub already running (PID: ${status.pid})`);
+                return true;
+            } catch {
+                // Process doesn't exist, status file is stale
+                console.log('[TrueFlow Hub] Stale status file, hub not running');
+                return false;
+            }
+        } catch (error) {
+            return false;
+        }
+    }
+
     private async startHub(): Promise<void> {
+        // Check if hub is already running before starting a new one
+        if (this.isHubRunning()) {
+            console.log('[TrueFlow Hub] Hub already running, skipping start');
+            return;
+        }
+
         // Find the hub script
         const extensionPath = vscode.extensions.getExtension('hevolve-ai.trueflow')?.extensionPath;
         let hubScript = '';
