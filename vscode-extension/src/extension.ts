@@ -59,6 +59,7 @@ const MODEL_PRESETS: ModelPreset[] = [
 
 let llmServerProcess: child_process.ChildProcess | undefined;
 let currentModelPath: string | undefined;
+let currentContextSelection: number = 0;
 
 /**
  * TrueFlow VS Code Extension
@@ -155,6 +156,11 @@ class TrueFlowSidebarProvider implements vscode.WebviewViewProvider {
                 case 'manageFilters':
                     showFilterManagementDialog();
                     break;
+                case 'contextChanged':
+                    // Store context selection for AI panel to use
+                    currentContextSelection = message.value;
+                    AIExplanationProvider.getInstance().setContextSelection(message.value);
+                    break;
                 case 'info':
                     vscode.window.showInformationMessage(message.message);
                     break;
@@ -219,15 +225,26 @@ function setupSocketClientHandlers(): void {
         statusBarItem.backgroundColor = undefined;
         vscode.window.showInformationMessage('TrueFlow: Connected to trace server');
 
-        // Update webview
+        // Update webviews
         if (traceViewerPanel) {
             traceViewerPanel.webview.postMessage({ type: 'socketConnected' });
+        }
+        if (sidebarProvider) {
+            sidebarProvider.postMessage({ type: 'socketConnected' });
         }
     });
 
     traceSocketClient.on('disconnected', () => {
         statusBarItem.text = '$(debug-disconnect) TrueFlow';
         statusBarItem.tooltip = 'TrueFlow: Disconnected from trace server';
+
+        // Notify panels
+        if (sidebarProvider) {
+            sidebarProvider.postMessage({ type: 'socketDisconnected' });
+        }
+        if (traceViewerPanel) {
+            traceViewerPanel.webview.postMessage({ type: 'socketDisconnected' });
+        }
     });
 
     traceSocketClient.on('error', (err: Error) => {
@@ -253,6 +270,24 @@ function setupSocketClientHandlers(): void {
                 data: traceSocketClient.getPerformanceData()
             });
         }
+
+        // Update AI panel with trace data for context injection
+        if (traceSocketClient) {
+            const perfData = traceSocketClient.getPerformanceData();
+            const aiProvider = AIExplanationProvider.getInstance();
+            const callTraceData = {
+                calls: events.map(e => ({
+                    function: e.function,
+                    module: e.module,
+                    depth: e.depth,
+                    duration_ms: e.duration_ms || 0,
+                    type: e.type
+                })),
+                total_calls: events.length
+            };
+            aiProvider.setCallTraceData(callTraceData);
+            aiProvider.setPerformanceData(perfData);
+        }
     });
 }
 
@@ -275,6 +310,15 @@ async function connectToSocket(): Promise<void> {
 
 function disconnectSocket(): void {
     traceSocketClient?.disconnect();
+
+    // Notify both sidebar and trace viewer panel about disconnect
+    if (sidebarProvider) {
+        sidebarProvider.postMessage({ type: 'socketDisconnected' });
+    }
+    if (traceViewerPanel) {
+        traceViewerPanel.webview.postMessage({ type: 'socketDisconnected' });
+    }
+
     vscode.window.showInformationMessage('Detached from trace server');
 }
 
@@ -648,11 +692,23 @@ function showTraceViewer(context: vscode.ExtensionContext, initialTab?: string):
         return;
     }
 
-    // Use ViewColumn.Beside to add to existing editor group, or Active if there's already content
-    // This prevents creating unnecessary new editor groups
-    const viewColumn = vscode.window.activeTextEditor?.viewColumn === vscode.ViewColumn.One
-        ? vscode.ViewColumn.Beside
-        : vscode.ViewColumn.Active;
+    // Open in existing editor group if available, otherwise use active column
+    // ViewColumn.Two opens in second group if it exists, otherwise creates it beside
+    // Check if there are visible editors to determine if we should use existing group
+    const visibleEditors = vscode.window.visibleTextEditors;
+    let viewColumn: vscode.ViewColumn;
+
+    if (visibleEditors.length > 1) {
+        // Multiple editor groups exist - use the second one (or the one not currently active)
+        const activeColumn = vscode.window.activeTextEditor?.viewColumn || vscode.ViewColumn.One;
+        viewColumn = activeColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
+    } else if (visibleEditors.length === 1) {
+        // Single editor - open beside it
+        viewColumn = vscode.ViewColumn.Beside;
+    } else {
+        // No editors open - use active/first column
+        viewColumn = vscode.ViewColumn.Active;
+    }
 
     traceViewerPanel = vscode.window.createWebviewPanel(
         'trueflowTraceViewer',
@@ -994,6 +1050,39 @@ function getSidebarHtml(isConnected: boolean): string {
             background: var(--vscode-focusBorder);
             color: white;
         }
+        .context-selector {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            background: var(--vscode-sideBarSectionHeader-background);
+            border-radius: 4px;
+            margin-bottom: 12px;
+        }
+        .context-selector label {
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            white-space: nowrap;
+        }
+        .context-selector select {
+            flex: 1;
+            padding: 4px 6px;
+            font-size: 11px;
+            background: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .context-badge {
+            font-size: 9px;
+            padding: 2px 5px;
+            background: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            border-radius: 8px;
+            display: none;
+        }
+        .context-badge.active { display: inline-block; }
     </style>
 </head>
 <body>
@@ -1028,6 +1117,20 @@ function getSidebarHtml(isConnected: boolean): string {
             <div id="stat-depth" class="stat-value">0</div>
             <div class="stat-label">Max Depth</div>
         </div>
+    </div>
+
+    <div class="section-title">AI Context</div>
+    <div class="context-selector">
+        <label>📊</label>
+        <select id="contextSelect" onchange="onContextChange()">
+            <option value="0">No context</option>
+            <option value="1">Dead Code</option>
+            <option value="2">Performance</option>
+            <option value="3">Call Trace</option>
+            <option value="4">Diagram</option>
+            <option value="5">All Data</option>
+        </select>
+        <span class="context-badge" id="contextBadge">+</span>
     </div>
 
     <div class="section-title">Session Actions</div>
@@ -1075,6 +1178,18 @@ function getSidebarHtml(isConnected: boolean): string {
         function openTab(tab) {
             // Open full view with specific tab
             vscode.postMessage({ type: 'openFullView', tab: tab });
+        }
+
+        function onContextChange() {
+            const select = document.getElementById('contextSelect');
+            const badge = document.getElementById('contextBadge');
+            const value = select.value;
+
+            // Show badge when context is selected
+            badge.classList.toggle('active', value !== '0');
+
+            // Notify VS Code extension
+            vscode.postMessage({ type: 'contextChanged', value: parseInt(value) });
         }
 
         // Handle messages from extension
@@ -1696,234 +1811,87 @@ function getTraceViewerHtml(initialTab?: string): string {
             const diagramType = document.getElementById('diagram-type').value;
             const showingDeadTrees = document.getElementById('show-dead-call-trees').checked;
 
-            // Build a standalone HTML page with the diagram
-            const htmlContent = \`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TrueFlow Sequence Diagram - Fullscreen</title>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"><\\/script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: #1e1e1e;
-            color: #d4d4d4;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
-        .header {
-            background: #252526;
-            padding: 12px 20px;
-            border-bottom: 1px solid #3c3c3c;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        .header h1 {
-            font-size: 16px;
-            font-weight: 500;
-            color: #569cd6;
-        }
-        .header-info {
-            font-size: 12px;
-            color: #808080;
-        }
-        .header-info span {
-            margin-left: 15px;
-            padding: 3px 8px;
-            background: #3c3c3c;
-            border-radius: 3px;
-        }
-        .controls {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-        .controls button {
-            background: #0e639c;
-            color: white;
-            border: none;
-            padding: 6px 12px;
-            border-radius: 3px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        .controls button:hover {
-            background: #1177bb;
-        }
-        .controls button.secondary {
-            background: #3c3c3c;
-        }
-        .controls button.secondary:hover {
-            background: #4c4c4c;
-        }
-        .diagram-container {
-            flex: 1;
-            overflow: auto;
-            padding: 20px;
-            display: flex;
-            justify-content: center;
-            align-items: flex-start;
-        }
-        .mermaid {
-            background: #2d2d2d;
-            padding: 20px;
-            border-radius: 8px;
-            min-width: 300px;
-        }
-        .mermaid svg {
-            max-width: 100%;
-            height: auto;
-        }
-        .zoom-controls {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            display: flex;
-            gap: 5px;
-            background: #252526;
-            padding: 8px;
-            border-radius: 5px;
-            border: 1px solid #3c3c3c;
-        }
-        .zoom-controls button {
-            width: 32px;
-            height: 32px;
-            background: #3c3c3c;
-            border: none;
-            color: white;
-            border-radius: 3px;
-            cursor: pointer;
-            font-size: 16px;
-        }
-        .zoom-controls button:hover {
-            background: #4c4c4c;
-        }
-        .zoom-level {
-            padding: 0 10px;
-            line-height: 32px;
-            font-size: 12px;
-        }
-        @media print {
-            .header, .zoom-controls { display: none; }
-            body { background: white; }
-            .diagram-container { padding: 0; }
-            .mermaid { background: white; }
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div>
-            <h1>TrueFlow Sequence Diagram</h1>
-            <div class="header-info">
-                <span>Type: \${diagramType === 'mermaid' ? 'Mermaid' : 'PlantUML'}</span>
-                <span>\${showingDeadTrees ? 'Including Dead Call Trees' : 'Runtime Calls Only'}</span>
-                <span>Generated: \${new Date().toLocaleString()}</span>
-            </div>
-        </div>
-        <div class="controls">
-            <button onclick="window.print()" class="secondary">Print / Save PDF</button>
-            <button onclick="downloadSVG()">Download SVG</button>
-        </div>
-    </div>
-    <div class="diagram-container" id="diagram-container">
-        <div class="mermaid" id="mermaid-diagram">
-\${code}
-        </div>
-    </div>
-    <div class="zoom-controls">
-        <button onclick="zoomOut()">-</button>
-        <span class="zoom-level" id="zoom-level">100%</span>
-        <button onclick="zoomIn()">+</button>
-        <button onclick="resetZoom()">Reset</button>
-    </div>
-    <script>
-        let currentZoom = 1;
-        const container = document.getElementById('diagram-container');
-        const diagram = document.getElementById('mermaid-diagram');
-
-        mermaid.initialize({
-            startOnLoad: true,
-            theme: 'dark',
-            securityLevel: 'loose',
-            sequence: {
-                diagramMarginX: 50,
-                diagramMarginY: 10,
-                actorMargin: 50,
-                width: 150,
-                height: 65,
-                boxMargin: 10,
-                boxTextMargin: 5,
-                noteMargin: 10,
-                messageMargin: 35,
-                mirrorActors: true,
-                useMaxWidth: false
-            }
-        });
-
-        function zoomIn() {
-            currentZoom = Math.min(currentZoom + 0.1, 3);
-            applyZoom();
-        }
-
-        function zoomOut() {
-            currentZoom = Math.max(currentZoom - 0.1, 0.3);
-            applyZoom();
-        }
-
-        function resetZoom() {
-            currentZoom = 1;
-            applyZoom();
-        }
-
-        function applyZoom() {
-            diagram.style.transform = 'scale(' + currentZoom + ')';
-            diagram.style.transformOrigin = 'top center';
-            document.getElementById('zoom-level').textContent = Math.round(currentZoom * 100) + '%';
-        }
-
-        function downloadSVG() {
-            const svg = diagram.querySelector('svg');
-            if (!svg) {
-                alert('No diagram rendered yet');
-                return;
-            }
-            const svgData = new XMLSerializer().serializeToString(svg);
-            const blob = new Blob([svgData], { type: 'image/svg+xml' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'trueflow-sequence-diagram.svg';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-        }
-
-        // Keyboard shortcuts
-        document.addEventListener('keydown', (e) => {
-            if (e.key === '+' || e.key === '=') zoomIn();
-            if (e.key === '-') zoomOut();
-            if (e.key === '0') resetZoom();
-            if (e.key === 'p' && e.ctrlKey) { e.preventDefault(); window.print(); }
-        });
-    </script>
-</body>
-</html>\`;
+            // Build a standalone HTML page with the diagram using string concatenation
+            // to avoid nested template literal issues
+            var htmlParts = [];
+            htmlParts.push('<!DOCTYPE html>');
+            htmlParts.push('<html lang="en">');
+            htmlParts.push('<head>');
+            htmlParts.push('<meta charset="UTF-8">');
+            htmlParts.push('<meta name="viewport" content="width=device-width, initial-scale=1.0">');
+            htmlParts.push('<title>TrueFlow Sequence Diagram - Fullscreen</title>');
+            htmlParts.push('<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"><\\/script>');
+            htmlParts.push('<style>');
+            htmlParts.push('* { margin: 0; padding: 0; box-sizing: border-box; }');
+            htmlParts.push('body { background: #1e1e1e; color: #d4d4d4; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; min-height: 100vh; display: flex; flex-direction: column; }');
+            htmlParts.push('.header { background: #252526; padding: 12px 20px; border-bottom: 1px solid #3c3c3c; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }');
+            htmlParts.push('.header h1 { font-size: 16px; font-weight: 500; color: #569cd6; }');
+            htmlParts.push('.header-info { font-size: 12px; color: #808080; }');
+            htmlParts.push('.header-info span { margin-left: 15px; padding: 3px 8px; background: #3c3c3c; border-radius: 3px; }');
+            htmlParts.push('.controls { display: flex; gap: 10px; align-items: center; }');
+            htmlParts.push('.controls button { background: #0e639c; color: white; border: none; padding: 6px 12px; border-radius: 3px; cursor: pointer; font-size: 12px; }');
+            htmlParts.push('.controls button:hover { background: #1177bb; }');
+            htmlParts.push('.controls button.secondary { background: #3c3c3c; }');
+            htmlParts.push('.controls button.secondary:hover { background: #4c4c4c; }');
+            htmlParts.push('.diagram-container { flex: 1; overflow: auto; padding: 20px; display: flex; justify-content: center; align-items: flex-start; }');
+            htmlParts.push('.mermaid { background: #2d2d2d; padding: 20px; border-radius: 8px; min-width: 300px; }');
+            htmlParts.push('.mermaid svg { max-width: 100%; height: auto; }');
+            htmlParts.push('.zoom-controls { position: fixed; bottom: 20px; right: 20px; display: flex; gap: 5px; background: #252526; padding: 8px; border-radius: 5px; border: 1px solid #3c3c3c; }');
+            htmlParts.push('.zoom-controls button { width: 32px; height: 32px; background: #3c3c3c; border: none; color: white; border-radius: 3px; cursor: pointer; font-size: 16px; }');
+            htmlParts.push('.zoom-controls button:hover { background: #4c4c4c; }');
+            htmlParts.push('.zoom-level { padding: 0 10px; line-height: 32px; font-size: 12px; }');
+            htmlParts.push('@media print { .header, .zoom-controls { display: none; } body { background: white; } .diagram-container { padding: 0; } .mermaid { background: white; } }');
+            htmlParts.push('</style>');
+            htmlParts.push('</head>');
+            htmlParts.push('<body>');
+            htmlParts.push('<div class="header">');
+            htmlParts.push('<div>');
+            htmlParts.push('<h1>TrueFlow Sequence Diagram</h1>');
+            htmlParts.push('<div class="header-info">');
+            htmlParts.push('<span id="diagram-type-label">Type: ' + (diagramType === 'mermaid' ? 'Mermaid' : 'PlantUML') + '</span>');
+            htmlParts.push('<span id="dead-trees-label">' + (showingDeadTrees ? 'Including Dead Call Trees' : 'Runtime Calls Only') + '</span>');
+            htmlParts.push('<span id="generated-label">Generated: ' + new Date().toLocaleString() + '</span>');
+            htmlParts.push('</div>');
+            htmlParts.push('</div>');
+            htmlParts.push('<div class="controls">');
+            htmlParts.push('<button onclick="window.print()" class="secondary">Print / Save PDF</button>');
+            htmlParts.push('<button onclick="downloadSVG()">Download SVG</button>');
+            htmlParts.push('</div>');
+            htmlParts.push('</div>');
+            htmlParts.push('<div class="diagram-container" id="diagram-container">');
+            htmlParts.push('<div class="mermaid" id="mermaid-diagram">');
+            htmlParts.push(code.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+            htmlParts.push('</div>');
+            htmlParts.push('</div>');
+            htmlParts.push('<div class="zoom-controls">');
+            htmlParts.push('<button onclick="zoomOut()">-</button>');
+            htmlParts.push('<span class="zoom-level" id="zoom-level">100%</span>');
+            htmlParts.push('<button onclick="zoomIn()">+</button>');
+            htmlParts.push('<button onclick="resetZoom()">Reset</button>');
+            htmlParts.push('</div>');
+            htmlParts.push('<script>');
+            htmlParts.push('var currentZoom = 1;');
+            htmlParts.push('var container = document.getElementById("diagram-container");');
+            htmlParts.push('var diagram = document.getElementById("mermaid-diagram");');
+            htmlParts.push('mermaid.initialize({ startOnLoad: true, theme: "dark", securityLevel: "loose", sequence: { diagramMarginX: 50, diagramMarginY: 10, actorMargin: 50, width: 150, height: 65, boxMargin: 10, boxTextMargin: 5, noteMargin: 10, messageMargin: 35, mirrorActors: true, useMaxWidth: false } });');
+            htmlParts.push('function zoomIn() { currentZoom = Math.min(currentZoom + 0.1, 3); applyZoom(); }');
+            htmlParts.push('function zoomOut() { currentZoom = Math.max(currentZoom - 0.1, 0.3); applyZoom(); }');
+            htmlParts.push('function resetZoom() { currentZoom = 1; applyZoom(); }');
+            htmlParts.push('function applyZoom() { diagram.style.transform = "scale(" + currentZoom + ")"; diagram.style.transformOrigin = "top center"; document.getElementById("zoom-level").textContent = Math.round(currentZoom * 100) + "%"; }');
+            htmlParts.push('function downloadSVG() { var svg = diagram.querySelector("svg"); if (!svg) { alert("No diagram rendered yet"); return; } var svgData = new XMLSerializer().serializeToString(svg); var blob = new Blob([svgData], { type: "image/svg+xml" }); var url = URL.createObjectURL(blob); var a = document.createElement("a"); a.href = url; a.download = "trueflow-sequence-diagram.svg"; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url); }');
+            htmlParts.push('document.addEventListener("keydown", function(e) { if (e.key === "+" || e.key === "=") zoomIn(); if (e.key === "-") zoomOut(); if (e.key === "0") resetZoom(); if (e.key === "p" && e.ctrlKey) { e.preventDefault(); window.print(); } });');
+            htmlParts.push('<\\/script>');
+            htmlParts.push('</body>');
+            htmlParts.push('</html>');
+            var htmlContent = htmlParts.join('\\n');
 
             // Create a Blob and open in new tab
-            const blob = new Blob([htmlContent], { type: 'text/html' });
-            const url = URL.createObjectURL(blob);
-            window.open(url, '_blank');
+            var blob = new Blob([htmlContent], { type: 'text/html' });
+            var blobUrl = URL.createObjectURL(blob);
+            window.open(blobUrl, '_blank');
 
             // Clean up the URL after a short delay
-            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            setTimeout(function() { URL.revokeObjectURL(blobUrl); }, 1000);
 
             vscode.postMessage({ type: 'info', message: 'Diagram opened in browser!' });
         }

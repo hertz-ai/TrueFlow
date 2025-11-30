@@ -13,6 +13,8 @@ import com.intellij.ui.table.JBTable
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.awt.Dimension
+import java.awt.FlowLayout
+import java.awt.Font
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.io.File
@@ -337,48 +339,106 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         dialog.show()
     }
 
+    private var statsExpanded = false
+    private lateinit var expandedStatsPanel: JPanel
+    private lateinit var statsToggleButton: JButton
+    private lateinit var manageFiltersButton: JButton
+
     private fun createStatsPanel() {
-        statsPanel.border = BorderFactory.createTitledBorder("Session Statistics & Global Filters")
+        statsPanel.layout = BorderLayout()
+        statsPanel.border = JBUI.Borders.empty(2, 5)
 
-        val gbc = GridBagConstraints()
-        gbc.gridx = 0
-        gbc.gridy = GridBagConstraints.RELATIVE
-        gbc.anchor = GridBagConstraints.WEST
-        gbc.insets = JBUI.insets(2, 5)
+        // Main content panel using FlowLayout for wrapping on narrow widths
+        val contentPanel = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.LEFT, 4, 2))
 
-        // Add version label at the top (with color coding)
-        versionLabel.foreground = JBColor.BLUE
-        statsPanel.add(versionLabel, gbc)
+        // === Essential stats (always visible, compact) ===
 
-        // Add mode label at the top (with color coding)
-        traceModeLabel.foreground = JBColor.GRAY
-        statsPanel.add(traceModeLabel, gbc)
+        // Calls count - important metric
+        totalCallsLabel.font = totalCallsLabel.font.deriveFont(Font.BOLD, 11f)
+        totalCallsLabel.foreground = JBColor(0x0066CC, 0x66AAFF)
+        contentPanel.add(totalCallsLabel)
 
-        statsPanel.add(currentSessionLabel, gbc)
-        statsPanel.add(processInfoLabel, gbc)
-        statsPanel.add(totalCallsLabel, gbc)
-        statsPanel.add(totalTimeLabel, gbc)
-        statsPanel.add(avgTimeLabel, gbc)
-        statsPanel.add(deadCodePercentLabel, gbc)
+        contentPanel.add(createSeparator())
 
-        // Add separator
-        gbc.fill = GridBagConstraints.HORIZONTAL
-        gbc.insets = JBUI.insets(8, 5, 5, 5)
-        statsPanel.add(JSeparator(), gbc)
+        // Avg time - important metric
+        avgTimeLabel.font = avgTimeLabel.font.deriveFont(Font.BOLD, 11f)
+        avgTimeLabel.foreground = JBColor(0x006600, 0x66FF66)
+        contentPanel.add(avgTimeLabel)
 
-        // Add filter stats label
-        gbc.fill = GridBagConstraints.NONE
-        gbc.insets = JBUI.insets(2, 5)
+        contentPanel.add(createSeparator())
+
+        // Dead code % - important metric (highlighted if > 0)
+        deadCodePercentLabel.font = deadCodePercentLabel.font.deriveFont(Font.BOLD, 11f)
+        deadCodePercentLabel.foreground = JBColor(0xCC6600, 0xFFAA33)
+        contentPanel.add(deadCodePercentLabel)
+
+        contentPanel.add(createSeparator())
+
+        // Filter stats - shows active filter count
         filterStatsLabel.foreground = JBColor(0x008800, 0x88FF88)
-        statsPanel.add(filterStatsLabel, gbc)
+        filterStatsLabel.font = filterStatsLabel.font.deriveFont(11f)
+        contentPanel.add(filterStatsLabel)
 
-        // Add "Manage Filters" button
-        val manageFiltersButton = JButton("Manage Filters")
+        // Manage Filters button - prominent with distinct color
+        manageFiltersButton = JButton("⚙ Filters")
+        manageFiltersButton.preferredSize = Dimension(80, 20)
         manageFiltersButton.toolTipText = "Configure global trace filtering (applies to all tabs)"
-        manageFiltersButton.addActionListener {
-            showFilterManagementDialog()
-        }
-        statsPanel.add(manageFiltersButton, gbc)
+        manageFiltersButton.font = manageFiltersButton.font.deriveFont(Font.BOLD, 10f)
+        manageFiltersButton.background = JBColor(0xE67300, 0xCC6600)
+        manageFiltersButton.foreground = JBColor.WHITE
+        manageFiltersButton.isOpaque = true
+        manageFiltersButton.isBorderPainted = false
+        manageFiltersButton.addActionListener { showFilterManagementDialog() }
+        contentPanel.add(manageFiltersButton)
+
+        contentPanel.add(createSeparator())
+
+        // Toggle button to expand/collapse additional stats
+        statsToggleButton = JButton("▶ More")
+        statsToggleButton.preferredSize = Dimension(65, 20)
+        statsToggleButton.toolTipText = "Show/hide additional statistics (version, session, process info)"
+        statsToggleButton.font = statsToggleButton.font.deriveFont(10f)
+        statsToggleButton.addActionListener { toggleStatsExpansion() }
+        contentPanel.add(statsToggleButton)
+
+        statsPanel.add(contentPanel, BorderLayout.NORTH)
+
+        // Expanded details panel (hidden by default) - secondary info
+        expandedStatsPanel = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.LEFT, 8, 2))
+        expandedStatsPanel.border = JBUI.Borders.empty(0, 5, 2, 5)
+        expandedStatsPanel.isVisible = false
+
+        // Version - secondary info
+        versionLabel.foreground = JBColor.BLUE
+        versionLabel.font = versionLabel.font.deriveFont(10f)
+        expandedStatsPanel.add(versionLabel)
+
+        expandedStatsPanel.add(createSeparator())
+
+        // Session label - secondary
+        currentSessionLabel.font = currentSessionLabel.font.deriveFont(10f)
+        expandedStatsPanel.add(currentSessionLabel)
+
+        expandedStatsPanel.add(createSeparator())
+
+        // Process info - secondary
+        processInfoLabel.font = processInfoLabel.font.deriveFont(10f)
+        expandedStatsPanel.add(processInfoLabel)
+
+        expandedStatsPanel.add(createSeparator())
+
+        // Total time - secondary
+        totalTimeLabel.font = totalTimeLabel.font.deriveFont(10f)
+        expandedStatsPanel.add(totalTimeLabel)
+
+        expandedStatsPanel.add(createSeparator())
+
+        // Trace mode - secondary
+        traceModeLabel.foreground = JBColor.GRAY
+        traceModeLabel.font = traceModeLabel.font.deriveFont(10f)
+        expandedStatsPanel.add(traceModeLabel)
+
+        statsPanel.add(expandedStatsPanel, BorderLayout.CENTER)
 
         // Register filter change listener
         traceFilter.addChangeListener {
@@ -388,6 +448,20 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
         // Initial update
         updateFilterStatsLabel()
+    }
+
+    private fun createSeparator(): JLabel {
+        val sep = JBLabel("|")
+        sep.foreground = JBColor(0xCCCCCC, 0x555555)
+        return sep
+    }
+
+    private fun toggleStatsExpansion() {
+        statsExpanded = !statsExpanded
+        expandedStatsPanel.isVisible = statsExpanded
+        statsToggleButton.text = if (statsExpanded) "▼ Less" else "▶ More"
+        statsPanel.revalidate()
+        statsPanel.repaint()
     }
 
     private fun updateFilterStatsLabel() {

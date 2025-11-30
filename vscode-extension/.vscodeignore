@@ -9,3 +9,5 @@ tsconfig.json
 node_modules/**
 !node_modules/ws/**
 *.vsix
+nul
+build-both.js

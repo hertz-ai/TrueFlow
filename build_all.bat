@@ -100,6 +100,8 @@ if %ERRORLEVEL% neq 0 (
 
 REM ============================================================
 REM 2. Build VS Code Extension (TypeScript/npm)
+REM    Uses build-both.js to auto-increment version and build
+REM    for both Open VSX (hevolve-ai) and VS Marketplace (hertzai)
 REM ============================================================
 echo.
 echo [2/3] Building VS Code Extension...
@@ -107,38 +109,52 @@ echo ------------------------------------------------------------
 
 cd /d "%SCRIPT_DIR%vscode-extension"
 
-if exist "package.json" (
-    REM Install dependencies if node_modules doesn't exist
-    if not exist "node_modules" (
-        echo   Installing npm dependencies...
-        call npm install
-    )
-
-    REM Compile TypeScript
-    call npm run compile
-
-    if %ERRORLEVEL% neq 0 (
-        echo [FAILED] VS Code extension build failed!
-        set "BUILD_SUCCESS=0"
-    ) else (
-        echo [SUCCESS] VS Code extension built successfully!
-        echo   Output: %SCRIPT_DIR%vscode-extension\out\
-
-        REM Package VSIX if vsce is available
-        where vsce >nul 2>nul
-        if %ERRORLEVEL% equ 0 (
-            echo   Packaging VSIX...
-            call vsce package
-            for /f "delims=" %%i in ('dir /b "*.vsix" 2^>nul') do (
-                echo   VSIX: %%i
-            )
-        ) else (
-            echo   [INFO] Install vsce to package VSIX: npm install -g @vscode/vsce
-        )
-    )
-) else (
+if not exist "package.json" (
     echo [SKIPPED] VS Code extension - package.json not found
+    goto :vscode_done
 )
+
+REM Install dependencies if node_modules doesn't exist
+if not exist "node_modules" (
+    echo   Installing npm dependencies...
+    call npm install
+)
+
+REM Use build-both.js for auto-increment and dual-marketplace build
+if not exist "build-both.js" goto :vscode_fallback
+
+echo   Running build-both.js (auto-increment + dual marketplace)...
+call node build-both.js
+if %ERRORLEVEL% neq 0 (
+    echo [FAILED] VS Code extension build failed!
+    set "BUILD_SUCCESS=0"
+) else (
+    echo [SUCCESS] VS Code extension built successfully!
+)
+goto :vscode_done
+
+:vscode_fallback
+REM Fallback to simple compile if build-both.js doesn't exist
+call npm run compile
+if %ERRORLEVEL% neq 0 (
+    echo [FAILED] VS Code extension build failed!
+    set "BUILD_SUCCESS=0"
+    goto :vscode_done
+)
+echo [SUCCESS] VS Code extension built successfully!
+echo   Output: %SCRIPT_DIR%vscode-extension\out\
+
+REM Package VSIX if vsce is available
+where vsce >nul 2>nul
+if %ERRORLEVEL% equ 0 (
+    echo   Packaging VSIX...
+    call vsce package
+    for /f "delims=" %%i in ('dir /b "*.vsix" 2^>nul') do echo   VSIX: %%i
+) else (
+    echo   [INFO] Install vsce to package VSIX: npm install -g @vscode/vsce
+)
+
+:vscode_done
 
 REM ============================================================
 REM 3. Run Tests (if --test flag provided)
@@ -197,6 +213,12 @@ echo.
 echo VS Code Extension:
 if exist "vscode-extension\out\extension.js" (
     echo   [OK] vscode-extension\out\extension.js
+    for /f "delims=" %%i in ('dir /b "vscode-extension\trueflow-openvsx-*.vsix" 2^>nul') do (
+        echo   [OK] vscode-extension\%%i ^(Open VSX - hevolve-ai^)
+    )
+    for /f "delims=" %%i in ('dir /b "vscode-extension\trueflow-vsmarketplace-*.vsix" 2^>nul') do (
+        echo   [OK] vscode-extension\%%i ^(VS Marketplace - hertzai^)
+    )
 ) else (
     echo   [MISSING] Extension not compiled
 )

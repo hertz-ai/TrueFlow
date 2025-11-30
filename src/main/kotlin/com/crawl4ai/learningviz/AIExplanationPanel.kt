@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonArray
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.ComboBox
@@ -52,18 +53,21 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         val fileName: String,
         val sizeMB: Int,
         val description: String,
-        val hasVision: Boolean
+        val hasVision: Boolean,
+        val mmprojFile: String? = null  // Vision projector file for VL models
     )
 
     private val modelPresets = listOf(
         // Qwen3-VL models - excellent for code analysis
+        // Note: mmproj file is required for vision - named mmproj-F16.gguf in each repo
         ModelPreset(
             "Qwen3-VL-2B Instruct Q4_K_XL (Recommended)",
             "unsloth/Qwen3-VL-2B-Instruct-GGUF",
             "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf",
             1500,
             "Vision+text, best for code analysis with diagrams",
-            hasVision = true
+            hasVision = true,
+            mmprojFile = "mmproj-F16.gguf"
         ),
         ModelPreset(
             "Qwen3-VL-2B Thinking Q4_K_XL",
@@ -71,7 +75,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             "Qwen3-VL-2B-Thinking-UD-Q4_K_XL.gguf",
             1500,
             "Vision+text with chain-of-thought reasoning",
-            hasVision = true
+            hasVision = true,
+            mmprojFile = "mmproj-F16.gguf"
         ),
         ModelPreset(
             "Qwen3-VL-4B Instruct Q4_K_XL",
@@ -79,7 +84,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             "Qwen3-VL-4B-Instruct-UD-Q4_K_XL.gguf",
             2800,
             "Larger model, better quality, needs ~6GB RAM",
-            hasVision = true
+            hasVision = true,
+            mmprojFile = "mmproj-F16.gguf"
         ),
         // Gemma 3 models - Google's multimodal
         ModelPreset(
@@ -88,15 +94,16 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             "gemma-3-4b-it-Q4_K_XL.gguf",
             2700,
             "Vision+text, Google Gemma 3, well-tested multimodal",
-            hasVision = true
+            hasVision = true,
+            mmprojFile = "mmproj-F16.gguf"
         ),
         ModelPreset(
             "Gemma-3-1B IT Q4_K_M",
             "unsloth/gemma-3-1b-it-GGUF",
             "gemma-3-1b-it-Q4_K_M.gguf",
             600,
-            "Vision+text, compact & fast, good for quick analysis",
-            hasVision = true
+            "Text-only, compact & fast, good for quick analysis",
+            hasVision = false
         ),
         // SmolVLM - ultra-compact vision model
         ModelPreset(
@@ -105,7 +112,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             "SmolVLM-256M-Instruct-Q8_0.gguf",
             280,
             "Tiny vision model, ultra-fast, basic image analysis",
-            hasVision = true
+            hasVision = true,
+            mmprojFile = "mmproj-SmolVLM-256M-Instruct-f16.gguf"
         ),
         // Text-only option
         ModelPreset(
@@ -136,13 +144,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private val conversationHistory = mutableListOf<ChatMessage>()
     private val maxHistorySize = 3  // Keep last 3 exchanges (6 messages)
 
-    // UI Components
-    private val chatArea = JBTextArea()
-    private val inputField = JBTextArea(3, 50)
-    private val sendButton = JButton("Send")
-    private val attachImageButton = JButton("Attach Image")
-    private val pasteImageButton = JButton("Paste Screenshot")
-    private val clearHistoryButton = JButton("Clear")
+    // UI Components - Rich web-based chat panel
+    private var webChatPanel: AIChatWebPanel? = null
     private val statusLabel = JBLabel("AI Ready")
     private val progressBar = JProgressBar(0, 100)
 
@@ -180,6 +183,10 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private val serverStatusFile = File(System.getProperty("user.home"), ".trueflow/server_status.json")
     private var statusCheckTimer: javax.swing.Timer? = null
 
+    // Chunked context and interrupt control
+    @Volatile private var isOperationCancelled = false
+    private val TOKEN_CHUNK_SIZE = 200  // Tokens per chunk
+
     // Cross-tab data references (set by EnhancedLearningFlowToolWindow)
     private var deadCodeData: JsonObject? = null
     private var performanceData: JsonObject? = null
@@ -205,6 +212,58 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         setupHubHandlers()
         checkModelStatus()
         connectToHub()
+        // Check if server is already running (e.g., from previous session or another IDE)
+        checkExistingServer()
+        // Register listener to reinitialize browser after indexing completes
+        setupIndexingListener()
+    }
+
+    /**
+     * Listen for indexing completion to reinitialize the browser if needed.
+     * The JCEF browser can become disposed during indexing operations.
+     */
+    private fun setupIndexingListener() {
+        project.messageBus.connect().subscribe(DumbService.DUMB_MODE, object : DumbService.DumbModeListener {
+            override fun exitDumbMode() {
+                PluginLogger.info("[TrueFlow] Indexing completed - checking browser state")
+                SwingUtilities.invokeLater {
+                    webChatPanel?.reinitializeIfNeeded()
+                }
+            }
+        })
+    }
+
+    /**
+     * Check if AI server is already running on startup.
+     * This handles the case where PyCharm restarts but the server is still running.
+     */
+    private fun checkExistingServer() {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                val isRunning = checkServerHealth()
+                if (isRunning) {
+                    // Server is running - check status file for details
+                    val status = readServerStatus()
+                    val model = status?.model ?: "Unknown model"
+                    val startedBy = status?.startedBy ?: "external process"
+
+                    SwingUtilities.invokeLater {
+                        startServerButton.text = if (status?.startedBy != null) {
+                            "Using External Server ($startedBy)"
+                        } else {
+                            "Stop AI Server"
+                        }
+                        startServerButton.isEnabled = true
+                        statusLabel.text = "AI Server already running - Ready!"
+                        webChatPanel?.setServerRunning(true, model)
+                        webChatPanel?.updateStatus("Server running: $model")
+                        PluginLogger.info("[TrueFlow] Detected existing AI server on startup (model: $model)")
+                    }
+                }
+            } catch (e: Exception) {
+                PluginLogger.debug("[TrueFlow] No existing server detected: ${e.message}")
+            }
+        }
     }
 
     private fun setupHubHandlers() {
@@ -213,20 +272,23 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             val data = message.data ?: return@on
             val running = data.get("running")?.asBoolean ?: false
             val startedBy = data.get("started_by")?.asString ?: "external"
+            val model = data.get("model")?.asString ?: ""
 
             SwingUtilities.invokeLater {
                 if (running && serverProcess == null) {
                     // Server started by another IDE
                     startServerButton.text = "Using External Server ($startedBy)"
                     startServerButton.isEnabled = false
-                    sendButton.isEnabled = true
                     statusLabel.text = "AI Server running (started by $startedBy) - Ready!"
+                    webChatPanel?.setServerRunning(true, model)
+                    webChatPanel?.updateStatus("Connected via $startedBy: $model")
                 } else if (!running) {
                     // Server stopped
                     startServerButton.text = "Start AI Server"
                     startServerButton.isEnabled = true
-                    sendButton.isEnabled = false
                     statusLabel.text = "AI Server stopped"
+                    webChatPanel?.setServerRunning(false)
+                    webChatPanel?.updateStatus("Server stopped")
                 }
             }
         }
@@ -390,15 +452,17 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     // Server running from another IDE
                     startServerButton.text = "Using External Server (${status.startedBy})"
                     startServerButton.isEnabled = false
-                    sendButton.isEnabled = true
                     statusLabel.text = "AI Server running (started by ${status.startedBy})"
+                    webChatPanel?.setServerRunning(true, status.model ?: "")
+                    webChatPanel?.updateStatus("Connected via ${status.startedBy}")
                 } else if (!isRunning && serverProcess != null) {
                     // Our server died
                     serverProcess = null
                     startServerButton.text = "Start AI Server"
                     startServerButton.isEnabled = true
-                    sendButton.isEnabled = false
                     statusLabel.text = "AI Server stopped unexpectedly"
+                    webChatPanel?.setServerRunning(false)
+                    webChatPanel?.updateStatus("Server stopped unexpectedly")
                 }
             }
         }
@@ -411,37 +475,116 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     private fun setupUI() {
-        border = JBUI.Borders.empty(10)
+        border = JBUI.Borders.empty(5)
 
-        // Top panel - Model selection and server controls
-        val topPanel = JPanel()
-        topPanel.layout = BoxLayout(topPanel, BoxLayout.Y_AXIS)
+        // Initialize the rich web-based chat panel
+        webChatPanel = AIChatWebPanel(project)
 
-        // Model selection row
+        // Wire up callbacks from the web panel
+        webChatPanel?.onSendMessage = { message, imageBase64 ->
+            sendMessageFromWeb(message, imageBase64)
+        }
+
+        webChatPanel?.onStartServer = {
+            toggleServer()
+        }
+
+        webChatPanel?.onStopServer = {
+            stopServer()
+        }
+
+        webChatPanel?.onDownloadModel = {
+            showModelDownloadDialog()
+        }
+
+        webChatPanel?.onAttachImage = {
+            attachImage()
+        }
+
+        webChatPanel?.onPasteImage = {
+            pasteImageFromClipboard()
+        }
+
+        webChatPanel?.onClearHistory = {
+            clearHistory()
+        }
+
+        webChatPanel?.onMaximize = {
+            showMaximizedChat()
+        }
+
+        webChatPanel?.onContextChanged = { index ->
+            // Sync the context selection with the combo box (for consistency)
+            if (index in 0 until contextComboBox.itemCount) {
+                contextComboBox.selectedIndex = index
+            }
+        }
+
+        webChatPanel?.onStopOperation = {
+            // Set cancel flag to interrupt chunked operations or MCP calls
+            isOperationCancelled = true
+            webChatPanel?.showStopButton(false)
+            webChatPanel?.setThinking(false)
+            webChatPanel?.addSystemMessage("Operation cancelled by user")
+        }
+
+        webChatPanel?.onDeployNewModel = {
+            // Stop current server and start with new model
+            stopServer()
+            // Wait a moment for server to stop then start with new model
+            javax.swing.Timer(1000) { _ ->
+                startServer()
+            }.apply {
+                isRepeats = false
+                start()
+            }
+        }
+
+        // Show MCP status if hub is connected
+        if (hubClient.isConnected()) {
+            webChatPanel?.setMCPStatus(true, "MCP Hub: ws://127.0.0.1:5680 | Project: ${hubClient.getProjectId()}")
+        }
+
+        // Add the web panel as the main content
+        add(webChatPanel, BorderLayout.CENTER)
+
+        // Bottom status bar (minimal, since most status is shown in web panel)
+        val statusBar = JPanel(BorderLayout())
+        statusBar.border = JBUI.Borders.empty(2, 5)
+        statusBar.add(statusLabel, BorderLayout.WEST)
+        progressBar.isVisible = false
+        statusBar.add(progressBar, BorderLayout.CENTER)
+        add(statusBar, BorderLayout.SOUTH)
+    }
+
+    private fun showModelDownloadDialog() {
+        val dialog = JDialog(SwingUtilities.getWindowAncestor(this) as? Frame, "Download AI Model", true)
+        dialog.layout = BorderLayout()
+        dialog.preferredSize = Dimension(500, 400)
+
+        val contentPanel = JPanel()
+        contentPanel.layout = BoxLayout(contentPanel, BoxLayout.Y_AXIS)
+        contentPanel.border = JBUI.Borders.empty(10)
+
+        // Model selection
         val modelPanel = JPanel(FlowLayout(FlowLayout.LEFT))
-        modelPanel.add(JBLabel("Model: "))
-        modelComboBox.preferredSize = Dimension(280, 30)
+        modelPanel.add(JBLabel("Select Model: "))
+        modelComboBox.preferredSize = Dimension(350, 30)
         modelComboBox.addActionListener { onModelSelectionChanged() }
         modelPanel.add(modelComboBox)
+        contentPanel.add(modelPanel)
 
         // Custom URL panel (hidden by default)
         customUrlPanel.isVisible = false
         customUrlField.preferredSize = Dimension(400, 30)
-        customUrlField.toolTipText = "Enter HuggingFace URL: https://huggingface.co/user/repo/resolve/main/model.gguf"
+        customUrlField.toolTipText = "Enter HuggingFace URL"
         customUrlPanel.add(JBLabel("URL: "), BorderLayout.WEST)
         customUrlPanel.add(customUrlField, BorderLayout.CENTER)
+        contentPanel.add(customUrlPanel)
 
-        // Server controls
-        val serverPanel = JPanel(FlowLayout(FlowLayout.LEFT))
-        downloadButton.addActionListener { downloadSelectedModel() }
-        startServerButton.addActionListener { toggleServer() }
-        startServerButton.isEnabled = false
-        serverPanel.add(downloadButton)
-        serverPanel.add(startServerButton)
-
-        // HuggingFace search panel (hidden by default, shown when "Custom HuggingFace Model..." selected)
+        // HuggingFace search panel
         hfSearchPanel.border = BorderFactory.createTitledBorder("Search HuggingFace GGUF Models")
-        hfSearchPanel.isVisible = false  // Hidden by default to save space
+        hfSearchPanel.isVisible = false
         val hfSearchInputPanel = JPanel(FlowLayout(FlowLayout.LEFT))
         hfSearchField.preferredSize = Dimension(300, 30)
         hfSearchField.toolTipText = "Search for GGUF models (e.g., qwen, llama, gemma)"
@@ -462,92 +605,368 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             }
         }
         val hfScrollPane = JBScrollPane(hfResultsList)
-        hfScrollPane.preferredSize = Dimension(400, 120)
+        hfScrollPane.preferredSize = Dimension(450, 150)
 
         hfSearchPanel.add(hfSearchInputPanel, BorderLayout.NORTH)
         hfSearchPanel.add(hfScrollPane, BorderLayout.CENTER)
+        contentPanel.add(hfSearchPanel)
 
         // Context selection
         val contextPanel = JPanel(FlowLayout(FlowLayout.LEFT))
         contextPanel.add(JBLabel("Context: "))
         contextComboBox.preferredSize = Dimension(200, 30)
         contextPanel.add(contextComboBox)
-
-        topPanel.add(modelPanel)
-        topPanel.add(customUrlPanel)
-        topPanel.add(serverPanel)
-        topPanel.add(hfSearchPanel)
-        topPanel.add(contextPanel)
-
-        add(topPanel, BorderLayout.NORTH)
-
-        // Chat display area
-        chatArea.isEditable = false
-        chatArea.lineWrap = true
-        chatArea.wrapStyleWord = true
-        chatArea.font = Font("Monospaced", Font.PLAIN, 13)
-        chatArea.background = JBColor(Color(30, 30, 30), Color(30, 30, 30))
-        chatArea.foreground = JBColor.WHITE
-        chatArea.text = buildWelcomeMessage()
-
-        val chatScrollPane = JBScrollPane(chatArea)
-        chatScrollPane.preferredSize = Dimension(600, 400)
-
-        // Input area
-        val inputPanel = JPanel(BorderLayout())
-        inputPanel.border = JBUI.Borders.empty(10, 0, 0, 0)
-
-        inputField.lineWrap = true
-        inputField.wrapStyleWord = true
-        inputField.border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(JBColor.GRAY),
-            JBUI.Borders.empty(5)
-        )
-        inputField.toolTipText = "Type your question here. You can paste images with Ctrl+V."
-
-        // Enable Ctrl+Enter to send
-        inputField.getInputMap(JComponent.WHEN_FOCUSED).put(
-            KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, KeyEvent.CTRL_DOWN_MASK),
-            "send"
-        )
-        inputField.actionMap.put("send", object : AbstractAction() {
-            override fun actionPerformed(e: ActionEvent) {
-                sendMessage()
-            }
-        })
-
-        // Image attachment indicator
-        val imageIndicatorLabel = JBLabel("")
-        imageIndicatorLabel.foreground = JBColor.GREEN
+        contentPanel.add(contextPanel)
 
         // Button panel
         val buttonPanel = JPanel(FlowLayout(FlowLayout.RIGHT))
-        attachImageButton.addActionListener { attachImage() }
-        pasteImageButton.addActionListener { pasteImageFromClipboard() }
-        clearHistoryButton.addActionListener { clearHistory() }
-        sendButton.addActionListener { sendMessage() }
+        downloadButton.addActionListener {
+            downloadSelectedModel()
+        }
+        startServerButton.addActionListener {
+            toggleServer()
+            dialog.dispose()
+        }
+        startServerButton.isEnabled = false
+        buttonPanel.add(downloadButton)
+        buttonPanel.add(startServerButton)
+        buttonPanel.add(JButton("Close").apply {
+            addActionListener { dialog.dispose() }
+        })
 
-        buttonPanel.add(attachImageButton)
-        buttonPanel.add(pasteImageButton)
-        buttonPanel.add(clearHistoryButton)
-        buttonPanel.add(sendButton)
+        dialog.add(contentPanel, BorderLayout.CENTER)
+        dialog.add(buttonPanel, BorderLayout.SOUTH)
+        dialog.pack()
+        dialog.setLocationRelativeTo(this)
 
-        inputPanel.add(JBScrollPane(inputField), BorderLayout.CENTER)
-        inputPanel.add(buttonPanel, BorderLayout.SOUTH)
+        // Check model status before showing
+        checkModelStatus()
+        dialog.isVisible = true
+    }
 
-        // Center panel with chat and input
-        val centerPanel = JPanel(BorderLayout())
-        centerPanel.add(chatScrollPane, BorderLayout.CENTER)
-        centerPanel.add(inputPanel, BorderLayout.SOUTH)
+    private fun showMaximizedChat() {
+        val frame = JFrame("TrueFlow AI Chat - Full Screen")
+        frame.defaultCloseOperation = JFrame.DISPOSE_ON_CLOSE
+        frame.preferredSize = Dimension(1200, 800)
 
-        add(centerPanel, BorderLayout.CENTER)
+        // Create a new web panel for the maximized view
+        val maximizedPanel = AIChatWebPanel(project)
 
-        // Bottom status bar
-        val statusBar = JPanel(BorderLayout())
-        statusBar.add(statusLabel, BorderLayout.WEST)
-        progressBar.isVisible = false
-        statusBar.add(progressBar, BorderLayout.CENTER)
-        add(statusBar, BorderLayout.SOUTH)
+        // Copy conversation history to maximized panel
+        for (msg in conversationHistory) {
+            if (msg.role == "user") {
+                maximizedPanel.addUserMessage(msg.content, msg.imageBase64)
+            } else {
+                maximizedPanel.addAssistantMessage(msg.content)
+            }
+        }
+
+        // Wire up the same callbacks
+        maximizedPanel.onSendMessage = { message, imageBase64 ->
+            sendMessageFromWeb(message, imageBase64)
+            // Also add to the maximized panel
+            maximizedPanel.addUserMessage(message, imageBase64)
+            maximizedPanel.setThinking(true)
+        }
+
+        maximizedPanel.onStartServer = { toggleServer() }
+        maximizedPanel.onStopServer = { stopServer() }
+        maximizedPanel.onDownloadModel = { showModelDownloadDialog() }
+        maximizedPanel.onAttachImage = { attachImageForPanel(maximizedPanel) }
+        maximizedPanel.onPasteImage = { pasteImageForPanel(maximizedPanel) }
+        maximizedPanel.onClearHistory = {
+            clearHistory()
+            maximizedPanel.clearChat()
+        }
+        maximizedPanel.onMaximize = { frame.dispose() }  // Close = restore
+
+        // Update server status
+        val serverRunning = isServerRunning()
+        maximizedPanel.setServerRunning(serverRunning, currentModelFile?.substringAfterLast("/") ?: "")
+
+        frame.contentPane.add(maximizedPanel)
+        frame.pack()
+        frame.setLocationRelativeTo(null)
+        frame.isVisible = true
+    }
+
+    private fun sendMessageFromWeb(message: String, imageBase64: String?) {
+        if (message.isEmpty() && imageBase64 == null) return
+
+        // Check if server is running
+        val serverRunning = isServerRunning()
+        if (!serverRunning) {
+            webChatPanel?.addSystemMessage("Please start the AI server first. Click 'Download Model' then 'Start Server'.")
+            return
+        }
+
+        // Reset cancel flag
+        isOperationCancelled = false
+
+        // Build context from selected tab
+        val contextText = buildContextFromSelection()
+
+        // Add user message to history
+        val userMessage = ChatMessage("user", message, imageBase64)
+        conversationHistory.add(userMessage)
+        trimHistory()
+
+        // Show user message in chat
+        webChatPanel?.addUserMessage(message, imageBase64)
+        webChatPanel?.setThinking(true)
+        webChatPanel?.updateStatus("Thinking...")
+
+        // Send to LLM asynchronously
+        CompletableFuture.runAsync {
+            try {
+                // Estimate tokens (rough: 1 token ≈ 4 chars)
+                val estimatedTokens = contextText.length / 4
+
+                val response = if (estimatedTokens > TOKEN_CHUNK_SIZE) {
+                    // Large context - send in chunks without history
+                    sendWithChunkedContext(message, contextText, imageBase64, estimatedTokens)
+                } else {
+                    // Small context - normal call
+                    callLLM(message, contextText, imageBase64)
+                }
+
+                if (isOperationCancelled) return@runAsync
+
+                // Add assistant response to history
+                conversationHistory.add(ChatMessage("assistant", response))
+                trimHistory()
+
+                SwingUtilities.invokeLater {
+                    webChatPanel?.setThinking(false)
+                    webChatPanel?.showStopButton(false)
+                    webChatPanel?.addAssistantMessage(response)
+                    webChatPanel?.updateStatus("Ready")
+                }
+            } catch (e: Exception) {
+                SwingUtilities.invokeLater {
+                    webChatPanel?.setThinking(false)
+                    webChatPanel?.showStopButton(false)
+                    webChatPanel?.addSystemMessage("Error: ${e.message}")
+                    webChatPanel?.updateStatus("Error occurred")
+                }
+            }
+        }
+    }
+
+    /**
+     * Send context in chunks for large contexts (>200 tokens).
+     * Skips conversation history during chunked calls.
+     */
+    private fun sendWithChunkedContext(
+        userPrompt: String,
+        fullContext: String,
+        imageBase64: String?,
+        totalTokens: Int
+    ): String {
+        val chunkSize = TOKEN_CHUNK_SIZE * 4  // Convert tokens to chars
+        val chunks = fullContext.chunked(chunkSize)
+        val responses = mutableListOf<String>()
+
+        SwingUtilities.invokeLater {
+            webChatPanel?.showStopButton(true)
+            webChatPanel?.updateStatus("Sending context in chunks...")
+        }
+
+        for ((index, chunk) in chunks.withIndex()) {
+            if (isOperationCancelled) {
+                return "Operation cancelled by user"
+            }
+
+            val currentOffset = index * TOKEN_CHUNK_SIZE
+            val nextOffset = minOf((index + 1) * TOKEN_CHUNK_SIZE, totalTokens)
+
+            SwingUtilities.invokeLater {
+                webChatPanel?.setChunkProgress(currentOffset, totalTokens,
+                    "Fetching $currentOffset-$nextOffset of $totalTokens tokens...")
+            }
+
+            // For all chunks, include the original question so LLM has context
+            val prompt = if (index == 0) {
+                "$userPrompt\n\n[Context chunk ${index + 1}/${chunks.size}]:\n$chunk"
+            } else {
+                "Original question: $userPrompt\n\n[Context chunk ${index + 1}/${chunks.size}]:\n$chunk\n\nAnalyze this additional context chunk and provide relevant insights."
+            }
+
+            // Update thinking status with chunk info
+            SwingUtilities.invokeLater {
+                webChatPanel?.setThinking(true, "Analyzing chunk ${index + 1}/${chunks.size}...")
+            }
+
+            // Call LLM WITHOUT history for chunked calls
+            val response = callLLMWithoutHistory(prompt, imageBase64, userPrompt)
+            responses.add(response)
+
+            // Show actual AI response for each chunk (not just "processed" message)
+            if (chunks.size > 1) {
+                SwingUtilities.invokeLater {
+                    webChatPanel?.addAssistantMessage("📦 **Chunk ${index + 1}/${chunks.size}:**\n\n$response")
+
+                    // If not last chunk, show continuation message in thinking area
+                    if (index < chunks.size - 1) {
+                        webChatPanel?.setThinking(true, "Processing next chunk (${index + 2}/${chunks.size})...")
+                    }
+                }
+            }
+        }
+
+        SwingUtilities.invokeLater {
+            webChatPanel?.setChunkProgress(0, 0, "")
+        }
+
+        // If multiple responses, combine them or take the last meaningful one
+        return if (responses.size == 1) {
+            responses[0]
+        } else {
+            // Filter out unhelpful responses
+            val unhelpfulPatterns = listOf(
+                "need more context",
+                "can't continue",
+                "cannot continue",
+                "please provide",
+                "clarify your question",
+                "additional context"
+            )
+            val combined = responses.filter { response ->
+                response.isNotBlank() && unhelpfulPatterns.none { pattern ->
+                    response.contains(pattern, ignoreCase = true)
+                }
+            }
+
+            when {
+                combined.isEmpty() -> "Unable to analyze the context. Please try with a more specific question or smaller context."
+                combined.size > 1 -> "Based on analyzing all context chunks:\n\n${combined.last()}"
+                else -> combined.first()
+            }
+        }
+    }
+
+    /**
+     * Call LLM without conversation history (for chunked context).
+     */
+    private fun callLLMWithoutHistory(prompt: String, imageBase64: String?, originalQuestion: String? = null): String {
+        val messages = mutableListOf<Map<String, Any>>()
+
+        // Sanitize all text inputs
+        val sanitizedPrompt = sanitizeForLLM(prompt)
+        val sanitizedQuestion = originalQuestion?.let { sanitizeForLLM(it) }
+
+        // System prompt with original question context for better chunk analysis
+        val systemContent = if (sanitizedQuestion != null) {
+            sanitizeForLLM("TrueFlow AI: You are analyzing code execution context in chunks. The user's question is: \"$sanitizedQuestion\". Analyze the provided context chunk and extract relevant information to answer this question. Focus on facts from the context, not speculation.")
+        } else {
+            "TrueFlow AI: Analyze the provided context and answer concisely."
+        }
+        messages.add(mapOf(
+            "role" to "system",
+            "content" to systemContent
+        ))
+
+        // User message only (no history)
+        if (imageBase64 != null && modelHasVision()) {
+            messages.add(mapOf(
+                "role" to "user",
+                "content" to listOf(
+                    mapOf("type" to "text", "text" to sanitizedPrompt),
+                    mapOf("type" to "image_url", "image_url" to mapOf("url" to "data:image/png;base64,$imageBase64"))
+                )
+            ))
+        } else {
+            messages.add(mapOf("role" to "user", "content" to sanitizedPrompt))
+        }
+
+        val requestBody = Gson().toJson(mapOf(
+            "model" to "qwen3-vl",
+            "messages" to messages,
+            "max_tokens" to 1024,
+            "temperature" to 0.7
+        ))
+
+        val url = URL("$apiBase/chat/completions")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.doOutput = true
+        conn.connectTimeout = 30000
+        conn.readTimeout = 120000
+
+        OutputStreamWriter(conn.outputStream).use { it.write(requestBody) }
+
+        val responseCode = conn.responseCode
+        if (responseCode != 200) {
+            val errorBody = conn.errorStream?.let { BufferedReader(InputStreamReader(it)).use { r -> r.readText() } } ?: ""
+            val errorMsg = when (responseCode) {
+                500 -> "Server error (500): $errorBody. This may be due to: (1) Model not fully loaded - wait a few seconds, (2) Out of memory - try a smaller model, (3) Invalid request format."
+                503 -> "Server unavailable (503): The AI server is still initializing. Please wait a moment."
+                else -> "HTTP $responseCode: $errorBody"
+            }
+            throw RuntimeException(errorMsg)
+        }
+
+        val response = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
+        val json = Gson().fromJson(response, JsonObject::class.java)
+
+        return json.getAsJsonArray("choices")
+            ?.get(0)?.asJsonObject
+            ?.getAsJsonObject("message")
+            ?.get("content")?.asString
+            ?: "No response"
+    }
+
+    private fun attachImageForPanel(panel: AIChatWebPanel) {
+        // Use JFileChooser with image preview
+        val fileChooser = JFileChooser()
+        fileChooser.dialogTitle = "Select Image"
+        fileChooser.fileSelectionMode = JFileChooser.FILES_ONLY
+        fileChooser.isAcceptAllFileFilterUsed = false
+
+        fileChooser.addChoosableFileFilter(javax.swing.filechooser.FileNameExtensionFilter(
+            "Image Files (*.png, *.jpg, *.jpeg, *.gif, *.bmp)",
+            "png", "jpg", "jpeg", "gif", "bmp"
+        ))
+
+        val previewPanel = ImagePreviewPanel()
+        fileChooser.accessory = previewPanel
+        fileChooser.addPropertyChangeListener { evt ->
+            if (evt.propertyName == JFileChooser.SELECTED_FILE_CHANGED_PROPERTY) {
+                val file = evt.newValue as? File
+                previewPanel.setImage(file)
+            }
+        }
+
+        val result = fileChooser.showOpenDialog(this)
+        if (result == JFileChooser.APPROVE_OPTION) {
+            val file = fileChooser.selectedFile
+            try {
+                val image = ImageIO.read(file)
+                val base64 = encodeImageToBase64(image)
+                pendingImage = base64
+                panel.setImageAttached(true, file.name, base64)
+            } catch (e: Exception) {
+                panel.addSystemMessage("Failed to load image: ${e.message}")
+            }
+        }
+    }
+
+    private fun pasteImageForPanel(panel: AIChatWebPanel) {
+        try {
+            val clipboard = Toolkit.getDefaultToolkit().systemClipboard
+            if (clipboard.isDataFlavorAvailable(DataFlavor.imageFlavor)) {
+                val image = clipboard.getData(DataFlavor.imageFlavor) as Image
+                val bufferedImage = toBufferedImage(image)
+                val base64 = encodeImageToBase64(bufferedImage)
+                pendingImage = base64
+                panel.setImageAttached(true, "Screenshot from clipboard", base64)
+            } else {
+                panel.addSystemMessage("No image in clipboard")
+            }
+        } catch (e: Exception) {
+            panel.addSystemMessage("Failed to paste image: ${e.message}")
+        }
     }
 
     private fun buildWelcomeMessage(): String {
@@ -577,86 +996,10 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
     // ==================== Chat Functions ====================
 
-    private fun sendMessage() {
-        val userInput = inputField.text.trim()
-        if (userInput.isEmpty() && pendingImage == null) {
-            return
-        }
-
-        // Check if server is running (either our local process or external server)
-        val serverRunning = (serverProcess != null && serverProcess!!.isAlive) || checkServerHealth()
-        if (!serverRunning) {
-            appendToChat("System", "Please start the AI server first.")
-            return
-        }
-
-        // Build context from selected tab
-        val contextText = buildContextFromSelection()
-
-        // Add user message to history
-        val userMessage = ChatMessage("user", userInput, pendingImage)
-        conversationHistory.add(userMessage)
-        trimHistory()
-
-        // Display in chat
-        if (pendingImage != null) {
-            appendToChat("You", "$userInput\n[Image attached]")
-        } else {
-            appendToChat("You", userInput)
-        }
-
-        // Clear input
-        inputField.text = ""
-        val sentImage = pendingImage
-        pendingImage = null
-        updateImageIndicator()
-
-        // Disable send while processing
-        sendButton.isEnabled = false
-        statusLabel.text = "Thinking..."
-
-        // Send to LLM asynchronously
-        CompletableFuture.runAsync {
-            try {
-                val response = callLLM(userInput, contextText, sentImage)
-
-                // Add assistant response to history
-                conversationHistory.add(ChatMessage("assistant", response))
-                trimHistory()
-
-                SwingUtilities.invokeLater {
-                    appendToChat("AI", response)
-                    sendButton.isEnabled = true
-                    statusLabel.text = "Ready"
-                }
-            } catch (e: Exception) {
-                SwingUtilities.invokeLater {
-                    appendToChat("System", "Error: ${e.message}")
-                    sendButton.isEnabled = true
-                    statusLabel.text = "Error occurred"
-                }
-            }
-        }
-    }
-
-    private fun appendToChat(sender: String, message: String) {
-        val timestamp = java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
-        val prefix = when (sender) {
-            "You" -> "\n[$timestamp] You:\n"
-            "AI" -> "\n[$timestamp] AI:\n"
-            else -> "\n[$timestamp] $sender:\n"
-        }
-        chatArea.append(prefix)
-        chatArea.append(message)
-        chatArea.append("\n")
-        chatArea.caretPosition = chatArea.document.length
-    }
-
     private fun clearHistory() {
         conversationHistory.clear()
-        chatArea.text = buildWelcomeMessage()
+        webChatPanel?.clearChat()
         pendingImage = null
-        updateImageIndicator()
     }
 
     private fun trimHistory() {
@@ -669,19 +1012,87 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     // ==================== Image Functions ====================
 
     private fun attachImage() {
-        val descriptor = FileChooserDescriptorFactory.createSingleFileDescriptor()
-            .withFileFilter { it.extension?.lowercase() in listOf("png", "jpg", "jpeg", "gif", "bmp") }
-            .withTitle("Select Image")
+        // Use JFileChooser with image preview instead of IntelliJ's FileChooser
+        val fileChooser = JFileChooser()
+        fileChooser.dialogTitle = "Select Image"
+        fileChooser.fileSelectionMode = JFileChooser.FILES_ONLY
+        fileChooser.isAcceptAllFileFilterUsed = false
 
-        FileChooser.chooseFile(descriptor, project, null) { virtualFile ->
+        // Add image file filter
+        fileChooser.addChoosableFileFilter(javax.swing.filechooser.FileNameExtensionFilter(
+            "Image Files (*.png, *.jpg, *.jpeg, *.gif, *.bmp)",
+            "png", "jpg", "jpeg", "gif", "bmp"
+        ))
+
+        // Add image preview accessory panel
+        val previewPanel = ImagePreviewPanel()
+        fileChooser.accessory = previewPanel
+        fileChooser.addPropertyChangeListener { evt ->
+            if (evt.propertyName == JFileChooser.SELECTED_FILE_CHANGED_PROPERTY) {
+                val file = evt.newValue as? File
+                previewPanel.setImage(file)
+            }
+        }
+
+        val result = fileChooser.showOpenDialog(this)
+        if (result == JFileChooser.APPROVE_OPTION) {
+            val file = fileChooser.selectedFile
             try {
-                val file = File(virtualFile.path)
                 val image = ImageIO.read(file)
-                pendingImage = encodeImageToBase64(image)
-                updateImageIndicator()
+                val base64 = encodeImageToBase64(image)
+                pendingImage = base64
+                webChatPanel?.setImageAttached(true, file.name, base64)
                 statusLabel.text = "Image attached: ${file.name}"
             } catch (e: Exception) {
+                webChatPanel?.addSystemMessage("Failed to load image: ${e.message}")
                 statusLabel.text = "Failed to load image: ${e.message}"
+            }
+        }
+    }
+
+    /**
+     * Image preview panel for JFileChooser accessory
+     */
+    private inner class ImagePreviewPanel : JPanel() {
+        private val imageLabel = JLabel()
+        private val PREVIEW_SIZE = 200
+
+        init {
+            preferredSize = Dimension(PREVIEW_SIZE + 20, PREVIEW_SIZE + 40)
+            layout = BorderLayout()
+            border = BorderFactory.createTitledBorder("Preview")
+            imageLabel.horizontalAlignment = JLabel.CENTER
+            imageLabel.verticalAlignment = JLabel.CENTER
+            add(imageLabel, BorderLayout.CENTER)
+        }
+
+        fun setImage(file: File?) {
+            if (file == null || !file.isFile) {
+                imageLabel.icon = null
+                imageLabel.text = "No preview"
+                return
+            }
+
+            try {
+                val image = ImageIO.read(file)
+                if (image != null) {
+                    // Scale image to fit preview
+                    val scale = minOf(
+                        PREVIEW_SIZE.toDouble() / image.width,
+                        PREVIEW_SIZE.toDouble() / image.height
+                    )
+                    val newWidth = (image.width * scale).toInt()
+                    val newHeight = (image.height * scale).toInt()
+                    val scaled = image.getScaledInstance(newWidth, newHeight, Image.SCALE_SMOOTH)
+                    imageLabel.icon = ImageIcon(scaled)
+                    imageLabel.text = null
+                } else {
+                    imageLabel.icon = null
+                    imageLabel.text = "Cannot preview"
+                }
+            } catch (e: Exception) {
+                imageLabel.icon = null
+                imageLabel.text = "Error loading"
             }
         }
     }
@@ -692,13 +1103,16 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             if (clipboard.isDataFlavorAvailable(DataFlavor.imageFlavor)) {
                 val image = clipboard.getData(DataFlavor.imageFlavor) as Image
                 val bufferedImage = toBufferedImage(image)
-                pendingImage = encodeImageToBase64(bufferedImage)
-                updateImageIndicator()
+                val base64 = encodeImageToBase64(bufferedImage)
+                pendingImage = base64
+                webChatPanel?.setImageAttached(true, "Screenshot from clipboard", base64)
                 statusLabel.text = "Screenshot pasted from clipboard"
             } else {
+                webChatPanel?.addSystemMessage("No image in clipboard")
                 statusLabel.text = "No image in clipboard"
             }
         } catch (e: Exception) {
+            webChatPanel?.addSystemMessage("Failed to paste image: ${e.message}")
             statusLabel.text = "Failed to paste image: ${e.message}"
         }
     }
@@ -716,16 +1130,6 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         val baos = ByteArrayOutputStream()
         ImageIO.write(image, "png", baos)
         return Base64.getEncoder().encodeToString(baos.toByteArray())
-    }
-
-    private fun updateImageIndicator() {
-        if (pendingImage != null) {
-            attachImageButton.text = "Image Ready"
-            attachImageButton.foreground = JBColor.GREEN
-        } else {
-            attachImageButton.text = "Attach Image"
-            attachImageButton.foreground = null
-        }
     }
 
     // ==================== Context Building ====================
@@ -818,31 +1222,93 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         return sb.toString()
     }
 
+    // ==================== MCP Tools (Compact) ====================
+
+    private fun buildMCPToolsDocumentation(): String {
+        // Ultra-compact format for minimal token usage (ASCII only for compatibility)
+        return """
+            |MCP Tools (use mcp{"tool":"name","args":{}} to call):
+            |- get_trace_data: call history
+            |- get_dead_code: unused functions
+            |- get_performance_data: hotspots
+            |- get_sql_queries: SQL with N+1
+            |- export_diagram(format): plantuml/mermaid/d2
+            |- search_function(function_name): find function
+            |- get_call_chain(function_name): callers/callees
+        """.trimMargin()
+    }
+
     // ==================== LLM Communication ====================
+
+    /**
+     * Sanitize text for JSON/LLM API compatibility.
+     * Removes or replaces problematic characters that can cause UTF-8 parsing errors.
+     */
+    private fun sanitizeForLLM(text: String): String {
+        return text
+            // Replace common problematic Unicode characters with ASCII equivalents
+            .replace("•", "-")
+            .replace("–", "-")
+            .replace("—", "-")
+            .replace(""", "\"")
+            .replace(""", "\"")
+            .replace("'", "'")
+            .replace("'", "'")
+            .replace("…", "...")
+            .replace("→", "->")
+            .replace("←", "<-")
+            .replace("↔", "<->")
+            .replace("≤", "<=")
+            .replace("≥", ">=")
+            .replace("≠", "!=")
+            .replace("×", "x")
+            .replace("÷", "/")
+            .replace("±", "+/-")
+            .replace("°", " degrees")
+            .replace("©", "(c)")
+            .replace("®", "(R)")
+            .replace("™", "(TM)")
+            .replace("€", "EUR")
+            .replace("£", "GBP")
+            .replace("¥", "JPY")
+            // Remove or replace control characters and invalid UTF-8 sequences
+            .replace(Regex("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]"), "")
+            // Replace any remaining non-ASCII with space (safe fallback)
+            .replace(Regex("[^\\x20-\\x7E\\n\\r\\t]"), " ")
+            // Collapse multiple spaces
+            .replace(Regex(" +"), " ")
+            .trim()
+    }
 
     private fun callLLM(userPrompt: String, contextText: String, imageBase64: String?): String {
         val messages = mutableListOf<Map<String, Any>>()
 
-        // System prompt
+        // Sanitize all text inputs
+        val sanitizedPrompt = sanitizeForLLM(userPrompt)
+        val sanitizedContext = sanitizeForLLM(contextText)
+
+        // Build MCP tools documentation
+        val mcpToolsDocs = buildMCPToolsDocumentation()
+
+        // Compact system prompt with MCP awareness
+        val systemPrompt = sanitizeForLLM("""TrueFlow AI: Code analysis assistant. Be concise and technical.
+                |$mcpToolsDocs
+                |If context insufficient, use MCP tool. I will execute and return results.
+            """.trimMargin())
+
         messages.add(mapOf(
             "role" to "system",
-            "content" to """You are TrueFlow AI, a code analysis assistant. You help developers understand:
-                |1. Why code is marked as dead/unreachable by analyzing call trees
-                |2. Performance issues by tracing through execution paths
-                |3. Exceptions and errors by examining trace data
-                |4. Code flow from sequence diagrams
-                |
-                |Be concise and technical. When analyzing images, describe what you see and relate it to code concepts.
-            """.trimMargin()
+            "content" to systemPrompt
         ))
 
         // Add conversation history (last 3 exchanges)
         for (msg in conversationHistory.dropLast(1)) {  // Exclude the message we just added
+            val sanitizedContent = sanitizeForLLM(msg.content)
             if (msg.imageBase64 != null && modelHasVision()) {
                 messages.add(mapOf(
                     "role" to msg.role,
                     "content" to listOf(
-                        mapOf("type" to "text", "text" to msg.content),
+                        mapOf("type" to "text", "text" to sanitizedContent),
                         mapOf(
                             "type" to "image_url",
                             "image_url" to mapOf("url" to "data:image/png;base64,${msg.imageBase64}")
@@ -850,15 +1316,15 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     )
                 ))
             } else {
-                messages.add(mapOf("role" to msg.role, "content" to msg.content))
+                messages.add(mapOf("role" to msg.role, "content" to sanitizedContent))
             }
         }
 
         // Current user message with context
-        val fullPrompt = if (contextText.isNotEmpty()) {
-            "$userPrompt\n$contextText"
+        val fullPrompt = if (sanitizedContext.isNotEmpty()) {
+            "$sanitizedPrompt\n$sanitizedContext"
         } else {
-            userPrompt
+            sanitizedPrompt
         }
 
         if (imageBase64 != null && modelHasVision()) {
@@ -893,14 +1359,226 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
         OutputStreamWriter(conn.outputStream).use { it.write(requestBody) }
 
+        val responseCode = conn.responseCode
+        if (responseCode != 200) {
+            val errorBody = conn.errorStream?.let { BufferedReader(InputStreamReader(it)).use { r -> r.readText() } } ?: ""
+            PluginLogger.error("LLM API error $responseCode: $errorBody")
+            PluginLogger.debug("Request body was: ${requestBody.take(500)}...")
+            val errorMsg = when (responseCode) {
+                500 -> "Server error (500): $errorBody. This may be due to: (1) Model not fully loaded - wait a few seconds, (2) Out of memory - try a smaller model, (3) Invalid request format for the model."
+                503 -> "Server unavailable (503): The AI server is still initializing. Please wait a moment."
+                else -> "HTTP $responseCode: $errorBody"
+            }
+            throw RuntimeException(errorMsg)
+        }
+
         val response = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
         val json = Gson().fromJson(response, JsonObject::class.java)
 
-        return json.getAsJsonArray("choices")
+        val content = json.getAsJsonArray("choices")
             ?.get(0)?.asJsonObject
             ?.getAsJsonObject("message")
             ?.get("content")?.asString
             ?: "No response"
+
+        // Check if model requested MCP tool call
+        val mcpResult = detectAndExecuteMCPCall(content)
+        if (mcpResult != null) {
+            // Model requested a tool - execute it and continue conversation
+            val (toolResponse, remainingText) = mcpResult
+
+            // Add tool result to messages and call LLM again
+            val followUpMessages = messages.toMutableList()
+            followUpMessages.add(mapOf("role" to "assistant", "content" to content))
+            followUpMessages.add(mapOf("role" to "user", "content" to "Tool result:\n$toolResponse\n\nNow answer the original question using this data."))
+
+            // Make follow-up call with tool results
+            val followUpBody = Gson().toJson(mapOf(
+                "model" to "qwen3-vl",
+                "messages" to followUpMessages,
+                "max_tokens" to 1024,
+                "temperature" to 0.7
+            ))
+
+            val followUpConn = URL("$apiBase/chat/completions").openConnection() as HttpURLConnection
+            followUpConn.requestMethod = "POST"
+            followUpConn.setRequestProperty("Content-Type", "application/json")
+            followUpConn.doOutput = true
+            followUpConn.connectTimeout = 30000
+            followUpConn.readTimeout = 120000
+
+            OutputStreamWriter(followUpConn.outputStream).use { it.write(followUpBody) }
+
+            val followUpCode = followUpConn.responseCode
+            if (followUpCode != 200) {
+                val followUpError = followUpConn.errorStream?.let { BufferedReader(InputStreamReader(it)).use { r -> r.readText() } } ?: ""
+                PluginLogger.error("Follow-up LLM API error $followUpCode: $followUpError")
+                return content  // Fallback to original response
+            }
+
+            val followUpResponse = BufferedReader(InputStreamReader(followUpConn.inputStream)).use { it.readText() }
+            val followUpJson = Gson().fromJson(followUpResponse, JsonObject::class.java)
+
+            return followUpJson.getAsJsonArray("choices")
+                ?.get(0)?.asJsonObject
+                ?.getAsJsonObject("message")
+                ?.get("content")?.asString
+                ?: content  // Fallback to original if follow-up fails
+        }
+
+        return content
+    }
+
+    /**
+     * Detect MCP tool call in response and execute it.
+     * Returns (toolResponse, remainingText) or null if no tool call.
+     */
+    private fun detectAndExecuteMCPCall(content: String): Pair<String, String>? {
+        // Look for ```mcp{...}``` pattern
+        val mcpPattern = Regex("```mcp\\s*\\{([^}]+)\\}\\s*```", RegexOption.DOT_MATCHES_ALL)
+        val match = mcpPattern.find(content) ?: return null
+
+        try {
+            val jsonStr = "{${match.groupValues[1]}}"
+            val toolCall = Gson().fromJson(jsonStr, JsonObject::class.java)
+            val toolName = toolCall.get("tool")?.asString ?: return null
+            val args = toolCall.getAsJsonObject("args") ?: JsonObject()
+
+            // Execute the tool
+            val result = executeMCPTool(toolName, args)
+            val remainingText = content.replace(match.value, "").trim()
+
+            return Pair(result, remainingText)
+        } catch (e: Exception) {
+            PluginLogger.warn("Failed to parse MCP call: ${e.message}")
+            return null
+        }
+    }
+
+    /**
+     * Execute an MCP tool and return the result as JSON string.
+     * First tries local data, then falls back to Hub RPC for cross-IDE data.
+     */
+    private fun executeMCPTool(toolName: String, args: JsonObject): String {
+        // Try local data first (faster)
+        val localResult = executeLocalMCPTool(toolName, args)
+        if (localResult != null && localResult != "{}") {
+            return localResult
+        }
+
+        // If local data empty and Hub connected, try remote
+        if (hubClient.isConnected()) {
+            return executeRemoteMCPTool(toolName, args)
+        }
+
+        return localResult ?: """{"error":"No data available for $toolName"}"""
+    }
+
+    private fun executeLocalMCPTool(toolName: String, args: JsonObject): String? {
+        return when (toolName) {
+            "get_trace_data" -> {
+                val data = callTraceData
+                if (data != null && data.size() > 0) Gson().toJson(data) else null
+            }
+            "get_dead_code" -> {
+                val data = deadCodeData
+                if (data != null && data.size() > 0) Gson().toJson(data) else null
+            }
+            "get_performance_data" -> {
+                val data = performanceData
+                if (data != null && data.size() > 0) Gson().toJson(data) else null
+            }
+            "get_sql_queries" -> {
+                // TODO: Implement SQL query data collection
+                """{"queries":[],"total_queries":0}"""
+            }
+            "export_diagram" -> {
+                val format = args.get("format")?.asString ?: "plantuml"
+                if (currentDiagramData != null) {
+                    """{"format":"$format","diagram":"${currentDiagramData?.replace("\"", "\\\"") ?: ""}"}"""
+                } else null
+            }
+            "search_function" -> {
+                val funcName = args.get("function_name")?.asString ?: ""
+                if (callTraceData != null) searchFunctionInTrace(funcName) else null
+            }
+            "get_call_chain" -> {
+                val funcName = args.get("function_name")?.asString ?: ""
+                if (callTraceData != null) getCallChainForFunction(funcName) else null
+            }
+            "get_flamegraph_data" -> {
+                val data = performanceData
+                if (data != null && data.size() > 0) Gson().toJson(data) else null
+            }
+            else -> null
+        }
+    }
+
+    /**
+     * Execute MCP tool via Hub RPC (for cross-IDE data access)
+     */
+    private fun executeRemoteMCPTool(toolName: String, args: JsonObject): String {
+        // Map tool names to Hub RPC commands
+        val command = when (toolName) {
+            "get_trace_data" -> "get_trace_data"
+            "get_dead_code" -> "get_dead_code"
+            "get_performance_data" -> "get_performance_data"
+            "export_diagram" -> "export_diagram"
+            else -> return """{"error":"Remote tool not supported: $toolName"}"""
+        }
+
+        // Request from any connected IDE via Hub broadcast
+        hubClient.requestFromProject("*", command, args)
+
+        // Note: This is async - for now return empty and let Hub handlers update data
+        // In future, implement synchronous RPC with timeout
+        return """{"status":"requested","command":"$command","note":"Data will arrive via Hub"}"""
+    }
+
+    private fun searchFunctionInTrace(functionName: String): String {
+        val calls = callTraceData?.getAsJsonArray("calls") ?: return """{"found":false,"calls":[]}"""
+        val matches = calls.filter {
+            it.asJsonObject.get("function")?.asString?.contains(functionName, ignoreCase = true) == true
+        }
+        return """{"found":${matches.isNotEmpty()},"calls":${Gson().toJson(matches.take(10))},"total_matches":${matches.size}}"""
+    }
+
+    private fun getCallChainForFunction(functionName: String): String {
+        val calls = callTraceData?.getAsJsonArray("calls") ?: return """{"function":"$functionName","callers":[],"callees":[]}"""
+
+        // Simple implementation - find callers and callees based on depth
+        val callers = mutableSetOf<String>()
+        val callees = mutableSetOf<String>()
+        var foundDepth = -1
+
+        calls.forEachIndexed { index, call ->
+            val obj = call.asJsonObject
+            val func = obj.get("function")?.asString ?: ""
+            val depth = obj.get("depth")?.asInt ?: 0
+
+            if (func.contains(functionName, ignoreCase = true)) {
+                foundDepth = depth
+                // Look for caller (previous call with lower depth)
+                for (i in index - 1 downTo 0) {
+                    val prev = calls[i].asJsonObject
+                    if ((prev.get("depth")?.asInt ?: 0) < depth) {
+                        callers.add(prev.get("function")?.asString ?: "")
+                        break
+                    }
+                }
+                // Look for callees (next calls with higher depth)
+                for (i in index + 1 until calls.size()) {
+                    val next = calls[i].asJsonObject
+                    val nextDepth = next.get("depth")?.asInt ?: 0
+                    if (nextDepth <= depth) break
+                    if (nextDepth == depth + 1) {
+                        callees.add(next.get("function")?.asString ?: "")
+                    }
+                }
+            }
+        }
+
+        return """{"function":"$functionName","callers":${Gson().toJson(callers.toList())},"callees":${Gson().toJson(callees.toList())}}"""
     }
 
     private fun modelHasVision(): Boolean {
@@ -970,8 +1648,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 val response = callLLM(question, context, image)
                 SwingUtilities.invokeLater {
                     // Also add to visible chat
-                    appendToChat("Panel Query", question)
-                    appendToChat("AI", response)
+                    webChatPanel?.addUserMessage(question, image)
+                    webChatPanel?.addAssistantMessage(response)
                     callback(response)
                 }
             } catch (e: Exception) {
@@ -1094,10 +1772,18 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         customUrlPanel.isVisible = isCustomModel
         hfSearchPanel.isVisible = isCustomModel
 
-        if (preset.sizeMB > 0) {
-            downloadButton.text = "Download Model (${preset.sizeMB}MB)"
+        // Check if this specific model is already downloaded
+        val modelFile = File(modelsDir, preset.fileName)
+        if (modelFile.exists()) {
+            downloadButton.text = "Change Model"
+            downloadButton.isEnabled = true
+            downloadButton.toolTipText = "Current: ${preset.displayName} - Click to download a different model"
+        } else if (preset.sizeMB > 0) {
+            downloadButton.text = "Download (${preset.sizeMB}MB)"
+            downloadButton.toolTipText = "Download ${preset.displayName}"
         } else {
             downloadButton.text = "Download Model"
+            downloadButton.toolTipText = null
         }
 
         checkModelStatus()
@@ -1127,31 +1813,114 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
     private fun checkModelStatus() {
         val modelInfo = getSelectedModelInfo() ?: return
-        val (_, fileName, _) = modelInfo
+        val (_, fileName, displayName) = modelInfo
         val modelFile = File(modelsDir, fileName)
+
+        val selectedIndex = modelComboBox.selectedIndex
+        val preset = if (selectedIndex in modelPresets.indices) modelPresets[selectedIndex] else null
 
         CompletableFuture.runAsync {
             SwingUtilities.invokeLater {
-                if (modelFile.exists()) {
-                    currentModelFile = modelFile.absolutePath
-                    downloadButton.isEnabled = false
-                    downloadButton.text = "Model Downloaded"
-                    startServerButton.isEnabled = true
-                    statusLabel.text = "Model ready: $fileName"
-                } else {
-                    currentModelFile = null
-                    downloadButton.isEnabled = true
-                    startServerButton.isEnabled = false
-                    onModelSelectionChanged()
-                    statusLabel.text = "Model not found. Click 'Download Model' to start."
+                val modelExists = modelFile.exists()
+
+                // Check if fully downloaded (model + mmproj for vision models)
+                val fullyDownloaded = preset != null && isModelFullyDownloaded(preset)
+
+                when {
+                    fullyDownloaded -> {
+                        // All prerequisites downloaded
+                        currentModelFile = modelFile.absolutePath
+                        downloadButton.isEnabled = true
+                        downloadButton.text = "Change Model"
+                        downloadButton.toolTipText = "Current: $displayName"
+                        startServerButton.isEnabled = true
+                        statusLabel.text = "Model ready: $fileName"
+                        webChatPanel?.setDownloadedModel(displayName)
+                    }
+                    modelExists && preset?.hasVision == true && preset.mmprojFile != null -> {
+                        // Model exists but mmproj missing - show download button for mmproj
+                        currentModelFile = modelFile.absolutePath
+                        downloadButton.isEnabled = true
+                        downloadButton.text = "Download Vision Support"
+                        downloadButton.toolTipText = "Download vision projector for $displayName"
+                        startServerButton.isEnabled = false  // Can't start without mmproj for vision model
+                        statusLabel.text = "Vision projector needed. Click to download."
+                        webChatPanel?.setDownloadedModel(null)
+                    }
+                    else -> {
+                        // Model not downloaded
+                        currentModelFile = null
+                        downloadButton.isEnabled = true
+                        startServerButton.isEnabled = false
+                        if (preset != null && preset.sizeMB > 0) {
+                            downloadButton.text = "Download (${preset.sizeMB}MB)"
+                        } else {
+                            downloadButton.text = "Download Model"
+                        }
+                        statusLabel.text = "Model not found. Download to start."
+                        webChatPanel?.setDownloadedModel(null)
+                    }
                 }
             }
         }
     }
 
+    /**
+     * Check if all prerequisites for a model are downloaded.
+     * For vision models, this includes both model file AND mmproj file.
+     */
+    private fun isModelFullyDownloaded(preset: ModelPreset): Boolean {
+        val modelFile = File(modelsDir, preset.fileName)
+        if (!modelFile.exists()) {
+            return false
+        }
+
+        // For vision models, also check mmproj
+        if (preset.hasVision && preset.mmprojFile != null) {
+            val mmprojFile = File(modelsDir, preset.mmprojFile)
+            if (!mmprojFile.exists()) {
+                return false
+            }
+        }
+
+        return true
+    }
+
     private fun downloadSelectedModel() {
         val modelInfo = getSelectedModelInfo() ?: return
         val (url, fileName, displayName) = modelInfo
+
+        // Get the preset to check for mmproj file
+        val selectedIndex = modelComboBox.selectedIndex
+        val preset = if (selectedIndex in modelPresets.indices) modelPresets[selectedIndex] else null
+
+        val destFile = File(modelsDir, fileName)
+        val modelExists = destFile.exists()
+
+        // Check if ALL prerequisites are downloaded (model + mmproj for vision models)
+        if (preset != null && isModelFullyDownloaded(preset)) {
+            // Fully downloaded - just update state
+            currentModelFile = destFile.absolutePath
+            downloadButton.text = "Change Model"
+            downloadButton.toolTipText = "Current: $displayName - Select a different model from dropdown"
+            startServerButton.isEnabled = true
+            statusLabel.text = "Model ready: $fileName"
+            webChatPanel?.setDownloadedModel(displayName)
+            return
+        }
+
+        // Model exists but mmproj is missing for vision model
+        if (modelExists && preset?.mmprojFile != null && preset.hasVision) {
+            currentModelFile = destFile.absolutePath
+            downloadButton.text = "Change Model"
+            startServerButton.isEnabled = true
+            webChatPanel?.setDownloadedModel(displayName)
+
+            // Download only the missing mmproj
+            statusLabel.text = "Downloading vision projector for $displayName..."
+            downloadMmprojOnly(preset, displayName)
+            return
+        }
 
         downloadButton.isEnabled = false
         modelComboBox.isEnabled = false
@@ -1161,14 +1930,41 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
         CompletableFuture.runAsync {
             try {
-                val destFile = File(modelsDir, fileName)
                 downloadFileWithProgress(url, destFile) { downloaded, total ->
                     val pct = if (total > 0) ((downloaded.toDouble() / total) * 100).toInt() else 0
                     val downloadedMB = downloaded / (1024 * 1024)
                     val totalMB = total / (1024 * 1024)
                     SwingUtilities.invokeLater {
                         progressBar.value = pct
-                        statusLabel.text = "Downloading... ${downloadedMB}MB / ${totalMB}MB ($pct%)"
+                        statusLabel.text = "Downloading model... ${downloadedMB}MB / ${totalMB}MB ($pct%)"
+                    }
+                }
+
+                // Download mmproj file if this is a vision model
+                if (preset?.mmprojFile != null && preset.hasVision) {
+                    val mmprojUrl = "https://huggingface.co/${preset.repoId}/resolve/main/${preset.mmprojFile}"
+                    val mmprojDest = File(modelsDir, preset.mmprojFile)
+
+                    if (!mmprojDest.exists()) {
+                        SwingUtilities.invokeLater {
+                            statusLabel.text = "Downloading vision projector..."
+                            progressBar.value = 0
+                        }
+
+                        try {
+                            downloadFileWithProgress(mmprojUrl, mmprojDest) { downloaded, total ->
+                                val pct = if (total > 0) ((downloaded.toDouble() / total) * 100).toInt() else 0
+                                val downloadedMB = downloaded / (1024 * 1024)
+                                val totalMB = total / (1024 * 1024)
+                                SwingUtilities.invokeLater {
+                                    progressBar.value = pct
+                                    statusLabel.text = "Downloading vision projector... ${downloadedMB}MB / ${totalMB}MB ($pct%)"
+                                }
+                            }
+                            PluginLogger.info("Downloaded mmproj file: ${preset.mmprojFile}")
+                        } catch (e: Exception) {
+                            PluginLogger.warn("Failed to download mmproj file: ${e.message} - vision may not work")
+                        }
                     }
                 }
 
@@ -1176,9 +1972,12 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     progressBar.isVisible = false
                     modelComboBox.isEnabled = true
                     currentModelFile = destFile.absolutePath
-                    downloadButton.text = "Model Downloaded"
+                    downloadButton.text = "Change Model"
+                    downloadButton.isEnabled = true
+                    downloadButton.toolTipText = "Current: $displayName"
                     startServerButton.isEnabled = true
                     statusLabel.text = "Download complete: $fileName"
+                    webChatPanel?.setDownloadedModel(displayName)
                 }
 
             } catch (e: Exception) {
@@ -1220,6 +2019,44 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
     }
 
+    /**
+     * Download only the mmproj file for a vision model (when model already exists but mmproj is missing).
+     */
+    private fun downloadMmprojOnly(preset: ModelPreset, displayName: String) {
+        val mmprojFile = preset.mmprojFile ?: return
+        val mmprojUrl = "https://huggingface.co/${preset.repoId}/resolve/main/$mmprojFile"
+        val mmprojDest = File(modelsDir, mmprojFile)
+
+        progressBar.isVisible = true
+        progressBar.value = 0
+        statusLabel.text = "Downloading vision projector..."
+
+        CompletableFuture.runAsync {
+            try {
+                downloadFileWithProgress(mmprojUrl, mmprojDest) { downloaded, total ->
+                    val pct = if (total > 0) ((downloaded.toDouble() / total) * 100).toInt() else 0
+                    val downloadedMB = downloaded / (1024 * 1024)
+                    val totalMB = total / (1024 * 1024)
+                    SwingUtilities.invokeLater {
+                        progressBar.value = pct
+                        statusLabel.text = "Downloading vision projector... ${downloadedMB}MB / ${totalMB}MB ($pct%)"
+                    }
+                }
+                SwingUtilities.invokeLater {
+                    progressBar.isVisible = false
+                    statusLabel.text = "Model ready: $displayName (vision enabled)"
+                    PluginLogger.info("Downloaded mmproj file: $mmprojFile")
+                }
+            } catch (e: Exception) {
+                SwingUtilities.invokeLater {
+                    progressBar.isVisible = false
+                    statusLabel.text = "Model ready: $displayName (vision projector download failed)"
+                    PluginLogger.warn("Failed to download mmproj file: ${e.message}")
+                }
+            }
+        }
+    }
+
     private fun toggleServer() {
         if (serverProcess != null && serverProcess!!.isAlive) {
             stopServer()
@@ -1237,8 +2074,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             SwingUtilities.invokeLater {
                 startServerButton.text = "Using External Server (${existingStatus.startedBy})"
                 startServerButton.isEnabled = false
-                sendButton.isEnabled = true
                 statusLabel.text = "AI Server already running (started by ${existingStatus.startedBy})"
+                webChatPanel?.setServerRunning(true, existingStatus.model ?: "")
+                webChatPanel?.updateStatus("Connected via ${existingStatus.startedBy}")
             }
             return
         }
@@ -1254,7 +2092,6 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
         CompletableFuture.runAsync {
             try {
-                val mmproj = File(modelsDir, "mmproj-F16.gguf")
                 val llamaServer = findLlamaServer()
 
                 if (llamaServer == null) {
@@ -1264,6 +2101,24 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     }
                     return@runAsync
                 }
+
+                // Find the matching mmproj file for this model
+                val modelFileName = File(modelFile).name
+                val matchingPreset = modelPresets.find { it.fileName == modelFileName }
+                val mmprojFile = if (matchingPreset?.mmprojFile != null) {
+                    File(modelsDir, matchingPreset.mmprojFile)
+                } else {
+                    // Fallback: try to find any mmproj that matches the model prefix
+                    val modelPrefix = modelFileName.substringBefore("-Q").substringBefore("-UD")
+                    modelsDir.listFiles()?.find {
+                        it.name.startsWith("mmproj") && it.name.contains(modelPrefix, ignoreCase = true)
+                    }
+                }
+
+                val isVisionModel = matchingPreset?.hasVision == true ||
+                    modelFile.contains("-VL-", ignoreCase = true) ||
+                    modelFile.contains("gemma-3", ignoreCase = true) ||
+                    modelFile.contains("smol", ignoreCase = true)
 
                 val cmd = mutableListOf(
                     llamaServer,
@@ -1276,15 +2131,17 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 )
 
                 // Add vision model flags
-                if (modelFile.contains("-VL-", ignoreCase = true) ||
-                    modelFile.contains("gemma-3", ignoreCase = true) ||
-                    modelFile.contains("smol", ignoreCase = true)) {
+                if (isVisionModel) {
                     cmd.add("--kv-unified")
                     cmd.add("--no-mmproj-offload")
                 }
 
-                if (mmproj.exists() && modelFile.contains("-VL-", ignoreCase = true)) {
-                    cmd.addAll(listOf("--mmproj", mmproj.absolutePath))
+                // Add mmproj if available for vision models
+                if (mmprojFile != null && mmprojFile.exists() && isVisionModel) {
+                    cmd.addAll(listOf("--mmproj", mmprojFile.absolutePath))
+                    PluginLogger.info("Using mmproj: ${mmprojFile.name}")
+                } else if (isVisionModel) {
+                    PluginLogger.warn("Vision model detected but no mmproj file found - image input may not work")
                 }
 
                 serverProcess = ProcessBuilder(cmd)
@@ -1328,13 +2185,18 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
                         startServerButton.text = "Stop AI Server"
                         startServerButton.isEnabled = true
-                        sendButton.isEnabled = true
                         statusLabel.text = "AI Server running - Ready to chat!"
+
+                        // Update web panel
+                        webChatPanel?.setServerRunning(true, modelName)
+                        webChatPanel?.updateStatus("Connected: $modelName")
                     } else {
                         serverProcess?.destroyForcibly()
                         serverProcess = null
                         startServerButton.isEnabled = true
                         statusLabel.text = "Server failed to start"
+                        webChatPanel?.setServerRunning(false)
+                        webChatPanel?.updateStatus("Server failed to start")
                     }
                 }
 
@@ -1342,6 +2204,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 SwingUtilities.invokeLater {
                     startServerButton.isEnabled = true
                     statusLabel.text = "Server error: ${e.message}"
+                    webChatPanel?.setServerRunning(false)
+                    webChatPanel?.updateStatus("Server error: ${e.message}")
                     PluginLogger.warn("Server start failed: ${e.message}")
                 }
             }
@@ -1359,9 +2223,12 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         hubClient.notifyAIServerStopped()
 
         startServerButton.text = "Start AI Server"
-        sendButton.isEnabled = false
         statusLabel.text = "AI Server stopped"
         selectedHFModel = null
+
+        // Update web panel
+        webChatPanel?.setServerRunning(false)
+        webChatPanel?.updateStatus("Server stopped")
     }
 
     private fun startServerWithHF(hfModel: String) {
@@ -1382,7 +2249,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
                 val isVisionModel = hfModel.contains("vl", ignoreCase = true) ||
                         hfModel.contains("vision", ignoreCase = true) ||
-                        hfModel.contains("gemma-3", ignoreCase = true) ||
+                        hfModel.contains("gemma-3-4b", ignoreCase = true) ||  // Gemma-3-4B has vision
                         hfModel.contains("smol", ignoreCase = true)
 
                 val cmd = mutableListOf(
@@ -1396,6 +2263,14 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 )
 
                 if (isVisionModel) {
+                    // Try to find mmproj file in the HuggingFace repo
+                    // llama-server supports -hfmp flag for HuggingFace mmproj
+                    val mmprojName = findMmprojInHFRepo(hfModel)
+                    if (mmprojName != null) {
+                        // Use -hfmp to load mmproj from same repo
+                        cmd.addAll(listOf("-hfmm", mmprojName))
+                        PluginLogger.info("Using mmproj from HF repo: $mmprojName")
+                    }
                     cmd.add("--kv-unified")  // Fix KV cache issues for vision models
                     cmd.add("--no-mmproj-offload")  // CPU compatibility
                 }
@@ -1440,13 +2315,18 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
                         startServerButton.text = "Stop AI Server"
                         startServerButton.isEnabled = true
-                        sendButton.isEnabled = true
                         statusLabel.text = "AI Server running with $hfModel"
+
+                        // Update web panel
+                        webChatPanel?.setServerRunning(true, hfModel)
+                        webChatPanel?.updateStatus("Connected: $hfModel")
                     } else {
                         serverProcess?.destroyForcibly()
                         serverProcess = null
                         startServerButton.isEnabled = true
                         statusLabel.text = "Server failed to start"
+                        webChatPanel?.setServerRunning(false)
+                        webChatPanel?.updateStatus("Server failed to start")
                     }
                 }
 
@@ -1454,6 +2334,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 SwingUtilities.invokeLater {
                     startServerButton.isEnabled = true
                     statusLabel.text = "Server error: ${e.message}"
+                    webChatPanel?.setServerRunning(false)
+                    webChatPanel?.updateStatus("Server error: ${e.message}")
                     PluginLogger.warn("Server start failed: ${e.message}")
                 }
             }
@@ -1512,6 +2394,46 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             num >= 1000000 -> String.format("%.1fM", num / 1000000.0)
             num >= 1000 -> String.format("%.1fK", num / 1000.0)
             else -> num.toString()
+        }
+    }
+
+    /**
+     * Queries HuggingFace API to find mmproj files in a repo.
+     * Returns the filename of the first mmproj file found (preferring F16).
+     */
+    private fun findMmprojInHFRepo(repoId: String): String? {
+        try {
+            val apiUrl = "https://huggingface.co/api/models/$repoId/tree/main"
+            val url = URL(apiUrl)
+            val conn = url.openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", "TrueFlow/1.0")
+            conn.connectTimeout = 10000
+
+            if (conn.responseCode != 200) {
+                return null
+            }
+
+            val response = BufferedReader(InputStreamReader(conn.inputStream)).readText()
+            val files = Gson().fromJson(response, JsonArray::class.java)
+
+            val mmprojFiles = mutableListOf<String>()
+            files.forEach { fileElement ->
+                val file = fileElement.asJsonObject
+                val path = file.get("path")?.asString ?: return@forEach
+                if (path.startsWith("mmproj") && path.endsWith(".gguf")) {
+                    mmprojFiles.add(path)
+                }
+            }
+
+            // Prefer F16 > BF16 > F32 > any
+            return mmprojFiles.find { it.contains("F16", ignoreCase = true) }
+                ?: mmprojFiles.find { it.contains("BF16", ignoreCase = true) }
+                ?: mmprojFiles.find { it.contains("f16", ignoreCase = true) }
+                ?: mmprojFiles.firstOrNull()
+
+        } catch (e: Exception) {
+            PluginLogger.warn("Failed to query HF repo for mmproj: ${e.message}")
+            return null
         }
     }
 
@@ -1771,5 +2693,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         stopStatusPolling()
         stopServer()
         hubClient.disconnect()
+        webChatPanel?.dispose()
+        webChatPanel = null
     }
 }

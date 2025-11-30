@@ -38,13 +38,17 @@ interface ChatMessage {
 
 const MODEL_PRESETS: ModelPreset[] = [
     // Qwen3-VL models - excellent for code analysis
+    // Note: mmproj file is required for vision - verified from HuggingFace repos
     {
         displayName: "Qwen3-VL-2B Instruct Q4_K_XL (Recommended)",
         repoId: "unsloth/Qwen3-VL-2B-Instruct-GGUF",
         fileName: "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf",
         sizeMB: 1500,
         description: "Vision+text, best for code analysis with diagrams",
-        hasVision: true
+        hasVision: true,
+        mmprojRepoId: "unsloth/Qwen3-VL-2B-Instruct-GGUF",
+        mmprojFileName: "mmproj-F16.gguf",
+        mmprojSizeMB: 819
     },
     {
         displayName: "Qwen3-VL-2B Thinking Q4_K_XL",
@@ -52,7 +56,10 @@ const MODEL_PRESETS: ModelPreset[] = [
         fileName: "Qwen3-VL-2B-Thinking-UD-Q4_K_XL.gguf",
         sizeMB: 1500,
         description: "Vision+text with chain-of-thought reasoning",
-        hasVision: true
+        hasVision: true,
+        mmprojRepoId: "unsloth/Qwen3-VL-2B-Thinking-GGUF",
+        mmprojFileName: "mmproj-F16.gguf",
+        mmprojSizeMB: 819
     },
     {
         displayName: "Qwen3-VL-4B Instruct Q4_K_XL",
@@ -60,7 +67,10 @@ const MODEL_PRESETS: ModelPreset[] = [
         fileName: "Qwen3-VL-4B-Instruct-UD-Q4_K_XL.gguf",
         sizeMB: 2800,
         description: "Larger model, better quality, needs ~6GB RAM",
-        hasVision: true
+        hasVision: true,
+        mmprojRepoId: "unsloth/Qwen3-VL-4B-Instruct-GGUF",
+        mmprojFileName: "mmproj-F16.gguf",
+        mmprojSizeMB: 819
     },
     // Gemma 3 models - Google's multimodal
     {
@@ -69,15 +79,19 @@ const MODEL_PRESETS: ModelPreset[] = [
         fileName: "gemma-3-4b-it-Q4_K_XL.gguf",
         sizeMB: 2700,
         description: "Vision+text, Google Gemma 3, well-tested multimodal",
-        hasVision: true
+        hasVision: true,
+        mmprojRepoId: "unsloth/gemma-3-4b-it-GGUF",
+        mmprojFileName: "mmproj-F16.gguf",
+        mmprojSizeMB: 851
     },
     {
+        // Note: Gemma-3-1B does NOT have mmproj in repo - text-only
         displayName: "Gemma-3-1B IT Q4_K_M",
         repoId: "unsloth/gemma-3-1b-it-GGUF",
         fileName: "gemma-3-1b-it-Q4_K_M.gguf",
         sizeMB: 600,
-        description: "Vision+text, compact & fast, good for quick analysis",
-        hasVision: true
+        description: "Text-only, compact & fast, good for quick analysis",
+        hasVision: false
     },
     // SmolVLM - ultra-compact vision model
     {
@@ -86,7 +100,10 @@ const MODEL_PRESETS: ModelPreset[] = [
         fileName: "SmolVLM-256M-Instruct-Q8_0.gguf",
         sizeMB: 280,
         description: "Tiny vision model, ultra-fast, basic image analysis",
-        hasVision: true
+        hasVision: true,
+        mmprojRepoId: "ggml-org/SmolVLM-256M-Instruct-GGUF",
+        mmprojFileName: "mmproj-SmolVLM-256M-Instruct-f16.gguf",
+        mmprojSizeMB: 50
     },
     // Text-only option
     {
@@ -125,6 +142,19 @@ export class AIExplanationProvider {
     private performanceData: any = null;
     private callTraceData: any = null;
     private diagramData: string = '';
+    private currentDiagramData: string = '';
+    private contextSelection: number = 0;
+
+    // Chunking and interrupt control
+    private isOperationCancelled = false;
+    private readonly TOKEN_CHUNK_SIZE = 200;
+
+    // GPU and backend configuration
+    private gpuAvailable: 'cuda' | 'metal' | 'vulkan' | 'none' = 'none';
+    private useGpuAcceleration = false;
+    private backendType: 'llama.cpp' | 'ollama' = 'llama.cpp';
+    private ollamaEndpoint = 'http://127.0.0.1:11434';
+    private totalTokensUsed = 0;
 
     private readonly modelsDir: string;
     private readonly apiBase = 'http://127.0.0.1:8080/v1';
@@ -140,6 +170,138 @@ export class AIExplanationProvider {
         // Initialize hub client
         this.hubClient = HubClient.getInstance();
         this.setupHubHandlers();
+
+        // Detect GPU availability
+        this.detectGpuAcceleration();
+
+        // Check if server is already running (e.g., from previous session or another IDE)
+        this.checkExistingServer();
+    }
+
+    /**
+     * Check if AI server is already running on startup.
+     * This handles the case where VS Code restarts but the server is still running.
+     */
+    private async checkExistingServer(): Promise<void> {
+        try {
+            const isRunning = await this.checkServerHealth();
+            if (isRunning) {
+                // Server is running - check status file for details
+                const status = this.readServerStatus();
+                const model = status?.model || 'Unknown model';
+                const startedBy = status?.startedBy || 'external process';
+
+                console.log(`[TrueFlow] Detected existing AI server on startup (model: ${model})`);
+
+                // Update UI to reflect server is running
+                this.postMessage({
+                    command: 'serverStarted',
+                    modelName: model,
+                    info: `Server running (started by ${startedBy})`
+                });
+                this.postMessage({
+                    command: 'updateStatus',
+                    status: `Server running: ${model}`
+                });
+            }
+        } catch (e) {
+            // No server running, that's fine
+        }
+    }
+
+    /**
+     * Detect available GPU acceleration (CUDA, Metal, Vulkan)
+     * Runs asynchronously to avoid blocking extension activation.
+     */
+    private detectGpuAcceleration(): void {
+        // Run detection in background to avoid blocking
+        setTimeout(() => {
+            this.detectGpuAsync().then(gpu => {
+                this.gpuAvailable = gpu;
+                console.log(`[TrueFlow] GPU acceleration detected: ${this.gpuAvailable}`);
+                // Update UI if panel exists
+                this.postMessage({
+                    command: 'gpuStatus',
+                    available: gpu !== 'none',
+                    type: gpu,
+                    enabled: this.useGpuAcceleration
+                });
+            }).catch(() => {
+                console.log('[TrueFlow] GPU detection failed, defaulting to none');
+            });
+        }, 100);
+    }
+
+    /**
+     * Async GPU detection with timeout protection
+     */
+    private async detectGpuAsync(): Promise<'cuda' | 'metal' | 'vulkan' | 'none'> {
+        const platform = process.platform;
+
+        const runWithTimeout = (cmd: string, timeoutMs: number = 3000): Promise<string> => {
+            return new Promise((resolve, reject) => {
+                const proc = child_process.exec(cmd, { encoding: 'utf-8', timeout: timeoutMs }, (error, stdout) => {
+                    if (error) reject(error);
+                    else resolve(stdout);
+                });
+                // Force kill if timeout
+                setTimeout(() => {
+                    proc.kill('SIGKILL');
+                    reject(new Error('Timeout'));
+                }, timeoutMs);
+            });
+        };
+
+        try {
+            if (platform === 'darwin') {
+                // macOS - assume Metal available on modern Macs
+                return 'metal';
+            } else if (platform === 'win32' || platform === 'linux') {
+                // Check for CUDA (nvidia-smi is fast)
+                try {
+                    await runWithTimeout('nvidia-smi --query-gpu=name --format=csv,noheader', 2000);
+                    return 'cuda';
+                } catch {
+                    // No CUDA, skip Vulkan check (too slow/unreliable)
+                    return 'none';
+                }
+            }
+        } catch {
+            // Detection failed
+        }
+        return 'none';
+    }
+
+    /**
+     * Check if Ollama is running and available
+     */
+    private async checkOllamaAvailable(): Promise<boolean> {
+        return new Promise((resolve) => {
+            http.get(`${this.ollamaEndpoint}/api/tags`, { timeout: 2000 }, (res) => {
+                resolve(res.statusCode === 200);
+            }).on('error', () => resolve(false));
+        });
+    }
+
+    /**
+     * Get list of available Ollama models
+     */
+    private async getOllamaModels(): Promise<string[]> {
+        return new Promise((resolve) => {
+            http.get(`${this.ollamaEndpoint}/api/tags`, { timeout: 5000 }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    try {
+                        const json = JSON.parse(data);
+                        const models = json.models?.map((m: any) => m.name) || [];
+                        resolve(models);
+                    } catch {
+                        resolve([]);
+                    }
+                });
+            }).on('error', () => resolve([]));
+        });
     }
 
     private setupHubHandlers(): void {
@@ -333,11 +495,22 @@ export class AIExplanationProvider {
             return;
         }
 
-        // Use ViewColumn.Beside to add to existing editor group, or Active if there's already content
+        // Open in existing editor group if available, otherwise use active column
         // This prevents creating unnecessary new editor groups
-        const viewColumn = vscode.window.activeTextEditor?.viewColumn === vscode.ViewColumn.One
-            ? vscode.ViewColumn.Beside
-            : vscode.ViewColumn.Active;
+        const visibleEditors = vscode.window.visibleTextEditors;
+        let viewColumn: vscode.ViewColumn;
+
+        if (visibleEditors.length > 1) {
+            // Multiple editor groups exist - use a different one from the active editor
+            const activeColumn = vscode.window.activeTextEditor?.viewColumn || vscode.ViewColumn.One;
+            viewColumn = activeColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
+        } else if (visibleEditors.length === 1) {
+            // Single editor - open beside it
+            viewColumn = vscode.ViewColumn.Beside;
+        } else {
+            // No editors open - use active
+            viewColumn = vscode.ViewColumn.Active;
+        }
 
         this.panel = vscode.window.createWebviewPanel(
             'trueflowAI',
@@ -361,8 +534,21 @@ export class AIExplanationProvider {
         this.hubClient.connect().then(connected => {
             if (connected) {
                 console.log('[TrueFlow] Connected to MCP Hub for cross-IDE coordination');
+                // Update MCP status in UI
+                this.postMessage({
+                    command: 'updateMcpStatus',
+                    connected: true,
+                    endpoint: 'ws://127.0.0.1:5680',
+                    projectId: this.hubClient.getProjectId()
+                });
             } else {
                 console.log('[TrueFlow] Hub not available, using file-based status polling');
+                // Update MCP status in UI
+                this.postMessage({
+                    command: 'updateMcpStatus',
+                    connected: false,
+                    hint: 'Use ```mcp{...}``` in chat to call tools'
+                });
                 // Fall back to polling if hub not available
                 this.startStatusPolling();
             }
@@ -408,8 +594,75 @@ export class AIExplanationProvider {
                 case 'startServerWithHF':
                     await this.startServerWithHF(message.hfModel);
                     break;
+                case 'cancelOperation':
+                    this.isOperationCancelled = true;
+                    this.postMessage({ command: 'operationCancelled' });
+                    break;
+                case 'setGpuAcceleration':
+                    this.useGpuAcceleration = message.enabled;
+                    break;
+                case 'setBackend':
+                    this.backendType = message.backend;
+                    if (message.backend === 'ollama' && message.endpoint) {
+                        this.ollamaEndpoint = message.endpoint;
+                    }
+                    break;
+                case 'checkOllama':
+                    this.checkOllamaStatus();
+                    break;
+                case 'startOllamaServer':
+                    await this.startWithOllama(message.model);
+                    break;
             }
         });
+    }
+
+    /**
+     * Check Ollama status and get available models
+     */
+    private async checkOllamaStatus(): Promise<void> {
+        const available = await this.checkOllamaAvailable();
+        if (available) {
+            const models = await this.getOllamaModels();
+            this.postMessage({
+                command: 'ollamaStatus',
+                available: true,
+                models: models
+            });
+        } else {
+            this.postMessage({
+                command: 'ollamaStatus',
+                available: false,
+                models: []
+            });
+        }
+    }
+
+    /**
+     * Start using Ollama as backend
+     */
+    private async startWithOllama(model: string): Promise<void> {
+        this.backendType = 'ollama';
+
+        // Verify Ollama is running
+        const available = await this.checkOllamaAvailable();
+        if (!available) {
+            this.postMessage({
+                command: 'addMessage',
+                role: 'system',
+                content: 'Ollama is not running. Please start Ollama first: https://ollama.ai',
+                timestamp: new Date().toLocaleTimeString()
+            });
+            return;
+        }
+
+        // Update status
+        this.postMessage({
+            command: 'ollamaConnected',
+            model: model
+        });
+
+        vscode.window.showInformationMessage(`Connected to Ollama with model: ${model}`);
     }
 
     private async searchHuggingFace(query: string): Promise<void> {
@@ -454,6 +707,35 @@ export class AIExplanationProvider {
                 });
             }).on('error', reject);
         });
+    }
+
+    /**
+     * Queries HuggingFace API to find mmproj files in a repo.
+     * Returns the filename of the first mmproj file found (preferring F16).
+     */
+    private async findMmprojInHFRepo(repoId: string): Promise<string | null> {
+        try {
+            const apiUrl = `https://huggingface.co/api/models/${repoId}/tree/main`;
+            const files = await this.fetchJSON(apiUrl);
+
+            const mmprojFiles: string[] = [];
+            for (const file of files) {
+                const filePath = file.path || '';
+                if (filePath.startsWith('mmproj') && filePath.endsWith('.gguf')) {
+                    mmprojFiles.push(filePath);
+                }
+            }
+
+            // Prefer F16 > BF16 > F32 > any
+            return mmprojFiles.find(f => /F16/i.test(f))
+                || mmprojFiles.find(f => /BF16/i.test(f))
+                || mmprojFiles.find(f => /f16/i.test(f))
+                || mmprojFiles[0]
+                || null;
+        } catch (error) {
+            console.warn(`[TrueFlow] Failed to query HF repo for mmproj: ${error}`);
+            return null;
+        }
     }
 
     private async downloadHFModel(repoId: string, fileName: string): Promise<void> {
@@ -513,7 +795,9 @@ export class AIExplanationProvider {
         this.postMessage({ command: 'serverStarting' });
 
         const cpuCount = require('os').cpus().length;
-        const isVisionModel = /vl|vision|gemma-3|smol/i.test(hfModel);
+        // Note: Gemma-3-1B doesn't have mmproj, so exclude it from vision check
+        const isVisionModel = /vl|vision|smol/i.test(hfModel) ||
+            (/gemma-3-4b/i.test(hfModel));  // Only Gemma-3-4B has vision
 
         const args = [
             '-hf', hfModel,  // Direct HuggingFace loading
@@ -525,6 +809,13 @@ export class AIExplanationProvider {
         ];
 
         if (isVisionModel) {
+            // Try to find mmproj file in the HuggingFace repo
+            const mmprojName = await this.findMmprojInHFRepo(hfModel);
+            if (mmprojName) {
+                // Use -hfmm to specify which mmproj file to load from the repo
+                args.push('-hfmm', mmprojName);
+                console.log(`[TrueFlow] Using mmproj from HF repo: ${mmprojName}`);
+            }
             args.push('--kv-unified');
             args.push('--no-mmproj-offload');
         }
@@ -654,6 +945,9 @@ export class AIExplanationProvider {
             timestamp: userMessage.timestamp
         });
 
+        // Reset cancel flag
+        this.isOperationCancelled = false;
+
         // Show thinking indicator
         this.postMessage({ command: 'setThinking', thinking: true });
 
@@ -661,8 +955,19 @@ export class AIExplanationProvider {
             // Build context
             const contextText = this.buildContext(contextType);
 
-            // Call LLM
-            const response = await this.callLLM(text, contextText, imageBase64);
+            // Estimate tokens (rough: 1 token ≈ 4 chars)
+            const estimatedTokens = Math.floor(contextText.length / 4);
+
+            let response: string;
+            if (estimatedTokens > this.TOKEN_CHUNK_SIZE) {
+                // Large context - send in chunks
+                response = await this.sendWithChunkedContext(text, contextText, imageBase64, estimatedTokens);
+            } else {
+                // Small context - normal call
+                response = await this.callLLM(text, contextText, imageBase64);
+            }
+
+            if (this.isOperationCancelled) return;
 
             // Add assistant response
             const assistantMessage: ChatMessage = {
@@ -688,7 +993,138 @@ export class AIExplanationProvider {
             });
         } finally {
             this.postMessage({ command: 'setThinking', thinking: false });
+            this.postMessage({ command: 'showStopButton', show: false });
         }
+    }
+
+    /**
+     * Send context in chunks for large contexts (>200 tokens)
+     */
+    private async sendWithChunkedContext(
+        userPrompt: string,
+        fullContext: string,
+        imageBase64: string | undefined,
+        totalTokens: number
+    ): Promise<string> {
+        const chunkSize = this.TOKEN_CHUNK_SIZE * 4; // Convert tokens to chars
+        const chunks: string[] = [];
+        for (let i = 0; i < fullContext.length; i += chunkSize) {
+            chunks.push(fullContext.slice(i, i + chunkSize));
+        }
+
+        const responses: string[] = [];
+
+        this.postMessage({ command: 'showStopButton', show: true });
+        this.postMessage({ command: 'updateStatus', status: 'Sending context in chunks...' });
+
+        for (let index = 0; index < chunks.length; index++) {
+            if (this.isOperationCancelled) {
+                return 'Operation cancelled by user';
+            }
+
+            const chunk = chunks[index];
+            const currentOffset = index * this.TOKEN_CHUNK_SIZE;
+            const nextOffset = Math.min((index + 1) * this.TOKEN_CHUNK_SIZE, totalTokens);
+
+            this.postMessage({
+                command: 'setChunkProgress',
+                current: currentOffset,
+                total: totalTokens,
+                message: `Fetching ${currentOffset}-${nextOffset} of ${totalTokens} tokens...`
+            });
+
+            // For all chunks, include the original question for context
+            const prompt = index === 0
+                ? `${userPrompt}\n\n[Context chunk ${index + 1}/${chunks.length}]:\n${chunk}`
+                : `Original question: ${userPrompt}\n\n[Context chunk ${index + 1}/${chunks.length}]:\n${chunk}\n\nAnalyze this additional context chunk and provide relevant insights.`;
+
+            // Update thinking status with chunk info
+            this.postMessage({
+                command: 'setThinking',
+                thinking: true,
+                message: `Analyzing chunk ${index + 1}/${chunks.length}...`
+            });
+
+            // Call LLM WITHOUT history for chunked calls
+            const response = await this.callLLMWithoutHistory(prompt, imageBase64, userPrompt);
+            responses.push(response);
+
+            // Show actual AI response for each chunk (not just "processed" message)
+            if (chunks.length > 1) {
+                this.postMessage({
+                    command: 'addMessage',
+                    role: 'assistant',
+                    content: `📦 **Chunk ${index + 1}/${chunks.length}:**\n\n${response}`,
+                    timestamp: new Date().toLocaleTimeString()
+                });
+
+                // If not last chunk, show continuation message in thinking area
+                if (index < chunks.length - 1) {
+                    this.postMessage({
+                        command: 'setThinking',
+                        thinking: true,
+                        message: `Processing next chunk (${index + 2}/${chunks.length})...`
+                    });
+                }
+            }
+        }
+
+        this.postMessage({ command: 'setChunkProgress', current: 0, total: 0, message: '' });
+
+        // Combine responses - filter out unhelpful responses
+        if (responses.length === 1) {
+            return responses[0];
+        } else {
+            const unhelpfulPatterns = [
+                'need more context',
+                "can't continue",
+                'cannot continue',
+                'please provide',
+                'clarify your question',
+                'additional context'
+            ];
+            const combined = responses.filter(r => {
+                if (!r) return false;
+                const lower = r.toLowerCase();
+                return !unhelpfulPatterns.some(pattern => lower.includes(pattern));
+            });
+
+            if (combined.length === 0) {
+                return 'Unable to analyze the context. Please try with a more specific question or smaller context.';
+            }
+
+            // Return the most comprehensive response (usually the last one with full context)
+            return combined.length > 1
+                ? `Based on analyzing all context chunks:\n\n${combined[combined.length - 1]}`
+                : combined[0];
+        }
+    }
+
+    /**
+     * Call LLM without history (for chunked context)
+     */
+    private async callLLMWithoutHistory(prompt: string, imageBase64?: string, originalQuestion?: string): Promise<string> {
+        const systemContent = originalQuestion
+            ? `TrueFlow AI: You are analyzing code execution context in chunks. The user's question is: "${originalQuestion}". Analyze the provided context chunk and extract relevant information to answer this question. Focus on facts from the context, not speculation.`
+            : 'TrueFlow AI: Analyze the provided context and answer concisely.';
+
+        const messages: any[] = [
+            { role: 'system', content: systemContent }
+        ];
+
+        if (imageBase64 && this.currentModelHasVision) {
+            messages.push({
+                role: 'user',
+                content: [
+                    { type: 'text', text: prompt },
+                    { type: 'image_url', image_url: { url: `data:image/png;base64,${imageBase64}` } }
+                ]
+            });
+        } else {
+            messages.push({ role: 'user', content: prompt });
+        }
+
+        return this.callLLMWithMessages(messages);
     }
 
     private buildContext(contextType: string): string {
@@ -756,16 +1192,22 @@ export class AIExplanationProvider {
     private async callLLM(userPrompt: string, contextText: string, imageBase64?: string): Promise<string> {
         const messages: any[] = [];
 
-        // System prompt
+        // Compact MCP tools documentation
+        const mcpToolsDocs = `MCP Tools (use \`\`\`mcp{"tool":"name","args":{}}\`\`\` to call):
+• get_trace_data - call history
+• get_dead_code - unused functions
+• get_performance_data - hotspots
+• get_sql_queries - SQL with N+1
+• export_diagram(format) - plantuml/mermaid/d2
+• search_function(function_name) - find function
+• get_call_chain(function_name) - callers/callees`;
+
+        // Compact system prompt with MCP awareness
         messages.push({
             role: 'system',
-            content: `You are TrueFlow AI, a code analysis assistant. You help developers understand:
-1. Why code is marked as dead/unreachable by analyzing call trees
-2. Performance issues by tracing through execution paths
-3. Exceptions and errors by examining trace data
-4. Code flow from sequence diagrams
-
-Be concise and technical. When analyzing images, describe what you see and relate it to code concepts.`
+            content: `TrueFlow AI: Code analysis assistant. Be concise & technical.
+${mcpToolsDocs}
+If context insufficient, use MCP tool. I'll execute & return results.`
         });
 
         // Add conversation history
@@ -798,6 +1240,11 @@ Be concise and technical. When analyzing images, describe what you see and relat
             messages.push({ role: 'user', content: fullPrompt });
         }
 
+        // Use Ollama or llama.cpp based on backend selection
+        if (this.backendType === 'ollama') {
+            return this.callOllamaLLM(messages);
+        }
+
         const requestBody = JSON.stringify({
             model: 'qwen3-vl',
             messages,
@@ -820,20 +1267,42 @@ Be concise and technical. When analyzing images, describe what you see and relat
                     // Handle non-200 responses
                     if (res.statusCode !== 200) {
                         console.error(`[TrueFlow] Server returned ${res.statusCode}: ${data}`);
+                        let errorMsg = '';
                         try {
                             const errorJson = JSON.parse(data);
-                            const errorMsg = errorJson.error?.message || errorJson.error || data;
-                            reject(new Error(`Server error (${res.statusCode}): ${errorMsg}`));
+                            errorMsg = errorJson.error?.message || errorJson.error || data;
                         } catch {
-                            reject(new Error(`Server error (${res.statusCode}): ${data.slice(0, 200)}`));
+                            errorMsg = data.slice(0, 200);
                         }
+
+                        // Provide helpful hints for common errors
+                        if (res.statusCode === 500) {
+                            errorMsg = `Server error: ${errorMsg || 'Internal error'}. This may be due to: (1) Model not fully loaded - wait a few seconds, (2) Out of memory - try a smaller model, (3) Invalid request - check if the model supports vision for image queries.`;
+                        } else if (res.statusCode === 503) {
+                            errorMsg = 'Server unavailable. The AI server may still be starting up. Please wait and try again.';
+                        }
+                        reject(new Error(errorMsg));
                         return;
                     }
 
                     try {
                         const json = JSON.parse(data);
                         const content = json.choices?.[0]?.message?.content || 'No response';
-                        resolve(content);
+
+                        // Track token usage
+                        const usage = json.usage;
+                        if (usage) {
+                            this.totalTokensUsed += (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+                            this.postMessage({ command: 'updateTokens', total: this.totalTokensUsed });
+                        }
+
+                        // Check for MCP tool call and handle it
+                        this.handleMCPToolCall(content, messages).then(finalContent => {
+                            resolve(finalContent);
+                        }).catch(err => {
+                            // If MCP handling fails, return original content
+                            resolve(content);
+                        });
                     } catch (e) {
                         console.error(`[TrueFlow] Failed to parse response: ${data.slice(0, 500)}`);
                         reject(new Error('Failed to parse response'));
@@ -851,6 +1320,231 @@ Be concise and technical. When analyzing images, describe what you see and relat
         });
     }
 
+    /**
+     * Call Ollama API for chat completions
+     */
+    private async callOllamaLLM(messages: any[]): Promise<string> {
+        // Get the selected Ollama model from config or use default
+        const ollamaModel = vscode.workspace.getConfiguration('trueflow').get('ollamaModel', 'llama3.2');
+
+        const requestBody = JSON.stringify({
+            model: ollamaModel,
+            messages: messages,
+            stream: false
+        });
+
+        return new Promise((resolve, reject) => {
+            const url = new URL(`${this.ollamaEndpoint}/api/chat`);
+            const req = http.request({
+                hostname: url.hostname,
+                port: url.port || 11434,
+                path: url.pathname,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(requestBody)
+                },
+                timeout: 120000
+            }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    if (res.statusCode !== 200) {
+                        reject(new Error(`Ollama error (${res.statusCode}): ${data.slice(0, 200)}`));
+                        return;
+                    }
+
+                    try {
+                        const json = JSON.parse(data);
+                        const content = json.message?.content || 'No response';
+
+                        // Track token usage (Ollama provides eval_count)
+                        if (json.eval_count) {
+                            this.totalTokensUsed += json.eval_count + (json.prompt_eval_count || 0);
+                            this.postMessage({ command: 'updateTokens', total: this.totalTokensUsed });
+                        }
+
+                        // Check for MCP tool call
+                        this.handleMCPToolCall(content, messages).then(finalContent => {
+                            resolve(finalContent);
+                        }).catch(() => {
+                            resolve(content);
+                        });
+                    } catch (e) {
+                        reject(new Error('Failed to parse Ollama response'));
+                    }
+                });
+            });
+
+            req.on('error', (err) => {
+                reject(new Error(`Ollama connection error: ${err.message}`));
+            });
+            req.on('timeout', () => reject(new Error('Ollama request timeout')));
+            req.write(requestBody);
+            req.end();
+        });
+    }
+
+    /**
+     * Detect and execute MCP tool calls in LLM response
+     */
+    private async handleMCPToolCall(content: string, originalMessages: any[]): Promise<string> {
+        // Look for ```mcp{...}``` pattern
+        const mcpPattern = /```mcp\s*\{([^}]+)\}\s*```/s;
+        const match = content.match(mcpPattern);
+
+        if (!match) {
+            return content; // No tool call, return as-is
+        }
+
+        try {
+            const jsonStr = `{${match[1]}}`;
+            const toolCall = JSON.parse(jsonStr);
+            const toolName = toolCall.tool;
+            const args = toolCall.args || {};
+
+            // Show MCP call in thinking status
+            this.postMessage({
+                command: 'setThinking',
+                thinking: true,
+                message: `Calling MCP tool: ${toolName}...`
+            });
+
+            // Execute the tool
+            const toolResult = this.executeMCPTool(toolName, args);
+
+            // Update thinking status for follow-up
+            this.postMessage({
+                command: 'setThinking',
+                thinking: true,
+                message: `Processing ${toolName} results...`
+            });
+
+            // Make follow-up call with tool results
+            const followUpMessages = [...originalMessages];
+            followUpMessages.push({ role: 'assistant', content: content });
+            followUpMessages.push({ role: 'user', content: `Tool result:\n${toolResult}\n\nNow answer the original question using this data.` });
+
+            // Call LLM again with tool results
+            return this.callLLMWithMessages(followUpMessages);
+        } catch (e) {
+            console.error(`[TrueFlow] Failed to parse MCP call: ${e}`);
+            return content;
+        }
+    }
+
+    /**
+     * Execute an MCP tool and return the result
+     */
+    private executeMCPTool(toolName: string, args: any): string {
+        switch (toolName) {
+            case 'get_trace_data':
+                return JSON.stringify(this.callTraceData || { calls: [], total_calls: 0 });
+            case 'get_dead_code':
+                return JSON.stringify(this.deadCodeData || { dead_functions: [], called_functions: [] });
+            case 'get_performance_data':
+                return JSON.stringify(this.performanceData || { hotspots: [], total_time_ms: 0 });
+            case 'get_sql_queries':
+                return JSON.stringify({ queries: [], total_queries: 0 });
+            case 'export_diagram':
+                const format = args.format || 'plantuml';
+                return JSON.stringify({ format, diagram: this.currentDiagramData || '' });
+            case 'search_function':
+                return this.searchFunctionInTrace(args.function_name || '');
+            case 'get_call_chain':
+                return this.getCallChainForFunction(args.function_name || '');
+            default:
+                return JSON.stringify({ error: `Unknown tool: ${toolName}` });
+        }
+    }
+
+    private searchFunctionInTrace(functionName: string): string {
+        const calls = this.callTraceData?.calls || [];
+        const matches = calls.filter((c: any) =>
+            c.function?.toLowerCase().includes(functionName.toLowerCase())
+        );
+        return JSON.stringify({
+            found: matches.length > 0,
+            calls: matches.slice(0, 10),
+            total_matches: matches.length
+        });
+    }
+
+    private getCallChainForFunction(functionName: string): string {
+        const calls = this.callTraceData?.calls || [];
+        const callers = new Set<string>();
+        const callees = new Set<string>();
+
+        calls.forEach((call: any, index: number) => {
+            if (call.function?.toLowerCase().includes(functionName.toLowerCase())) {
+                const depth = call.depth || 0;
+                // Find caller
+                for (let i = index - 1; i >= 0; i--) {
+                    if ((calls[i].depth || 0) < depth) {
+                        callers.add(calls[i].function || '');
+                        break;
+                    }
+                }
+                // Find callees
+                for (let i = index + 1; i < calls.length; i++) {
+                    const nextDepth = calls[i].depth || 0;
+                    if (nextDepth <= depth) break;
+                    if (nextDepth === depth + 1) {
+                        callees.add(calls[i].function || '');
+                    }
+                }
+            }
+        });
+
+        return JSON.stringify({
+            function: functionName,
+            callers: Array.from(callers),
+            callees: Array.from(callees)
+        });
+    }
+
+    /**
+     * Call LLM with pre-built messages array (for follow-up calls)
+     */
+    private callLLMWithMessages(messages: any[]): Promise<string> {
+        const requestBody = JSON.stringify({
+            model: 'qwen3-vl',
+            messages,
+            max_tokens: 1024,
+            temperature: 0.7
+        });
+
+        return new Promise((resolve, reject) => {
+            const req = http.request(`${this.apiBase}/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(requestBody)
+                },
+                timeout: 120000
+            }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    if (res.statusCode !== 200) {
+                        reject(new Error(`Server error (${res.statusCode})`));
+                        return;
+                    }
+                    try {
+                        const json = JSON.parse(data);
+                        resolve(json.choices?.[0]?.message?.content || 'No response');
+                    } catch {
+                        reject(new Error('Failed to parse response'));
+                    }
+                });
+            });
+            req.on('error', reject);
+            req.on('timeout', () => reject(new Error('Request timeout')));
+            req.write(requestBody);
+            req.end();
+        });
+    }
+
     private trimHistory(): void {
         while (this.conversationHistory.length > this.maxHistorySize * 2) {
             this.conversationHistory.shift();
@@ -859,14 +1553,26 @@ Be concise and technical. When analyzing images, describe what you see and relat
 
     private async checkModelStatus(): Promise<void> {
         const downloadedModels: string[] = [];
+        const fullyDownloadedModels: string[] = [];
+        const needsMmprojModels: string[] = [];
 
         for (const preset of MODEL_PRESETS) {
             const modelPath = path.join(this.modelsDir, preset.fileName);
-            if (fs.existsSync(modelPath)) {
+            const modelExists = fs.existsSync(modelPath);
+
+            if (modelExists) {
                 downloadedModels.push(preset.fileName);
-                if (!this.currentModelFile) {
-                    this.currentModelFile = modelPath;
-                    this.currentModelHasVision = preset.hasVision;
+
+                // Check if fully downloaded (including mmproj for vision models)
+                if (this.isModelFullyDownloaded(preset)) {
+                    fullyDownloadedModels.push(preset.fileName);
+                    if (!this.currentModelFile) {
+                        this.currentModelFile = modelPath;
+                        this.currentModelHasVision = preset.hasVision;
+                    }
+                } else if (preset.hasVision && preset.mmprojFileName) {
+                    // Model exists but needs mmproj
+                    needsMmprojModels.push(preset.fileName);
                 }
             }
         }
@@ -888,16 +1594,33 @@ Be concise and technical. When analyzing images, describe what you see and relat
             }
         }
 
+        // Also check Ollama availability
+        const ollamaAvailable = await this.checkOllamaAvailable();
+        let ollamaModels: string[] = [];
+        if (ollamaAvailable) {
+            ollamaModels = await this.getOllamaModels();
+        }
+
         this.postMessage({
             command: 'updateStatus',
             downloadedModels,
+            fullyDownloadedModels,
+            needsMmprojModels,
             serverRunning: !!this.serverProcess || externalRunning,
             models: MODEL_PRESETS.map(m => ({
                 displayName: m.displayName,
                 sizeMB: m.sizeMB,
                 description: m.description,
-                downloaded: downloadedModels.includes(m.fileName)
-            }))
+                downloaded: downloadedModels.includes(m.fileName),
+                fullyDownloaded: fullyDownloadedModels.includes(m.fileName),
+                needsMmproj: needsMmprojModels.includes(m.fileName)
+            })),
+            // GPU and backend info
+            gpuAvailable: this.gpuAvailable,
+            gpuEnabled: this.useGpuAcceleration,
+            ollamaAvailable: ollamaAvailable,
+            ollamaModels: ollamaModels,
+            totalTokens: this.totalTokensUsed
         });
     }
 
@@ -907,10 +1630,38 @@ Be concise and technical. When analyzing images, describe what you see and relat
 
         const url = `https://huggingface.co/${preset.repoId}/resolve/main/${preset.fileName}`;
         const destPath = path.join(this.modelsDir, preset.fileName);
+        const modelExists = fs.existsSync(destPath);
+
+        // Check if ALL prerequisites are downloaded (model + mmproj for vision models)
+        if (this.isModelFullyDownloaded(preset)) {
+            // Fully downloaded - just update state
+            this.currentModelFile = destPath;
+            this.currentModelHasVision = preset.hasVision;
+            this.postMessage({ command: 'downloadComplete', modelName: preset.displayName });
+            this.checkModelStatus();
+            return;
+        }
+
+        // Model exists but mmproj is missing for vision model
+        if (modelExists && preset.hasVision && preset.mmprojFileName && preset.mmprojRepoId) {
+            this.currentModelFile = destPath;
+            this.currentModelHasVision = preset.hasVision;
+
+            try {
+                this.postMessage({ command: 'downloadStarted', modelName: `${preset.displayName} (vision projector)` });
+                await this.downloadMmprojOnly(preset);
+                this.postMessage({ command: 'downloadComplete', modelName: preset.displayName });
+            } catch (error: any) {
+                this.postMessage({ command: 'downloadError', error: `Vision projector download failed: ${error.message}` });
+            }
+            this.checkModelStatus();
+            return;
+        }
 
         this.postMessage({ command: 'downloadStarted', modelName: preset.displayName });
 
         try {
+            // Download main model file
             await this.downloadFileWithProgress(url, destPath, (downloaded, total) => {
                 const pct = total > 0 ? Math.round((downloaded / total) * 100) : 0;
                 const downloadedMB = Math.round(downloaded / (1024 * 1024));
@@ -919,9 +1670,40 @@ Be concise and technical. When analyzing images, describe what you see and relat
                     command: 'downloadProgress',
                     percent: pct,
                     downloadedMB,
-                    totalMB
+                    totalMB,
+                    stage: 'model'
                 });
             });
+
+            // Download mmproj file if this is a vision model
+            if (preset.hasVision && preset.mmprojFileName && preset.mmprojRepoId) {
+                const mmprojUrl = `https://huggingface.co/${preset.mmprojRepoId}/resolve/main/${preset.mmprojFileName}`;
+                const mmprojDestPath = path.join(this.modelsDir, preset.mmprojFileName);
+
+                // Check if mmproj already exists
+                if (!fs.existsSync(mmprojDestPath)) {
+                    this.postMessage({
+                        command: 'downloadProgress',
+                        percent: 0,
+                        downloadedMB: 0,
+                        totalMB: preset.mmprojSizeMB || 0,
+                        stage: 'mmproj'
+                    });
+
+                    await this.downloadFileWithProgress(mmprojUrl, mmprojDestPath, (downloaded, total) => {
+                        const pct = total > 0 ? Math.round((downloaded / total) * 100) : 0;
+                        const downloadedMB = Math.round(downloaded / (1024 * 1024));
+                        const totalMB = Math.round(total / (1024 * 1024));
+                        this.postMessage({
+                            command: 'downloadProgress',
+                            percent: pct,
+                            downloadedMB,
+                            totalMB,
+                            stage: 'mmproj'
+                        });
+                    });
+                }
+            }
 
             this.currentModelFile = destPath;
             this.currentModelHasVision = preset.hasVision;
@@ -971,6 +1753,58 @@ Be concise and technical. When analyzing images, describe what you see and relat
             }).on('error', (err) => {
                 fs.unlink(destPath, () => {});
                 reject(err);
+            });
+        });
+    }
+
+    /**
+     * Check if all prerequisites for a model are downloaded.
+     * For vision models, this includes both model file AND mmproj file.
+     */
+    private isModelFullyDownloaded(preset: typeof MODEL_PRESETS[0]): boolean {
+        const modelPath = path.join(this.modelsDir, preset.fileName);
+        if (!fs.existsSync(modelPath)) {
+            return false;
+        }
+
+        // For vision models, also check mmproj
+        if (preset.hasVision && preset.mmprojFileName) {
+            const mmprojPath = path.join(this.modelsDir, preset.mmprojFileName);
+            if (!fs.existsSync(mmprojPath)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Download only the mmproj file for a vision model (when model exists but mmproj is missing).
+     */
+    private async downloadMmprojOnly(preset: typeof MODEL_PRESETS[0]): Promise<void> {
+        if (!preset.mmprojFileName || !preset.mmprojRepoId) return;
+
+        const mmprojUrl = `https://huggingface.co/${preset.mmprojRepoId}/resolve/main/${preset.mmprojFileName}`;
+        const mmprojDestPath = path.join(this.modelsDir, preset.mmprojFileName);
+
+        this.postMessage({
+            command: 'downloadProgress',
+            percent: 0,
+            downloadedMB: 0,
+            totalMB: preset.mmprojSizeMB || 0,
+            stage: 'mmproj'
+        });
+
+        await this.downloadFileWithProgress(mmprojUrl, mmprojDestPath, (downloaded, total) => {
+            const pct = total > 0 ? Math.round((downloaded / total) * 100) : 0;
+            const downloadedMB = Math.round(downloaded / (1024 * 1024));
+            const totalMB = Math.round(total / (1024 * 1024));
+            this.postMessage({
+                command: 'downloadProgress',
+                percent: pct,
+                downloadedMB,
+                totalMB,
+                stage: 'mmproj'
             });
         });
     }
@@ -1044,11 +1878,36 @@ Be concise and technical. When analyzing images, describe what you see and relat
         ];
 
         // Add vision model specific flags
-        if (currentPreset?.hasVision) {
+        if (currentPreset?.hasVision && currentPreset?.mmprojFileName) {
+            // Add mmproj (multimodal projector) file for vision capability
+            const mmprojPath = path.join(this.modelsDir, currentPreset.mmprojFileName);
+            if (fs.existsSync(mmprojPath)) {
+                args.push('--mmproj', mmprojPath);
+                console.log(`[TrueFlow] Using mmproj file: ${mmprojPath}`);
+            } else {
+                vscode.window.showWarningMessage(
+                    `Vision projector file not found: ${currentPreset.mmprojFileName}. Vision features may not work. Try re-downloading the model.`
+                );
+            }
             // --kv-unified fixes KV cache issues on second+ multimodal requests for Qwen3-VL
             args.push('--kv-unified');
             // --no-mmproj-offload for better compatibility on systems without GPU
-            args.push('--no-mmproj-offload');
+            if (!this.useGpuAcceleration) {
+                args.push('--no-mmproj-offload');
+            }
+        }
+
+        // Add GPU acceleration flags if enabled and available
+        if (this.useGpuAcceleration && this.gpuAvailable !== 'none') {
+            // Number of layers to offload to GPU (-1 = all)
+            args.push('--n-gpu-layers', '-1');
+
+            // For CUDA, we can use flash attention for faster inference
+            if (this.gpuAvailable === 'cuda') {
+                args.push('--flash-attn');
+            }
+
+            console.log(`[TrueFlow] GPU acceleration enabled: ${this.gpuAvailable}`);
         }
 
         // Log the full command for debugging
@@ -1404,6 +2263,11 @@ Be concise and technical. When analyzing images, describe what you see and relat
 
     public setDiagramData(diagram: string): void {
         this.diagramData = diagram;
+        this.currentDiagramData = diagram;
+    }
+
+    public setContextSelection(value: number): void {
+        this.contextSelection = value;
     }
 
     public async askQuestion(question: string, context: string = '', callback: (response: string) => void): Promise<void> {
@@ -1639,6 +2503,39 @@ ${methodCode}
             transition: width 0.3s ease;
         }
 
+        /* MCP Status Bar */
+        .mcp-status-bar {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 6px;
+            padding: 4px 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .mcp-indicator {
+            font-size: 10px;
+            transition: color 0.3s ease;
+        }
+
+        .mcp-indicator.connected {
+            color: #4caf50;
+        }
+
+        .mcp-indicator.disconnected {
+            color: #ff5252;
+        }
+
+        .mcp-usage-hint {
+            color: var(--text-muted);
+            font-size: 10px;
+            margin-left: auto;
+            opacity: 0.7;
+        }
+
         /* Chat Container */
         .chat-container {
             flex: 1;
@@ -1783,33 +2680,32 @@ ${methodCode}
             transform: scale(1.02);
         }
 
-        /* Thinking indicator */
+        /* Thinking indicator - compact inline style */
         .thinking {
             display: none;
-            padding: 16px;
-            margin: 0 16px;
+            padding: 4px 8px;
+            margin: 4px 8px;
         }
 
         .thinking.active { display: block; }
 
         .thinking-content {
-            display: flex;
+            display: inline-flex;
             align-items: center;
-            gap: 12px;
-            padding: 12px 16px;
-            background: var(--bg-secondary);
-            border-radius: 12px;
-            border: 1px solid var(--border-color);
+            gap: 8px;
+            padding: 4px 8px;
+            background: transparent;
+            border-radius: 4px;
         }
 
         .thinking-dots {
             display: flex;
-            gap: 4px;
+            gap: 3px;
         }
 
         .thinking-dot {
-            width: 8px;
-            height: 8px;
+            width: 6px;
+            height: 6px;
             background: var(--accent-blue);
             border-radius: 50%;
             animation: bounce 1.4s infinite ease-in-out;
@@ -1821,12 +2717,13 @@ ${methodCode}
 
         @keyframes bounce {
             0%, 80%, 100% { transform: translateY(0); }
-            40% { transform: translateY(-8px); }
+            40% { transform: translateY(-4px); }
         }
 
         .thinking-text {
             color: var(--text-muted);
-            font-size: 13px;
+            font-size: 12px;
+            font-style: italic;
         }
 
         /* Input Area */
@@ -2101,6 +2998,150 @@ ${methodCode}
             color: var(--text-muted);
         }
 
+        /* Stop button and chunk progress */
+        .stop-btn {
+            background: #d32f2f;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 500;
+            display: none;
+            margin-left: 8px;
+        }
+
+        .stop-btn.active {
+            display: inline-block;
+        }
+
+        .stop-btn:hover {
+            background: #f44336;
+        }
+
+        .chunk-progress {
+            display: none;
+            padding: 8px 12px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            font-size: 12px;
+            color: var(--accent-green);
+            margin-top: 8px;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .chunk-progress.active {
+            display: flex;
+        }
+
+        .chunk-progress-bar {
+            flex: 1;
+            height: 4px;
+            background: var(--bg-primary);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .chunk-progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-green), var(--accent-blue));
+            border-radius: 2px;
+            transition: width 0.3s ease;
+        }
+
+        /* GPU and Backend controls */
+        .backend-controls {
+            display: flex;
+            gap: 12px;
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .gpu-option {
+            display: none;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--accent-green);
+        }
+
+        .gpu-option.available {
+            display: flex;
+        }
+
+        .gpu-option input[type="checkbox"] {
+            accent-color: var(--accent-green);
+        }
+
+        .backend-selector {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+        }
+
+        .backend-selector select {
+            padding: 4px 8px;
+            font-size: 11px;
+            min-width: 120px;
+        }
+
+        .ollama-models {
+            display: none;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+        }
+
+        .ollama-models.active {
+            display: flex;
+        }
+
+        .ollama-models select {
+            padding: 4px 8px;
+            font-size: 11px;
+            min-width: 150px;
+        }
+
+        .ollama-status {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+
+        .ollama-status.connected {
+            background: rgba(76, 175, 80, 0.2);
+            color: #4caf50;
+        }
+
+        .ollama-status.disconnected {
+            background: rgba(244, 67, 54, 0.2);
+            color: #f44336;
+        }
+
+        /* Token counter */
+        .token-counter {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: var(--text-muted);
+            padding: 4px 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            margin-bottom: 8px;
+        }
+
+        .token-counter span {
+            color: var(--accent-blue);
+            font-weight: 500;
+        }
+
         .tabs {
             display: flex;
             gap: 4px;
@@ -2148,8 +3189,41 @@ ${methodCode}
         </div>
         <div class="status-bar">
             <span id="status">Initializing...</span>
+            <button class="stop-btn" id="stopBtn" title="Stop operation (ESC)">Stop</button>
             <div class="progress-bar" id="progressBar">
                 <div class="progress-bar-fill" id="progressFill"></div>
+            </div>
+        </div>
+        <div class="mcp-status-bar" id="mcpStatusBar">
+            <span class="mcp-indicator disconnected" id="mcpIndicator">●</span>
+            <span id="mcpStatusText">MCP Hub: Connecting...</span>
+            <span class="mcp-usage-hint" id="mcpUsageHint">| Tools: get_trace_data, get_dead_code, get_performance_data, search_function</span>
+        </div>
+        <div class="chunk-progress" id="chunkProgress">
+            <span id="chunkProgressText">Fetching context...</span>
+            <div class="chunk-progress-bar">
+                <div class="chunk-progress-fill" id="chunkProgressFill"></div>
+            </div>
+        </div>
+        <!-- Backend and GPU controls -->
+        <div class="backend-controls">
+            <div class="backend-selector">
+                <label>Backend:</label>
+                <select id="backendSelect">
+                    <option value="llama.cpp">llama.cpp (Local)</option>
+                    <option value="ollama">Ollama</option>
+                </select>
+            </div>
+            <div class="gpu-option" id="gpuOption">
+                <input type="checkbox" id="gpuCheckbox" />
+                <label for="gpuCheckbox" id="gpuLabel">GPU Acceleration</label>
+            </div>
+            <div class="ollama-models" id="ollamaModelsDiv">
+                <label>Model:</label>
+                <select id="ollamaModelSelect">
+                    <option value="">Select Ollama model...</option>
+                </select>
+                <span class="ollama-status disconnected" id="ollamaStatus">Not connected</span>
             </div>
         </div>
     </div>
@@ -2189,6 +3263,9 @@ ${methodCode}
     </div>
 
     <div class="input-area">
+        <div class="token-counter" id="tokenCounter">
+            <span id="tokenDisplay">Tokens: 0</span>
+        </div>
         <div class="image-preview-container" id="imagePreviewContainer">
             <img id="imagePreview" class="image-preview" />
             <div class="image-preview-info" id="imageInfo">Image attached</div>
@@ -2196,7 +3273,7 @@ ${methodCode}
         </div>
         <div class="input-wrapper">
             <div class="input-left">
-                <textarea id="userInput" placeholder="Ask about your code... (Ctrl+Enter to send)"></textarea>
+                <textarea id="userInput" placeholder="Ask about your code... (Enter to send, Shift+Enter for new line)"></textarea>
                 <div class="input-actions">
                     <select id="contextSelect">
                         <option value="">No context</option>
@@ -2252,6 +3329,10 @@ ${methodCode}
         const imageModal = document.getElementById('imageModal');
         const modalImage = document.getElementById('modalImage');
         const closeModal = document.getElementById('closeModal');
+        const stopBtn = document.getElementById('stopBtn');
+        const chunkProgress = document.getElementById('chunkProgress');
+        const chunkProgressText = document.getElementById('chunkProgressText');
+        const chunkProgressFill = document.getElementById('chunkProgressFill');
 
         // HuggingFace search elements
         const tabPresets = document.getElementById('tabPresets');
@@ -2262,7 +3343,18 @@ ${methodCode}
         const hfSearchBtn = document.getElementById('hfSearchBtn');
         const hfResults = document.getElementById('hfResults');
 
+        // Backend and GPU elements
+        const backendSelect = document.getElementById('backendSelect');
+        const gpuOption = document.getElementById('gpuOption');
+        const gpuCheckbox = document.getElementById('gpuCheckbox');
+        const gpuLabel = document.getElementById('gpuLabel');
+        const ollamaModelsDiv = document.getElementById('ollamaModelsDiv');
+        const ollamaModelSelect = document.getElementById('ollamaModelSelect');
+        const ollamaStatus = document.getElementById('ollamaStatus');
+
         let selectedHFModel = null;
+        let currentBackend = 'llama.cpp';
+        let gpuEnabled = false;
 
         // Tab switching
         tabPresets.addEventListener('click', () => {
@@ -2365,10 +3457,65 @@ ${methodCode}
             vscode.postMessage({ command: 'clearHistory' });
         });
 
+        // Backend selection handler
+        backendSelect.addEventListener('change', () => {
+            currentBackend = backendSelect.value;
+            vscode.postMessage({ command: 'setBackend', backend: currentBackend });
+
+            if (currentBackend === 'ollama') {
+                // Hide llama.cpp controls, show Ollama controls
+                presetControls.style.display = 'none';
+                hfSearchPanel.classList.remove('active');
+                ollamaModelsDiv.style.display = 'flex';
+                tabPresets.style.display = 'none';
+                tabHFSearch.style.display = 'none';
+                // Check Ollama connection
+                vscode.postMessage({ command: 'checkOllama' });
+            } else {
+                // Show llama.cpp controls
+                presetControls.style.display = 'flex';
+                ollamaModelsDiv.style.display = 'none';
+                tabPresets.style.display = 'block';
+                tabHFSearch.style.display = 'block';
+            }
+        });
+
+        // GPU checkbox handler
+        gpuCheckbox.addEventListener('change', () => {
+            gpuEnabled = gpuCheckbox.checked;
+            vscode.postMessage({ command: 'setGpuAcceleration', enabled: gpuEnabled });
+        });
+
+        // Ollama model selection handler
+        ollamaModelSelect.addEventListener('change', () => {
+            const selectedModel = ollamaModelSelect.value;
+            if (selectedModel) {
+                vscode.postMessage({ command: 'setOllamaModel', model: selectedModel });
+            }
+        });
+
+        // Stop button and ESC key handler
+        stopBtn.addEventListener('click', () => {
+            vscode.postMessage({ command: 'cancelOperation' });
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                vscode.postMessage({ command: 'cancelOperation' });
+            }
+        });
+
         sendBtn.addEventListener('click', sendMessage);
 
+        // Enter sends message, Shift+Enter or Alt+Enter inserts new line
         userInput.addEventListener('keydown', (e) => {
-            if (e.ctrlKey && e.key === 'Enter') {
+            if (e.key === 'Enter') {
+                if (e.shiftKey || e.altKey) {
+                    // Allow default behavior (new line)
+                    return;
+                }
+                // Plain Enter sends message
+                e.preventDefault();
                 sendMessage();
             }
         });
@@ -2539,6 +3686,36 @@ ${methodCode}
                     // Reset download button state
                     downloadBtn.disabled = modelSelect.selectedIndex <= 0;
                     downloadBtn.textContent = 'Download';
+
+                    // Handle GPU availability
+                    if (msg.gpuAvailable && msg.gpuAvailable !== 'none') {
+                        gpuOption.style.display = 'flex';
+                        gpuLabel.textContent = 'GPU (' + msg.gpuAvailable.toUpperCase() + ')';
+                        gpuCheckbox.checked = msg.gpuEnabled || false;
+                        gpuEnabled = msg.gpuEnabled || false;
+                    } else {
+                        gpuOption.style.display = 'none';
+                    }
+
+                    // Handle Ollama status
+                    if (msg.ollamaAvailable) {
+                        ollamaStatus.textContent = 'Connected';
+                        ollamaStatus.className = 'ollama-status connected';
+                        ollamaModelSelect.innerHTML = '<option value="">Select model...</option>';
+                        if (msg.ollamaModels && msg.ollamaModels.length > 0) {
+                            msg.ollamaModels.forEach(function(model) {
+                                const opt = document.createElement('option');
+                                opt.value = model;
+                                opt.textContent = model;
+                                ollamaModelSelect.appendChild(opt);
+                            });
+                        }
+                    }
+
+                    // Update token counter
+                    if (msg.totalTokens !== undefined) {
+                        document.getElementById('tokenDisplay').textContent = 'Tokens: ' + msg.totalTokens.toLocaleString();
+                    }
                     break;
 
                 case 'addMessage':
@@ -2548,6 +3725,16 @@ ${methodCode}
                 case 'setThinking':
                     thinking.classList.toggle('active', msg.thinking);
                     sendBtn.disabled = msg.thinking;
+                    // Update thinking text with custom message if provided, reset when done
+                    const thinkingText = thinking.querySelector('.thinking-text');
+                    if (thinkingText) {
+                        if (msg.thinking) {
+                            thinkingText.textContent = msg.message || 'AI is thinking...';
+                        } else {
+                            // Reset to default when thinking ends
+                            thinkingText.textContent = 'AI is thinking...';
+                        }
+                    }
                     break;
 
                 case 'historyCleared':
@@ -2605,6 +3792,22 @@ ${methodCode}
                     status.textContent = 'AI Server stopped';
                     break;
 
+                case 'updateMcpStatus':
+                    const mcpIndicator = document.getElementById('mcpIndicator');
+                    const mcpStatusText = document.getElementById('mcpStatusText');
+                    if (mcpIndicator && mcpStatusText) {
+                        if (msg.connected) {
+                            mcpIndicator.className = 'mcp-indicator connected';
+                            mcpStatusText.textContent = 'MCP Hub: ' + (msg.endpoint || 'Connected') +
+                                (msg.projectId ? ' | Project: ' + msg.projectId : '');
+                        } else {
+                            mcpIndicator.className = 'mcp-indicator disconnected';
+                            mcpStatusText.textContent = 'MCP Hub: Not connected' +
+                                (msg.hint ? ' - ' + msg.hint : '');
+                        }
+                    }
+                    break;
+
                 case 'imageSelected':
                     if (msg.imageBase64) {
                         pendingImageBase64 = msg.imageBase64;
@@ -2632,6 +3835,72 @@ ${methodCode}
                     sendBtn.disabled = false;
                     statusIndicator.classList.add('connected');
                     status.textContent = 'AI Server running (started by ' + msg.startedBy + ') - Ready!';
+                    break;
+
+                case 'showStopButton':
+                    stopBtn.classList.toggle('active', msg.show);
+                    break;
+
+                case 'setChunkProgress':
+                    if (msg.total > 0) {
+                        chunkProgress.classList.add('active');
+                        chunkProgressText.textContent = msg.message || ('Fetching ' + msg.current + '-' + msg.total + ' tokens...');
+                        const pct = Math.round((msg.current / msg.total) * 100);
+                        chunkProgressFill.style.width = pct + '%';
+                    } else {
+                        chunkProgress.classList.remove('active');
+                    }
+                    break;
+
+                case 'operationCancelled':
+                    stopBtn.classList.remove('active');
+                    chunkProgress.classList.remove('active');
+                    thinking.classList.remove('active');
+                    sendBtn.disabled = false;
+                    status.textContent = 'Operation cancelled';
+                    break;
+
+                case 'gpuStatus':
+                    // Show/hide GPU option based on availability
+                    if (msg.available && msg.available !== 'none') {
+                        gpuOption.style.display = 'flex';
+                        gpuLabel.textContent = 'GPU (' + msg.available.toUpperCase() + ')';
+                        gpuCheckbox.checked = msg.enabled || false;
+                        gpuEnabled = msg.enabled || false;
+                    } else {
+                        gpuOption.style.display = 'none';
+                    }
+                    break;
+
+                case 'ollamaStatus':
+                    if (msg.connected) {
+                        ollamaStatus.textContent = 'Connected';
+                        ollamaStatus.className = 'ollama-status connected';
+                        // Populate model list
+                        ollamaModelSelect.innerHTML = '<option value="">Select model...</option>';
+                        if (msg.models && msg.models.length > 0) {
+                            msg.models.forEach(model => {
+                                const opt = document.createElement('option');
+                                opt.value = model;
+                                opt.textContent = model;
+                                ollamaModelSelect.appendChild(opt);
+                            });
+                            serverBtn.disabled = false;
+                            serverBtn.textContent = 'Ready (Ollama)';
+                        }
+                    } else {
+                        ollamaStatus.textContent = 'Not connected';
+                        ollamaStatus.className = 'ollama-status disconnected';
+                        ollamaModelSelect.innerHTML = '<option value="">Ollama not running</option>';
+                    }
+                    break;
+
+                case 'updateTokens':
+                    // Update total tokens display
+                    const tokenDisplay = document.getElementById('tokenDisplay');
+                    if (tokenDisplay) {
+                        tokenDisplay.textContent = 'Tokens: ' + msg.total.toLocaleString();
+                    }
                     break;
             }
         });

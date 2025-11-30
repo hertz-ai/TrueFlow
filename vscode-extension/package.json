@@ -2,7 +2,7 @@
   "name": "trueflow",
   "displayName": "TrueFlow - Deterministic Code Visualizer",
   "description": "Unblackbox LLM code with deterministic truth. Zero-code Python runtime instrumentation with 3D animated execution videos.",
-  "version": "0.1.5",
+  "version": "0.1.46",
   "publisher": "hevolve-ai",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -34,6 +34,7 @@
     "plantuml"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onLanguage:python",
     "workspaceContains:**/*.py"
   ],
@@ -96,7 +97,7 @@
         {
           "id": "trueflow-sidebar",
           "title": "TrueFlow",
-          "icon": "resources/icon.svg"
+          "icon": "resources/icon-mono.svg"
         }
       ]
     },
@@ -146,6 +147,30 @@
           ],
           "default": "medium_quality",
           "description": "Quality setting for Manim video generation"
+        },
+        "trueflow.aiBackend": {
+          "type": "string",
+          "enum": [
+            "llama.cpp",
+            "ollama"
+          ],
+          "default": "llama.cpp",
+          "description": "AI backend to use for chat (llama.cpp local or Ollama)"
+        },
+        "trueflow.ollamaEndpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Ollama API endpoint URL"
+        },
+        "trueflow.ollamaModel": {
+          "type": "string",
+          "default": "llama3.2",
+          "description": "Ollama model to use for chat"
+        },
+        "trueflow.gpuAcceleration": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable GPU acceleration for llama.cpp (requires compatible GPU)"
         }
       }
     },
@@ -167,9 +192,10 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run esbuild-base -- --minify",
+    "compile": "npm run esbuild-base -- --sourcemap",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "watch": "npm run esbuild-base -- --sourcemap --watch",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js"
@@ -179,6 +205,7 @@
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
+    "esbuild": "^0.24.2",
     "eslint": "^8.54.0",
     "typescript": "^5.3.0"
   },
