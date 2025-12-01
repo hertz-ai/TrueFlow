@@ -11,3 +11,5 @@ node_modules/**
 *.vsix
 nul
 build-both.js
+# Include runtime_injector Python files (for bundling with extension)
+!runtime_injector/**

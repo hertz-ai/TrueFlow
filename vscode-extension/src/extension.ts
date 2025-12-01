@@ -287,6 +287,8 @@ function setupSocketClientHandlers(): void {
             };
             aiProvider.setCallTraceData(callTraceData);
             aiProvider.setPerformanceData(perfData);
+            // Save snapshot after data update
+            aiProvider.saveSnapshot();
         }
     });
 }
@@ -900,9 +902,37 @@ function setupTraceWatcher(context: vscode.ExtensionContext): void {
 }
 
 /**
+ * Check if the workspace already has TrueFlow integration.
+ * Returns true if .trueflow/runtime_injector or .pycharm_plugin/runtime_injector exists.
+ */
+function isProjectAlreadyIntegrated(): boolean {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return false;
+    }
+
+    const workspaceRoot = workspaceFolders[0].uri.fsPath;
+
+    // Check for VS Code integration (.trueflow)
+    const trueflowInjector = path.join(workspaceRoot, '.trueflow', 'runtime_injector', 'sitecustomize.py');
+    if (fs.existsSync(trueflowInjector)) {
+        return true;
+    }
+
+    // Check for PyCharm integration (.pycharm_plugin)
+    const pycharmInjector = path.join(workspaceRoot, '.pycharm_plugin', 'runtime_injector', 'sitecustomize.py');
+    if (fs.existsSync(pycharmInjector)) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
  * Get HTML for the sidebar view - a compact dashboard with quick actions
  */
 function getSidebarHtml(isConnected: boolean): string {
+    const isIntegrated = isProjectAlreadyIntegrated();
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1135,10 +1165,10 @@ function getSidebarHtml(isConnected: boolean): string {
 
     <div class="section-title">Session Actions</div>
     <div class="action-buttons">
-        <button class="action-btn primary" onclick="action('autoIntegrate')">
+        ${!isIntegrated ? `<button class="action-btn primary" onclick="action('autoIntegrate')">
             <span class="icon">⚡</span>
             <span>Auto-Integrate Project</span>
-        </button>
+        </button>` : ''}
         <button id="attach-btn" class="action-btn" onclick="action('${isConnected ? 'disconnect' : 'connect'}')">
             <span class="icon">${isConnected ? '🔴' : '🟢'}</span>
             <span>${isConnected ? 'Detach from Server' : 'Attach to Server'}</span>

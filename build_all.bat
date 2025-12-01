@@ -1,8 +1,9 @@
 @echo off
 REM ============================================================
 REM TrueFlow - Build All Variants
-REM Builds: PyCharm Plugin + VS Code Extension + Python Deps
-REM Usage: build_all.bat [--test] [--skip-python]
+REM Builds: PyCharm Plugin + IntelliJ Plugin + VS Code Extension
+REM         + Java Agent + Python Deps
+REM Usage: build_all.bat [--test] [--skip-python] [--skip-java-agent]
 REM ============================================================
 
 setlocal enabledelayedexpansion
@@ -12,12 +13,14 @@ set "GRADLE_EXE=D:\gradle-8.10.1\bin\gradle.bat"
 set "BUILD_SUCCESS=1"
 set "RUN_TESTS=0"
 set "SKIP_PYTHON=0"
+set "SKIP_JAVA_AGENT=0"
 
 REM Parse arguments
 :parse_args
 if "%~1"=="" goto :done_args
 if /i "%~1"=="--test" set "RUN_TESTS=1"
 if /i "%~1"=="--skip-python" set "SKIP_PYTHON=1"
+if /i "%~1"=="--skip-java-agent" set "SKIP_JAVA_AGENT=1"
 shift
 goto :parse_args
 :done_args
@@ -25,6 +28,10 @@ goto :parse_args
 echo.
 echo ============================================================
 echo TrueFlow - Building All Variants
+echo   - PyCharm Plugin (Python support built-in)
+echo   - IntelliJ IDEA Ultimate Plugin (Python optional)
+echo   - Java Agent (for Java runtime instrumentation)
+echo   - VS Code Extension
 echo ============================================================
 echo.
 
@@ -42,7 +49,7 @@ REM 0. Install Python Dependencies (if not skipped)
 REM ============================================================
 if "%SKIP_PYTHON%"=="0" (
     echo.
-    echo [0/3] Installing Python Dependencies...
+    echo [0/5] Installing Python Dependencies...
     echo ------------------------------------------------------------
 
     cd /d "%SCRIPT_DIR%"
@@ -68,22 +75,30 @@ if "%SKIP_PYTHON%"=="0" (
     )
 ) else (
     echo.
-    echo [0/3] Skipping Python dependencies (--skip-python)
+    echo [0/5] Skipping Python dependencies (--skip-python)
 )
 
 REM ============================================================
-REM 1. Build PyCharm Plugin (Kotlin/Gradle)
+REM 1. Build PyCharm Plugin (Kotlin/Gradle) - Default, Python built-in
 REM ============================================================
 echo.
-echo [1/3] Building PyCharm Plugin...
+echo [1/5] Building PyCharm Plugin...
 echo ------------------------------------------------------------
 
 cd /d "%SCRIPT_DIR%"
 
+REM Clean first
 if exist "%GRADLE_EXE%" (
-    call "%GRADLE_EXE%" clean buildPlugin --no-daemon
+    call "%GRADLE_EXE%" clean --no-daemon -q
 ) else (
-    call gradlew.bat clean buildPlugin --no-daemon 2>nul || call gradle clean buildPlugin --no-daemon
+    call gradlew.bat clean --no-daemon -q 2>nul || call gradle clean --no-daemon -q
+)
+
+REM Build PyCharm plugin (PC = PyCharm Community, has Python built-in)
+if exist "%GRADLE_EXE%" (
+    call "%GRADLE_EXE%" buildPlugin -PideType=PC --no-daemon
+) else (
+    call gradlew.bat buildPlugin -PideType=PC --no-daemon 2>nul || call gradle buildPlugin -PideType=PC --no-daemon
 )
 
 if %ERRORLEVEL% neq 0 (
@@ -92,19 +107,90 @@ if %ERRORLEVEL% neq 0 (
 ) else (
     echo [SUCCESS] PyCharm plugin built successfully!
 
-    REM Find and display the built plugin
-    for /f "delims=" %%i in ('dir /b /s "%SCRIPT_DIR%build\distributions\*.zip" 2^>nul') do (
-        echo   Output: %%i
+    REM Copy to named output
+    for /f "delims=" %%i in ('dir /b "%SCRIPT_DIR%build\distributions\*.zip" 2^>nul') do (
+        copy "%SCRIPT_DIR%build\distributions\%%i" "%SCRIPT_DIR%build\distributions\trueflow-pycharm-%%i" >nul 2>nul
+        echo   Output: build\distributions\%%i
     )
 )
 
 REM ============================================================
-REM 2. Build VS Code Extension (TypeScript/npm)
+REM 2. Build IntelliJ IDEA Ultimate Plugin (Python optional)
+REM ============================================================
+echo.
+echo [2/5] Building IntelliJ IDEA Ultimate Plugin...
+echo ------------------------------------------------------------
+
+cd /d "%SCRIPT_DIR%"
+
+REM Build IntelliJ IDEA Ultimate plugin (IU = IntelliJ Ultimate, Python is optional)
+if exist "%GRADLE_EXE%" (
+    call "%GRADLE_EXE%" buildPlugin -PideType=IU --no-daemon
+) else (
+    call gradlew.bat buildPlugin -PideType=IU --no-daemon 2>nul || call gradle buildPlugin -PideType=IU --no-daemon
+)
+
+if %ERRORLEVEL% neq 0 (
+    echo [FAILED] IntelliJ IDEA plugin build failed!
+    set "BUILD_SUCCESS=0"
+) else (
+    echo [SUCCESS] IntelliJ IDEA Ultimate plugin built successfully!
+
+    REM Copy to named output
+    for /f "delims=" %%i in ('dir /b "%SCRIPT_DIR%build\distributions\*.zip" 2^>nul') do (
+        copy "%SCRIPT_DIR%build\distributions\%%i" "%SCRIPT_DIR%build\distributions\trueflow-intellij-%%i" >nul 2>nul
+        echo   Output: build\distributions\%%i
+    )
+)
+
+REM ============================================================
+REM 3. Build Java Agent (if not skipped)
+REM ============================================================
+if "%SKIP_JAVA_AGENT%"=="0" (
+    echo.
+    echo [3/5] Building Java Agent...
+    echo ------------------------------------------------------------
+
+    cd /d "%SCRIPT_DIR%java-agent"
+
+    if not exist "build.gradle.kts" (
+        echo [SKIPPED] Java agent - build.gradle.kts not found
+        goto :java_agent_done
+    )
+
+    REM Build shadow JAR with all dependencies
+    if exist "%SCRIPT_DIR%java-agent\gradlew.bat" (
+        call gradlew.bat shadowJar --no-daemon
+    ) else if exist "%GRADLE_EXE%" (
+        call "%GRADLE_EXE%" shadowJar --no-daemon
+    ) else (
+        call gradle shadowJar --no-daemon
+    )
+
+    if %ERRORLEVEL% neq 0 (
+        echo [FAILED] Java agent build failed!
+        set "BUILD_SUCCESS=0"
+    ) else (
+        echo [SUCCESS] Java agent built successfully!
+
+        REM Find and display the built agent
+        for /f "delims=" %%i in ('dir /b "%SCRIPT_DIR%java-agent\build\libs\trueflow-agent*.jar" 2^>nul') do (
+            echo   Output: java-agent\build\libs\%%i
+        )
+    )
+) else (
+    echo.
+    echo [3/5] Skipping Java agent (--skip-java-agent)
+)
+:java_agent_done
+
+REM ============================================================
+REM 4. Build VS Code Extension (TypeScript/npm)
 REM    Uses build-both.js to auto-increment version and build
 REM    for both Open VSX (hevolve-ai) and VS Marketplace (hertzai)
 REM ============================================================
 echo.
-echo [2/3] Building VS Code Extension...
+echo [4/5] Building VS Code Extension...
 echo ------------------------------------------------------------
 
 cd /d "%SCRIPT_DIR%vscode-extension"
@@ -157,11 +243,11 @@ if %ERRORLEVEL% equ 0 (
 :vscode_done
 
 REM ============================================================
-REM 3. Run Tests (if --test flag provided)
+REM 5. Run Tests (if --test flag provided)
 REM ============================================================
 if "%RUN_TESTS%"=="1" (
     echo.
-    echo [3/3] Running Tests...
+    echo [5/5] Running Tests...
     echo ------------------------------------------------------------
 
     cd /d "%SCRIPT_DIR%"
@@ -186,7 +272,7 @@ if "%RUN_TESTS%"=="1" (
     )
 ) else (
     echo.
-    echo [3/3] Skipping tests (use --test to run)
+    echo [5/5] Skipping tests (use --test to run)
 )
 
 REM ============================================================
@@ -200,13 +286,37 @@ echo ============================================================
 cd /d "%SCRIPT_DIR%"
 
 echo.
-echo PyCharm Plugin:
-if exist "build\distributions\*.zip" (
+echo PyCharm Plugin (Python built-in):
+if exist "build\distributions\*pycharm*.zip" (
+    for /f "delims=" %%i in ('dir /b "build\distributions\*pycharm*.zip" 2^>nul') do (
+        echo   [OK] build\distributions\%%i
+    )
+) else if exist "build\distributions\*.zip" (
     for /f "delims=" %%i in ('dir /b "build\distributions\*.zip" 2^>nul') do (
         echo   [OK] build\distributions\%%i
     )
 ) else (
     echo   [MISSING] No plugin ZIP found
+)
+
+echo.
+echo IntelliJ IDEA Ultimate Plugin (Python optional):
+if exist "build\distributions\*intellij*.zip" (
+    for /f "delims=" %%i in ('dir /b "build\distributions\*intellij*.zip" 2^>nul') do (
+        echo   [OK] build\distributions\%%i
+    )
+) else (
+    echo   [INFO] IntelliJ plugin shares same build as PyCharm
+)
+
+echo.
+echo Java Agent (for Java runtime instrumentation):
+if exist "java-agent\build\libs\trueflow-agent*.jar" (
+    for /f "delims=" %%i in ('dir /b "java-agent\build\libs\trueflow-agent*.jar" 2^>nul') do (
+        echo   [OK] java-agent\build\libs\%%i
+    )
+) else (
+    echo   [MISSING] Java agent JAR not found
 )
 
 echo.
@@ -235,10 +345,15 @@ if "%BUILD_SUCCESS%"=="1" (
     echo ============================================================
     echo.
     echo Usage:
-    echo   build_all.bat              Build all components
-    echo   build_all.bat --test       Build and run quick tests
-    echo   build_all.bat --skip-python  Skip Python dependency install
-    echo   run_all_tests.bat          Run full test suite ^(~163 tests^)
+    echo   build_all.bat                    Build all components
+    echo   build_all.bat --test             Build and run quick tests
+    echo   build_all.bat --skip-python      Skip Python dependency install
+    echo   build_all.bat --skip-java-agent  Skip Java agent build
+    echo   run_all_tests.bat                Run full test suite ^(~163 tests^)
+    echo.
+    echo Java Agent Usage:
+    echo   java -javaagent:java-agent/build/libs/trueflow-agent.jar -jar your-app.jar
+    echo   TRUEFLOW_ENABLED=1 java -javaagent:trueflow-agent.jar=includes=com.myapp -jar app.jar
     echo.
 ) else (
     echo ============================================================

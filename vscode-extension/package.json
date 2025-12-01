@@ -2,7 +2,7 @@
   "name": "trueflow",
   "displayName": "TrueFlow - Deterministic Code Visualizer",
   "description": "Unblackbox LLM code with deterministic truth. Zero-code Python runtime instrumentation with 3D animated execution videos.",
-  "version": "0.1.46",
+  "version": "0.1.74",
   "publisher": "hevolve-ai",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -115,7 +115,7 @@
       "properties": {
         "trueflow.traceDirectory": {
           "type": "string",
-          "default": "./traces",
+          "default": "./.trueflow/traces",
           "description": "Directory to store trace files"
         },
         "trueflow.autoRefresh": {
@@ -192,7 +192,8 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run esbuild-base -- --minify",
+    "copy-runtime": "node -e \"const fs=require('fs');const path=require('path');const src='../src/main/resources/runtime_injector';const dest='./runtime_injector';if(!fs.existsSync(dest))fs.mkdirSync(dest,{recursive:true});fs.readdirSync(src).forEach(f=>{const s=path.join(src,f);if(fs.statSync(s).isFile())fs.copyFileSync(s,path.join(dest,f))});console.log('Runtime injector copied')\"",
+    "vscode:prepublish": "npm run copy-runtime && npm run esbuild-base -- --minify",
     "compile": "npm run esbuild-base -- --sourcemap",
     "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
     "watch": "npm run esbuild-base -- --sourcemap --watch",

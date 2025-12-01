@@ -45,10 +45,23 @@ repositories {
 }
 
 // Configure Gradle IntelliJ Plugin
+// Supports multiple IDE variants:
+//   PC = PyCharm Community (default) - has built-in Python support
+//   IU = IntelliJ IDEA Ultimate - requires Python plugin for Python features
+//   IC = IntelliJ IDEA Community - requires Python plugin for Python features
+// Usage: ./gradlew buildPlugin -PideType=IU
+val ideType = findProperty("ideType")?.toString() ?: "PC"
+
 intellij {
     version.set("2023.3.2")
-    type.set("PC") // PyCharm Community - has built-in Python support
-    // No additional plugins needed - PyCharm has com.intellij.modules.python built-in
+    type.set(ideType)
+
+    // For IntelliJ IDEA, include Python plugin as optional dependency
+    // This enables Python features when Python plugin is installed
+    if (ideType == "IU" || ideType == "IC") {
+        plugins.set(listOf("PythonCore:233.11799.241"))  // Python Community plugin
+    }
+    // PyCharm (PC) has Python built-in, no additional plugins needed
 }
 
 dependencies {
@@ -279,7 +292,7 @@ tasks {
 
     patchPluginXml {
         sinceBuild.set("231")
-        untilBuild.set("241.*")
+        untilBuild.set("251.*")  // Supports up to Android Studio 2025.1 (Meerkat)
 
         pluginDescription.set("""
             TrueFlow - Deterministic Code Visualizer & Explainer

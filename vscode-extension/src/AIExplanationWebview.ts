@@ -141,6 +141,7 @@ export class AIExplanationProvider {
     private deadCodeData: any = null;
     private performanceData: any = null;
     private callTraceData: any = null;
+    private sqlAnalysisData: any = null;
     private diagramData: string = '';
     private currentDiagramData: string = '';
     private contextSelection: number = 0;
@@ -155,6 +156,12 @@ export class AIExplanationProvider {
     private backendType: 'llama.cpp' | 'ollama' = 'llama.cpp';
     private ollamaEndpoint = 'http://127.0.0.1:11434';
     private totalTokensUsed = 0;
+
+    // Benchmark results for CPU vs GPU comparison
+    private cpuTokensPerSecond = 0;
+    private gpuTokensPerSecond = 0;
+    private benchmarkCompleted = false;
+    private recommendedBackend: 'cpu' | 'gpu' = 'cpu';
 
     private readonly modelsDir: string;
     private readonly apiBase = 'http://127.0.0.1:8080/v1';
@@ -547,7 +554,7 @@ export class AIExplanationProvider {
                 this.postMessage({
                     command: 'updateMcpStatus',
                     connected: false,
-                    hint: 'Use ```mcp{...}``` in chat to call tools'
+                    hint: 'Hub not found - check console for details'
                 });
                 // Fall back to polling if hub not available
                 this.startStatusPolling();
@@ -871,6 +878,10 @@ export class AIExplanationProvider {
 
             this.postMessage({ command: 'serverStarted' });
             vscode.window.showInformationMessage('AI server started with HuggingFace model');
+
+            // Run benchmark to measure CPU/GPU performance
+            this.postMessage({ command: 'benchmarkStarting' });
+            this.runBenchmark();
         } else {
             this.stopServer();
             vscode.window.showErrorMessage('AI server failed to start');
@@ -937,12 +948,13 @@ export class AIExplanationProvider {
         this.conversationHistory.push(userMessage);
         this.trimHistory();
 
-        // Show user message
+        // Show user message with image if present
         this.postMessage({
             command: 'addMessage',
             role: 'user',
-            content: imageBase64 ? `${text}\n[Image attached]` : text,
-            timestamp: userMessage.timestamp
+            content: text || '[Image]',
+            timestamp: userMessage.timestamp,
+            imageBase64: imageBase64
         });
 
         // Reset cancel flag
@@ -1135,14 +1147,17 @@ export class AIExplanationProvider {
                 return this.buildPerformanceContext();
             case 'callTrace':
                 return this.buildCallTraceContext();
+            case 'sql':
+                return this.buildSqlAnalysisContext();
             case 'diagram':
-                return this.diagramData ? `\n--- Current Diagram ---\n${this.diagramData}` : '';
+                return this.buildDiagramContext();
             case 'all':
                 return [
                     this.buildDeadCodeContext(),
                     this.buildPerformanceContext(),
                     this.buildCallTraceContext(),
-                    this.diagramData ? `\n--- Current Diagram ---\n${this.diagramData}` : ''
+                    this.buildSqlAnalysisContext(),
+                    this.buildDiagramContext()
                 ].filter(s => s).join('\n');
             default:
                 return '';
@@ -1150,7 +1165,12 @@ export class AIExplanationProvider {
     }
 
     private buildDeadCodeContext(): string {
+        // If no dead code data from socket, try loading from trace files
+        if (!this.deadCodeData) {
+            this.loadTraceDataFromFiles();
+        }
         if (!this.deadCodeData) return '';
+
         const deadFunctions = this.deadCodeData.dead_functions || [];
         if (deadFunctions.length === 0) return '';
 
@@ -1163,7 +1183,12 @@ export class AIExplanationProvider {
     }
 
     private buildPerformanceContext(): string {
+        // If no performance data from socket, try loading from trace files
+        if (!this.performanceData) {
+            this.loadTraceDataFromFiles();
+        }
         if (!this.performanceData) return '';
+
         const hotspots = this.performanceData.hotspots || [];
         if (hotspots.length === 0) return '';
 
@@ -1176,7 +1201,12 @@ export class AIExplanationProvider {
     }
 
     private buildCallTraceContext(): string {
+        // If no call trace data from socket, try loading from trace files
+        if (!this.callTraceData) {
+            this.loadTraceDataFromFiles();
+        }
         if (!this.callTraceData) return '';
+
         const calls = this.callTraceData.calls || [];
         if (calls.length === 0) return '';
 
@@ -1187,6 +1217,54 @@ export class AIExplanationProvider {
             context += `${indent}→ ${item.module || '?'}.${item.function || '?'}()\n`;
         });
         return context;
+    }
+
+    private buildSqlAnalysisContext(): string {
+        // If no SQL data from socket, try loading from trace files
+        if (!this.sqlAnalysisData) {
+            this.loadTraceDataFromFiles();
+        }
+        if (!this.sqlAnalysisData) return '';
+
+        const issues = this.sqlAnalysisData.issues || [];
+        const queries = this.sqlAnalysisData.queries || [];
+        const totalQueries = this.sqlAnalysisData.totalQueries || 0;
+        const nPlus1Count = this.sqlAnalysisData.nPlus1Issues || 0;
+
+        if (totalQueries === 0 && issues.length === 0) return '';
+
+        let context = '\n--- SQL Analysis Context ---\n';
+        context += `Total Queries: ${totalQueries}, N+1 Issues: ${nPlus1Count}\n`;
+
+        if (issues.length > 0) {
+            context += '\nN+1 Issues:\n';
+            issues.slice(0, 10).forEach((issue: any) => {
+                context += `  [${issue.severity}] ${issue.pattern} (${issue.count} occurrences)\n`;
+                if (issue.suggestion) {
+                    context += `    Suggestion: ${issue.suggestion}\n`;
+                }
+            });
+        }
+
+        if (queries.length > 0) {
+            context += '\nRecent Queries:\n';
+            queries.slice(0, 10).forEach((q: any) => {
+                const shortQuery = (q.query || '').substring(0, 100);
+                context += `  - ${q.module}.${q.function}: ${shortQuery}...\n`;
+            });
+        }
+
+        return context;
+    }
+
+    private buildDiagramContext(): string {
+        // If no diagram data from socket, try loading from trace files
+        if (!this.diagramData) {
+            this.loadTraceDataFromFiles();
+        }
+        if (!this.diagramData) return '';
+
+        return `\n--- Sequence Diagram ---\n${this.diagramData}`;
     }
 
     private async callLLM(userPrompt: string, contextText: string, imageBase64?: string): Promise<string> {
@@ -1210,19 +1288,13 @@ ${mcpToolsDocs}
 If context insufficient, use MCP tool. I'll execute & return results.`
         });
 
-        // Add conversation history
+        // Add conversation history (text only - images are too large to resend)
         for (const msg of this.conversationHistory.slice(0, -1)) {
-            if (msg.imageBase64 && this.currentModelHasVision) {
-                messages.push({
-                    role: msg.role,
-                    content: [
-                        { type: 'text', text: msg.content },
-                        { type: 'image_url', image_url: { url: `data:image/png;base64,${msg.imageBase64}` } }
-                    ]
-                });
-            } else {
-                messages.push({ role: msg.role, content: msg.content });
-            }
+            // For messages that had images, add a note but don't resend the image data
+            const content = msg.imageBase64
+                ? `${msg.content}\n[User shared an image with this message]`
+                : msg.content;
+            messages.push({ role: msg.role, content });
         }
 
         // Current message with context
@@ -1646,11 +1718,20 @@ If context insufficient, use MCP tool. I'll execute & return results.`
         if (modelExists && preset.hasVision && preset.mmprojFileName && preset.mmprojRepoId) {
             this.currentModelFile = destPath;
             this.currentModelHasVision = preset.hasVision;
+            const serverWasRunning = this.serverProcess !== undefined;
 
             try {
                 this.postMessage({ command: 'downloadStarted', modelName: `${preset.displayName} (vision projector)` });
                 await this.downloadMmprojOnly(preset);
                 this.postMessage({ command: 'downloadComplete', modelName: preset.displayName });
+
+                // If server was running, restart it to pick up the new mmproj
+                if (serverWasRunning) {
+                    vscode.window.showInformationMessage('Vision support downloaded. Restarting server to enable vision...');
+                    await this.stopServer();
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    await this.startServer();
+                }
             } catch (error: any) {
                 this.postMessage({ command: 'downloadError', error: `Vision projector download failed: ${error.message}` });
             }
@@ -1963,6 +2044,10 @@ If context insufficient, use MCP tool. I'll execute & return results.`
 
             this.postMessage({ command: 'serverStarted' });
             vscode.window.showInformationMessage('AI server started on port 8080');
+
+            // Run benchmark to measure CPU/GPU performance
+            this.postMessage({ command: 'benchmarkStarting' });
+            this.runBenchmark();
         } else {
             this.stopServer();
             vscode.window.showErrorMessage('AI server failed to start');
@@ -1975,6 +2060,145 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                 resolve(res.statusCode === 200);
             }).on('error', () => resolve(false));
         });
+    }
+
+    /**
+     * Run a quick benchmark to compare CPU vs GPU performance.
+     * Called after server starts - runs a quick inference and measures tokens/second.
+     */
+    private async runBenchmark(): Promise<void> {
+        if (this.gpuAvailable === 'none') {
+            // No GPU, just set CPU as recommended
+            this.cpuTokensPerSecond = 50;  // Default estimate
+            this.gpuTokensPerSecond = 0;
+            this.recommendedBackend = 'cpu';
+            this.benchmarkCompleted = true;
+            this.postMessage({
+                command: 'benchmarkComplete',
+                cpuTps: this.cpuTokensPerSecond,
+                gpuTps: this.gpuTokensPerSecond,
+                recommended: this.recommendedBackend
+            });
+            return;
+        }
+
+        try {
+            const startTime = Date.now();
+            const testPrompt = 'Count from 1 to 10:';
+            const response = await this.callLLMForBenchmark(testPrompt, 50);
+            const endTime = Date.now();
+
+            const durationSeconds = (endTime - startTime) / 1000;
+            const estimatedTokens = response.split(' ').length + 10;  // Rough token estimate
+            const tokensPerSecond = durationSeconds > 0 ? estimatedTokens / durationSeconds : 0;
+
+            // Store based on current GPU setting
+            if (this.useGpuAcceleration) {
+                this.gpuTokensPerSecond = tokensPerSecond;
+            } else {
+                this.cpuTokensPerSecond = tokensPerSecond;
+            }
+
+            // Determine recommendation: GPU is only better if significantly faster (>20% improvement)
+            if (this.gpuTokensPerSecond <= 0) {
+                this.recommendedBackend = 'cpu';
+            } else if (this.cpuTokensPerSecond <= 0) {
+                this.recommendedBackend = 'gpu';
+            } else if (this.gpuTokensPerSecond > this.cpuTokensPerSecond * 1.2) {
+                this.recommendedBackend = 'gpu';
+            } else {
+                this.recommendedBackend = 'cpu';  // Prefer CPU if similar or CPU is faster
+            }
+
+            this.benchmarkCompleted = true;
+            console.log(`[TrueFlow] Benchmark: CPU=${Math.round(this.cpuTokensPerSecond)} t/s, GPU=${Math.round(this.gpuTokensPerSecond)} t/s, Recommended=${this.recommendedBackend.toUpperCase()}`);
+
+            this.postMessage({
+                command: 'benchmarkComplete',
+                cpuTps: this.cpuTokensPerSecond,
+                gpuTps: this.gpuTokensPerSecond,
+                recommended: this.recommendedBackend
+            });
+
+            // Auto-select the recommended backend for next server start
+            if (this.gpuAvailable !== 'none') {
+                const shouldUseGpu = this.recommendedBackend === 'gpu';
+                if (shouldUseGpu !== this.useGpuAcceleration) {
+                    console.log(`[TrueFlow] Benchmark recommends ${this.recommendedBackend.toUpperCase()}, will use for next server start`);
+                    this.useGpuAcceleration = shouldUseGpu;
+                }
+            }
+        } catch (error: any) {
+            console.warn(`[TrueFlow] Benchmark failed: ${error.message}`);
+            this.benchmarkCompleted = true;
+            this.postMessage({
+                command: 'benchmarkComplete',
+                cpuTps: this.cpuTokensPerSecond,
+                gpuTps: this.gpuTokensPerSecond,
+                recommended: 'cpu'
+            });
+        }
+    }
+
+    /**
+     * Simple LLM call for benchmarking - doesn't use streaming
+     */
+    private callLLMForBenchmark(prompt: string, maxTokens: number): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const requestBody = JSON.stringify({
+                model: 'local',
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: maxTokens,
+                temperature: 0.1,
+                stream: false
+            });
+
+            const req = http.request({
+                hostname: '127.0.0.1',
+                port: 8080,
+                path: '/v1/chat/completions',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(requestBody)
+                },
+                timeout: 60000
+            }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    if (res.statusCode !== 200) {
+                        reject(new Error(`HTTP ${res.statusCode}`));
+                        return;
+                    }
+                    try {
+                        const json = JSON.parse(data);
+                        const content = json.choices?.[0]?.message?.content || '';
+                        resolve(content);
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
+            });
+
+            req.on('error', reject);
+            req.on('timeout', () => reject(new Error('Timeout')));
+            req.write(requestBody);
+            req.end();
+        });
+    }
+
+    /**
+     * Get benchmark status string for UI display
+     */
+    public getBenchmarkStatus(): string {
+        if (!this.benchmarkCompleted) {
+            return 'Benchmark pending...';
+        }
+        if (this.gpuAvailable === 'none') {
+            return `CPU: ${Math.round(this.cpuTokensPerSecond)} t/s`;
+        }
+        return `CPU: ${Math.round(this.cpuTokensPerSecond)} t/s | GPU: ${Math.round(this.gpuTokensPerSecond)} t/s | Best: ${this.recommendedBackend.toUpperCase()}`;
     }
 
     private stopServer(): void {
@@ -2137,20 +2361,56 @@ If context insufficient, use MCP tool. I'll execute & return results.`
             const tagName = releaseInfo.tag_name;
 
             // Determine the right binary for this platform
+            // Use CUDA-enabled binary if GPU acceleration is available and user wants GPU
             let assetName: string;
             let extractDir: string;
+            const useCuda = this.gpuAvailable === 'cuda' && this.useGpuAcceleration;
 
             if (process.platform === 'win32') {
-                assetName = `llama-${tagName}-bin-win-cpu-x64.zip`;
+                if (useCuda) {
+                    // Try CUDA 12 first (most common modern version)
+                    assetName = `llama-${tagName}-bin-win-cuda-cu12.2.0-x64.zip`;
+                } else {
+                    assetName = `llama-${tagName}-bin-win-cpu-x64.zip`;
+                }
             } else if (process.platform === 'darwin') {
+                // macOS uses Metal, which is built into the standard macOS binary
                 assetName = `llama-${tagName}-bin-macos-arm64.zip`;
             } else {
-                // Linux - use ubuntu as it's most compatible
-                assetName = `llama-${tagName}-bin-ubuntu-x64.zip`;
+                // Linux
+                if (useCuda) {
+                    assetName = `llama-${tagName}-bin-ubuntu-cuda-cu12.2.0-x64.zip`;
+                } else {
+                    assetName = `llama-${tagName}-bin-ubuntu-x64.zip`;
+                }
             }
 
             // Find the asset URL
-            const asset = releaseInfo.assets?.find((a: any) => a.name === assetName);
+            let asset = releaseInfo.assets?.find((a: any) => a.name === assetName);
+
+            // If CUDA binary not found, try alternative CUDA versions then fall back to CPU
+            if (!asset && useCuda) {
+                console.log(`[TrueFlow] CUDA binary not found: ${assetName}, trying alternatives...`);
+
+                // Try CUDA 11.8 as fallback
+                const cuda11Asset = process.platform === 'win32'
+                    ? `llama-${tagName}-bin-win-cuda-cu11.8.0-x64.zip`
+                    : `llama-${tagName}-bin-ubuntu-cuda-cu11.8.0-x64.zip`;
+                asset = releaseInfo.assets?.find((a: any) => a.name === cuda11Asset);
+
+                if (asset) {
+                    assetName = cuda11Asset;
+                    console.log(`[TrueFlow] Found CUDA 11.8 binary: ${assetName}`);
+                } else {
+                    // Fall back to CPU version
+                    assetName = process.platform === 'win32'
+                        ? `llama-${tagName}-bin-win-cpu-x64.zip`
+                        : `llama-${tagName}-bin-ubuntu-x64.zip`;
+                    asset = releaseInfo.assets?.find((a: any) => a.name === assetName);
+                    console.log(`[TrueFlow] Falling back to CPU binary: ${assetName}`);
+                }
+            }
+
             if (!asset) {
                 console.log(`[TrueFlow] Prebuilt binary not found: ${assetName}`);
                 return false;
@@ -2205,7 +2465,9 @@ If context insufficient, use MCP tool. I'll execute & return results.`
 
             // Find llama-server in extracted files and copy/link to expected location
             const serverExe = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server';
-            const extractedBinDir = path.join(installDir, `llama-${tagName}-bin-${process.platform === 'win32' ? 'win-cpu-x64' : process.platform === 'darwin' ? 'macos-arm64' : 'ubuntu-x64'}`);
+            // Extract dir name matches the asset name without .zip extension
+            const extractedDirName = assetName.replace('.zip', '');
+            const extractedBinDir = path.join(installDir, extractedDirName);
             const srcServer = path.join(extractedBinDir, serverExe);
             const destServer = path.join(binDir, serverExe);
 
@@ -2268,6 +2530,309 @@ If context insufficient, use MCP tool. I'll execute & return results.`
 
     public setContextSelection(value: number): void {
         this.contextSelection = value;
+    }
+
+    public setSqlAnalysisData(data: any): void {
+        this.sqlAnalysisData = data;
+    }
+
+    /**
+     * Save a comprehensive snapshot of all trace data to the .trueflow/traces directory.
+     * Maintains only the last 5 snapshots to avoid disk bloat.
+     * Called when trace data is updated.
+     */
+    public saveSnapshot(): void {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) return;
+
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+        const traceDir = path.join(workspaceRoot, '.trueflow', 'traces');
+
+        // Ensure trace directory exists
+        if (!fs.existsSync(traceDir)) {
+            fs.mkdirSync(traceDir, { recursive: true });
+        }
+
+        // Generate timestamp for filename
+        const now = new Date();
+        const timestamp = now.toISOString()
+            .replace(/[-:]/g, '')
+            .replace('T', '_')
+            .substring(0, 15);
+        const snapshotFile = path.join(traceDir, `snapshot_${timestamp}.json`);
+
+        // Cleanup old snapshots (keep only last 5)
+        this.cleanupOldSnapshots(traceDir, 5);
+
+        // Build snapshot data
+        const snapshot: any = {
+            metadata: {
+                createdAt: now.toISOString(),
+                createdBy: 'vscode',
+                version: '1.0'
+            }
+        };
+
+        // Performance data
+        if (this.performanceData?.hotspots && this.performanceData.hotspots.length > 0) {
+            snapshot.performance = {
+                hotspots: this.performanceData.hotspots.slice(0, 50).map((h: any) => ({
+                    function: h.function || 'unknown',
+                    total_ms: h.total_ms || 0,
+                    calls: h.calls || 0
+                }))
+            };
+        }
+
+        // Dead code data
+        if (this.deadCodeData?.dead_functions && this.deadCodeData.dead_functions.length > 0) {
+            snapshot.deadCode = {
+                dead_functions: this.deadCodeData.dead_functions.slice(0, 50).map((f: any) => ({
+                    name: f.name || f.function || 'unknown',
+                    file: f.file || '',
+                    line: f.line || 0
+                }))
+            };
+        }
+
+        // SQL analysis data
+        if (this.sqlAnalysisData) {
+            snapshot.sqlAnalysis = {
+                totalQueries: this.sqlAnalysisData.totalQueries || 0,
+                nPlus1Issues: this.sqlAnalysisData.nPlus1Issues || 0,
+                issues: (this.sqlAnalysisData.issues || []).slice(0, 20).map((i: any) => ({
+                    severity: i.severity || 'medium',
+                    pattern: i.pattern || '',
+                    count: i.count || 0,
+                    example: i.example || '',
+                    suggestion: i.suggestion || ''
+                })),
+                queries: (this.sqlAnalysisData.queries || []).slice(0, 50).map((q: any) => ({
+                    query: q.query || '',
+                    module: q.module || '',
+                    function: q.function || '',
+                    variable: q.variable || ''
+                }))
+            };
+        }
+
+        // Diagram data
+        if (this.diagramData) {
+            snapshot.diagram = {
+                format: 'plantuml',
+                content: this.diagramData.substring(0, 50000) // Limit size
+            };
+        }
+
+        // Call trace data (summary)
+        if (this.callTraceData?.calls && this.callTraceData.calls.length > 0) {
+            snapshot.callTrace = {
+                totalCalls: this.callTraceData.total_calls || this.callTraceData.calls.length,
+                sampleCalls: this.callTraceData.calls.slice(0, 100).map((c: any) => ({
+                    function: c.function || 'unknown',
+                    module: c.module || '',
+                    depth: c.depth || 0,
+                    duration_ms: c.duration_ms || 0
+                }))
+            };
+        }
+
+        // Only write if we have some data
+        if (Object.keys(snapshot).length > 1) { // More than just metadata
+            try {
+                fs.writeFileSync(snapshotFile, JSON.stringify(snapshot, null, 2), 'utf-8');
+                console.log(`[TrueFlow] Snapshot saved: ${snapshotFile}`);
+            } catch (e) {
+                console.error('[TrueFlow] Failed to save snapshot:', e);
+            }
+        }
+    }
+
+    /**
+     * Remove old snapshot files, keeping only the most recent ones.
+     */
+    private cleanupOldSnapshots(traceDir: string, keepCount: number): void {
+        try {
+            const files = fs.readdirSync(traceDir)
+                .filter(f => f.startsWith('snapshot_') && f.endsWith('.json'))
+                .map(f => ({
+                    name: f,
+                    path: path.join(traceDir, f),
+                    mtime: fs.statSync(path.join(traceDir, f)).mtimeMs
+                }))
+                .sort((a, b) => b.mtime - a.mtime);
+
+            // Delete files beyond keepCount
+            if (files.length >= keepCount) {
+                for (let i = keepCount - 1; i < files.length; i++) {
+                    try {
+                        fs.unlinkSync(files[i].path);
+                        console.log(`[TrueFlow] Deleted old snapshot: ${files[i].name}`);
+                    } catch (e) {
+                        // Ignore deletion errors
+                    }
+                }
+            }
+        } catch (e) {
+            // Ignore cleanup errors
+        }
+    }
+
+    /**
+     * Load trace data from workspace snapshot/trace files when not available from socket.
+     * First tries to find snapshot files (comprehensive), then falls back to raw trace files.
+     * Searches in .trueflow/traces and .pycharm_plugin/traces directories.
+     */
+    private loadTraceDataFromFiles(): void {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) return;
+
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+        // Check VS Code default first (.trueflow/traces), then PyCharm's (.pycharm_plugin/traces)
+        const traceDirs = [
+            path.join(workspaceRoot, '.trueflow', 'traces'),
+            path.join(workspaceRoot, '.pycharm_plugin', 'traces')
+        ];
+
+        // First, try to find snapshot files (snapshot_*.json - comprehensive export)
+        let latestSnapshotFile: string | null = null;
+        let latestSnapshotMtime = 0;
+
+        for (const traceDir of traceDirs) {
+            if (!fs.existsSync(traceDir)) continue;
+
+            try {
+                const snapshotFiles = fs.readdirSync(traceDir)
+                    .filter(f => f.startsWith('snapshot_') && f.endsWith('.json'))
+                    .map(f => path.join(traceDir, f));
+
+                for (const file of snapshotFiles) {
+                    const stat = fs.statSync(file);
+                    if (stat.mtimeMs > latestSnapshotMtime) {
+                        latestSnapshotMtime = stat.mtimeMs;
+                        latestSnapshotFile = file;
+                    }
+                }
+            } catch (e) {
+                // Directory read error, continue to next
+            }
+        }
+
+        // If snapshot found, load from it (it has pre-computed performance and dead code data)
+        if (latestSnapshotFile) {
+            try {
+                const content = fs.readFileSync(latestSnapshotFile, 'utf-8');
+                const snapshot = JSON.parse(content);
+
+                // Load performance data directly
+                if (snapshot.performance?.hotspots && snapshot.performance.hotspots.length > 0) {
+                    this.performanceData = { hotspots: snapshot.performance.hotspots };
+                }
+
+                // Load dead code data
+                if (snapshot.deadCode?.dead_functions && !this.deadCodeData) {
+                    this.deadCodeData = { dead_functions: snapshot.deadCode.dead_functions };
+                }
+
+                // Load SQL analysis data
+                if (snapshot.sqlAnalysis && !this.sqlAnalysisData) {
+                    this.sqlAnalysisData = {
+                        totalQueries: snapshot.sqlAnalysis.totalQueries || 0,
+                        nPlus1Issues: snapshot.sqlAnalysis.nPlus1Issues || 0,
+                        issues: snapshot.sqlAnalysis.issues || [],
+                        queries: snapshot.sqlAnalysis.queries || []
+                    };
+                }
+
+                // Load diagram data
+                if (snapshot.diagram?.content && !this.diagramData) {
+                    this.diagramData = snapshot.diagram.content;
+                }
+
+                return; // Successfully loaded from snapshot
+            } catch (e) {
+                // Snapshot parse error, fall back to raw trace files
+            }
+        }
+
+        // Fallback: Find raw trace files if no snapshot
+        let latestTraceFile: string | null = null;
+        let latestMtime = 0;
+
+        for (const traceDir of traceDirs) {
+            if (!fs.existsSync(traceDir)) continue;
+
+            try {
+                const files = fs.readdirSync(traceDir)
+                    .filter(f => f.endsWith('.json') && !f.startsWith('snapshot_'))
+                    .map(f => path.join(traceDir, f));
+
+                for (const file of files) {
+                    const stat = fs.statSync(file);
+                    if (stat.mtimeMs > latestMtime) {
+                        latestMtime = stat.mtimeMs;
+                        latestTraceFile = file;
+                    }
+                }
+            } catch (e) {
+                // Directory read error, continue to next
+            }
+        }
+
+        if (!latestTraceFile) return;
+
+        try {
+            const content = fs.readFileSync(latestTraceFile, 'utf-8');
+            const traceData = JSON.parse(content);
+            const calls = traceData.calls || [];
+
+            if (calls.length === 0) return;
+
+            // Compute performance data from calls
+            const perfMap = new Map<string, { total_ms: number; calls: number }>();
+
+            for (const call of calls) {
+                const funcName = `${call.module || 'unknown'}.${call.function || 'unknown'}`;
+                const duration = call.duration_ms || call.duration || 0;
+
+                if (!perfMap.has(funcName)) {
+                    perfMap.set(funcName, { total_ms: 0, calls: 0 });
+                }
+                const entry = perfMap.get(funcName)!;
+                entry.total_ms += duration;
+                entry.calls += 1;
+            }
+
+            // Convert to hotspots array and sort by total time
+            const hotspots = Array.from(perfMap.entries())
+                .map(([func, data]) => ({
+                    function: func,
+                    total_ms: data.total_ms,
+                    calls: data.calls
+                }))
+                .sort((a, b) => b.total_ms - a.total_ms)
+                .slice(0, 20);
+
+            if (hotspots.length > 0) {
+                this.performanceData = { hotspots };
+            }
+
+            // Also set call trace data if not already set
+            if (!this.callTraceData && calls.length > 0) {
+                this.callTraceData = {
+                    calls: calls.slice(0, 100).map((c: any) => ({
+                        function: c.function || 'unknown',
+                        module: c.module || 'unknown',
+                        depth: c.depth || 0,
+                        duration_ms: c.duration_ms || c.duration || 0,
+                        type: c.type || 'call'
+                    })),
+                    total_calls: calls.length
+                };
+            }
+        } catch (e) {
+            // Parse error, ignore
+        }
     }
 
     public async askQuestion(question: string, context: string = '', callback: (response: string) => void): Promise<void> {
@@ -3078,6 +3643,15 @@ ${methodCode}
             accent-color: var(--accent-green);
         }
 
+        .benchmark-info {
+            font-size: 10px;
+            color: #888;
+            margin-left: 8px;
+            padding: 2px 6px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 4px;
+        }
+
         .backend-selector {
             display: flex;
             align-items: center;
@@ -3217,6 +3791,7 @@ ${methodCode}
             <div class="gpu-option" id="gpuOption">
                 <input type="checkbox" id="gpuCheckbox" />
                 <label for="gpuCheckbox" id="gpuLabel">GPU Acceleration</label>
+                <span id="benchmarkInfo" class="benchmark-info"></span>
             </div>
             <div class="ollama-models" id="ollamaModelsDiv">
                 <label>Model:</label>
@@ -3790,6 +4365,27 @@ ${methodCode}
                     serverBtn.disabled = false;
                     statusIndicator.classList.remove('connected');
                     status.textContent = 'AI Server stopped';
+                    // Clear benchmark info
+                    const benchmarkInfoStop = document.getElementById('benchmarkInfo');
+                    if (benchmarkInfoStop) benchmarkInfoStop.textContent = '';
+                    break;
+
+                case 'benchmarkStarting':
+                    status.textContent = 'AI Server running - Running benchmark...';
+                    const benchmarkInfoStart = document.getElementById('benchmarkInfo');
+                    if (benchmarkInfoStart) benchmarkInfoStart.textContent = '⏱ Benchmarking...';
+                    break;
+
+                case 'benchmarkComplete':
+                    const benchmarkInfo = document.getElementById('benchmarkInfo');
+                    if (benchmarkInfo) {
+                        if (msg.gpuTps > 0) {
+                            benchmarkInfo.textContent = 'CPU: ' + Math.round(msg.cpuTps) + ' t/s | GPU: ' + Math.round(msg.gpuTps) + ' t/s | Best: ' + msg.recommended.toUpperCase();
+                        } else {
+                            benchmarkInfo.textContent = 'CPU: ' + Math.round(msg.cpuTps) + ' t/s';
+                        }
+                    }
+                    status.textContent = 'AI Server running - Ready to chat!';
                     break;
 
                 case 'updateMcpStatus':

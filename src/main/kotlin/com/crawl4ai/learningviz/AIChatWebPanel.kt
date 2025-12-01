@@ -410,9 +410,33 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
 
         .controls {
             display: flex;
-            gap: 6px;
+            gap: 8px;
             flex-wrap: wrap;
             align-items: center;
+        }
+
+        .compact-select {
+            padding: 8px 12px;
+            font-size: 13px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .compact-btn {
+            padding: 8px 16px;
+            font-size: 13px;
+        }
+
+        .model-btn {
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 13px;
+            padding: 8px 16px;
         }
 
         button {
@@ -467,22 +491,13 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
             cursor: not-allowed;
         }
 
-        .status-bar {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-top: 8px;
-            font-size: 11px;
-            color: var(--text-muted);
-        }
-
         .progress-bar {
-            flex: 1;
-            height: 4px;
+            height: 3px;
             background: var(--bg-tertiary);
             border-radius: 2px;
             overflow: hidden;
             display: none;
+            margin-top: 4px;
         }
 
         .progress-bar.active { display: block; }
@@ -988,81 +1003,19 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
         .gpu-option {
             display: flex;
             align-items: center;
-            gap: 4px;
+            gap: 8px;
         }
 
         .gpu-option input[type="checkbox"] {
-            width: 14px;
-            height: 14px;
+            width: 18px;
+            height: 18px;
             cursor: pointer;
         }
 
         .gpu-option label {
-            font-size: 11px;
+            font-size: 13px;
             color: var(--accent-green);
             cursor: pointer;
-        }
-
-        /* Model info row */
-        .model-info {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 4px 10px;
-            background: var(--bg-tertiary);
-            border-radius: 4px;
-            margin-top: 6px;
-            font-size: 11px;
-        }
-
-        .model-label {
-            color: var(--text-muted);
-        }
-
-        .model-name {
-            color: var(--accent-blue);
-            font-weight: 500;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            max-width: 200px;
-        }
-
-        /* Server controls row */
-        .server-controls {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            padding: 6px 10px;
-            background: var(--bg-tertiary);
-            border-radius: 4px;
-            margin-top: 6px;
-        }
-
-        .server-status-row {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 11px;
-        }
-
-        .server-label {
-            color: var(--text-muted);
-        }
-
-        .running-model {
-            color: var(--accent-green);
-            font-weight: 500;
-        }
-
-        .running-model.stopped {
-            color: var(--text-muted);
-        }
-
-        .server-buttons {
-            display: flex;
-            gap: 6px;
         }
 
         /* Ollama controls */
@@ -1070,15 +1023,15 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
             display: flex;
             align-items: center;
             gap: 8px;
-            padding: 4px 10px;
+            padding: 8px 16px;
             background: var(--bg-tertiary);
             border-radius: 4px;
             margin-top: 6px;
         }
 
         .ollama-controls select {
-            padding: 4px 8px;
-            font-size: 11px;
+            padding: 8px 12px;
+            font-size: 13px;
             background: var(--bg-secondary);
             color: var(--text-primary);
             border: 1px solid var(--border-color);
@@ -1087,9 +1040,9 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
         }
 
         .ollama-status {
-            font-size: 10px;
-            padding: 2px 6px;
-            border-radius: 10px;
+            font-size: 13px;
+            padding: 4px 12px;
+            border-radius: 12px;
         }
 
         .ollama-status.connected {
@@ -1102,17 +1055,16 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
             color: white;
         }
 
-        /* Token counter */
+        /* Token counter - now inline with thinking */
         .token-counter {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 11px;
+            display: none;  /* Hidden by default, shown inline with thinking */
+            font-size: 13px;
             color: var(--text-muted);
-            padding: 4px 8px;
-            background: var(--bg-tertiary);
-            border-radius: 4px;
-            margin-bottom: 6px;
+            margin-left: auto;
+        }
+
+        .token-counter.active {
+            display: inline-block;
         }
 
         .token-counter span {
@@ -1130,6 +1082,7 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
             border-radius: 4px;
             cursor: pointer;
             min-width: 90px;
+            position: relative;
         }
 
         .context-inline:focus {
@@ -1148,46 +1101,37 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
             <button class="maximize-btn" onclick="maximize()">Maximize</button>
         </div>
         <div class="controls">
-            <div class="backend-selector">
-                <label>Backend:</label>
-                <select id="backendSelect" onchange="onBackendChange()">
-                    <option value="llama.cpp">llama.cpp</option>
-                    <option value="ollama">Ollama</option>
-                </select>
-            </div>
+            <select id="backendSelect" class="compact-select" onchange="onBackendChange()" title="AI Backend">
+                <option value="llama.cpp">llama.cpp</option>
+                <option value="ollama">Ollama</option>
+            </select>
             <div class="gpu-option" id="gpuOption" style="display:none;">
                 <input type="checkbox" id="gpuCheckbox" onchange="onGpuChange()" />
                 <label for="gpuCheckbox" id="gpuLabel">GPU</label>
             </div>
-            <button class="secondary" onclick="clearHistory()">Clear</button>
-            <button id="downloadBtn" class="secondary" onclick="downloadModel()">Download Model</button>
-        </div>
-        <div class="model-info" id="modelInfo" style="display:none;">
-            <span class="model-label">Model:</span>
-            <span class="model-name" id="downloadedModelName">None</span>
-        </div>
-        <div class="server-controls">
-            <div class="server-status-row">
-                <span class="server-label">Server:</span>
-                <span class="running-model" id="runningModelName">Not running</span>
-            </div>
-            <div class="server-buttons">
-                <button id="startBtn" class="success" onclick="startServer()">Start Server</button>
-                <button id="stopBtn" class="danger" onclick="stopServer()" style="display:none;">Stop Server</button>
-                <button id="deployNewBtn" class="primary" onclick="deployNewModel()" style="display:none;">Stop & Deploy New</button>
-            </div>
+            <button id="downloadBtn" class="secondary model-btn" onclick="downloadModel()" title="Click to download or change model">
+                <span id="modelBtnText">Download Model</span> ✎
+            </button>
+            <select id="contextSelect" class="compact-select" onchange="onContextChange()" title="Inject context data">
+                <option value="0">No context</option>
+                <option value="1">+ Dead Code</option>
+                <option value="2">+ Performance</option>
+                <option value="3">+ Call Trace</option>
+                <option value="4">+ Diagram</option>
+                <option value="5">+ All Data</option>
+            </select>
+            <button id="startBtn" class="success compact-btn" onclick="startServer()">▶ Start</button>
+            <button id="stopBtn" class="danger compact-btn" onclick="stopServer()" style="display:none;">⏹ Stop</button>
+            <button class="secondary compact-btn" onclick="clearHistory()" title="Clear chat history">🗑</button>
         </div>
         <div class="ollama-controls" id="ollamaControls" style="display:none;">
-            <select id="ollamaModelSelect" onchange="onOllamaModelChange()">
+            <select id="ollamaModelSelect" class="compact-select" onchange="onOllamaModelChange()">
                 <option value="">Select model...</option>
             </select>
             <span class="ollama-status" id="ollamaStatus">Not connected</span>
         </div>
-        <div class="status-bar">
-            <span id="status">Ready</span>
-            <div class="progress-bar" id="progressBar">
-                <div class="progress-bar-fill" id="progressFill"></div>
-            </div>
+        <div class="progress-bar" id="progressBar">
+            <div class="progress-bar-fill" id="progressFill"></div>
         </div>
     </div>
 
@@ -1211,6 +1155,7 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
                 <div class="thinking-dot"></div>
             </div>
             <span id="thinkingText">AI is thinking...</span>
+            <span class="token-counter" id="tokenCounter"><span id="tokenDisplay">0</span> tokens</span>
             <button id="stopOperationBtn" class="stop-btn" onclick="stopOperation()" style="display:none;">⏹ Stop</button>
         </div>
         <div class="chunk-progress" id="chunkProgress" style="display:none;">
@@ -1225,9 +1170,6 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
     </div>
 
     <div class="input-area">
-        <div class="token-counter" id="tokenCounter">
-            <span id="tokenDisplay">Tokens: 0</span>
-        </div>
         <div class="image-preview-container" id="imagePreviewContainer">
             <img id="imagePreview" class="image-preview" />
             <span class="image-preview-info" id="imageInfo">Image attached</span>
@@ -1239,14 +1181,6 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
                 <div class="input-actions">
                     <button class="icon-btn" onclick="pasteImage()" title="Paste image">📋</button>
                     <button class="icon-btn" onclick="attachImage()" title="Attach image">📎</button>
-                    <select id="contextSelect" class="context-inline" onchange="onContextChange()" title="Inject context data">
-                        <option value="0">No context</option>
-                        <option value="1">Dead Code</option>
-                        <option value="2">Performance</option>
-                        <option value="3">Call Trace</option>
-                        <option value="4">Diagram</option>
-                        <option value="5">All Data</option>
-                    </select>
                 </div>
             </div>
             <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
@@ -1268,7 +1202,6 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
         const sendBtn = document.getElementById('sendBtn');
         const thinking = document.getElementById('thinking');
         const statusIndicator = document.getElementById('statusIndicator');
-        const status = document.getElementById('status');
         const progressBar = document.getElementById('progressBar');
         const progressFill = document.getElementById('progressFill');
         const startBtn = document.getElementById('startBtn');
@@ -1353,7 +1286,8 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
         }
 
         function updateStatus(text) {
-            status.textContent = text;
+            // Status is shown via the indicator dot and stop button model name
+            // This function is kept for backward compatibility
         }
 
         let downloadedModel = null;
@@ -1364,51 +1298,33 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
             runningModel = running ? model : null;
             statusIndicator.classList.toggle('connected', running);
 
-            const runningModelEl = document.getElementById('runningModelName');
-            const deployNewBtn = document.getElementById('deployNewBtn');
-
-            if (running && model) {
-                runningModelEl.textContent = model;
-                runningModelEl.classList.remove('stopped');
-                status.textContent = 'Connected: ' + model;
+            if (running) {
+                // Determine model name to show - use running model, fallback to downloaded
+                const displayModel = (model && model !== 'unknown') ? model : (downloadedModel || 'Server');
+                const shortModel = displayModel.length > 15 ? displayModel.substring(0, 12) + '...' : displayModel;
                 startBtn.style.display = 'none';
+                stopBtn.textContent = '⏹ ' + shortModel;
+                stopBtn.title = 'Stop: ' + displayModel;
                 stopBtn.style.display = 'inline-block';
-
-                // Show deploy button if downloaded model differs from running model
-                if (downloadedModel && downloadedModel !== model) {
-                    deployNewBtn.style.display = 'inline-block';
-                } else {
-                    deployNewBtn.style.display = 'none';
-                }
             } else {
-                runningModelEl.textContent = 'Not running';
-                runningModelEl.classList.add('stopped');
                 startBtn.style.display = 'inline-block';
                 stopBtn.style.display = 'none';
-                deployNewBtn.style.display = 'none';
             }
         }
 
         function setDownloadedModel(modelName) {
             downloadedModel = modelName;
-            const modelInfo = document.getElementById('modelInfo');
-            const modelNameEl = document.getElementById('downloadedModelName');
+            const modelBtnText = document.getElementById('modelBtnText');
             const downloadBtn = document.getElementById('downloadBtn');
-            const deployNewBtn = document.getElementById('deployNewBtn');
 
             if (modelName) {
-                modelInfo.style.display = 'flex';
-                modelNameEl.textContent = modelName;
-                downloadBtn.textContent = 'Change Model';
-
-                // Show deploy button if running different model
-                if (serverRunning && runningModel && runningModel !== modelName) {
-                    deployNewBtn.style.display = 'inline-block';
-                }
+                // Show shortened model name in button
+                const shortModel = modelName.length > 16 ? modelName.substring(0, 13) + '...' : modelName;
+                modelBtnText.textContent = shortModel;
+                downloadBtn.title = 'Model: ' + modelName + ' (click to change)';
             } else {
-                modelInfo.style.display = 'none';
-                downloadBtn.textContent = 'Download Model';
-                deployNewBtn.style.display = 'none';
+                modelBtnText.textContent = 'Download Model';
+                downloadBtn.title = 'Click to download a model';
             }
         }
 
@@ -1420,7 +1336,7 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
             if (percent > 0 && percent < 100) {
                 progressBar.classList.add('active');
                 progressFill.style.width = percent + '%';
-                if (message) status.textContent = message;
+                // Progress message shown via progress bar, no separate status element
             } else {
                 progressBar.classList.remove('active');
             }
@@ -1541,9 +1457,14 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
         }
 
         function updateTokens(total) {
+            const tokenCounter = document.getElementById('tokenCounter');
             const tokenDisplay = document.getElementById('tokenDisplay');
-            if (tokenDisplay) {
-                tokenDisplay.textContent = 'Tokens: ' + total.toLocaleString();
+            if (tokenDisplay && tokenCounter) {
+                tokenDisplay.textContent = total.toLocaleString();
+                // Show counter when we have tokens
+                if (total > 0) {
+                    tokenCounter.classList.add('active');
+                }
             }
         }
 

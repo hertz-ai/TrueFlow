@@ -24,6 +24,73 @@ import javax.swing.*
 import javax.swing.table.DefaultTableModel
 
 /**
+ * WrapLayout - A FlowLayout subclass that supports wrapping components to the next line.
+ * Unlike FlowLayout which clips components when container is too narrow,
+ * WrapLayout adjusts the container height to accommodate all components.
+ */
+class WrapLayout(align: Int = FlowLayout.LEFT, hgap: Int = 5, vgap: Int = 5) : FlowLayout(align, hgap, vgap) {
+
+    override fun preferredLayoutSize(target: java.awt.Container): Dimension {
+        return layoutSize(target, true)
+    }
+
+    override fun minimumLayoutSize(target: java.awt.Container): Dimension {
+        val minimum = layoutSize(target, false)
+        minimum.width -= (hgap + 1)
+        return minimum
+    }
+
+    private fun layoutSize(target: java.awt.Container, preferred: Boolean): Dimension {
+        synchronized(target.treeLock) {
+            val targetWidth = target.size.width
+            val insets = target.insets
+            val horizontalInsetsAndGap = insets.left + insets.right + (hgap * 2)
+            val maxWidth = if (targetWidth > 0) targetWidth - horizontalInsetsAndGap else Integer.MAX_VALUE
+
+            val dim = Dimension(0, 0)
+            var rowWidth = 0
+            var rowHeight = 0
+
+            val nmembers = target.componentCount
+            for (i in 0 until nmembers) {
+                val m = target.getComponent(i)
+                if (m.isVisible) {
+                    val d = if (preferred) m.preferredSize else m.minimumSize
+                    if (rowWidth + d.width > maxWidth) {
+                        addRow(dim, rowWidth, rowHeight)
+                        rowWidth = 0
+                        rowHeight = 0
+                    }
+                    if (rowWidth != 0) {
+                        rowWidth += hgap
+                    }
+                    rowWidth += d.width
+                    rowHeight = maxOf(rowHeight, d.height)
+                }
+            }
+            addRow(dim, rowWidth, rowHeight)
+
+            dim.width += horizontalInsetsAndGap
+            dim.height += insets.top + insets.bottom + vgap * 2
+
+            val scrollPane = SwingUtilities.getAncestorOfClass(JScrollPane::class.java, target)
+            if (scrollPane != null && target.isValid) {
+                dim.width -= (hgap + 1)
+            }
+            return dim
+        }
+    }
+
+    private fun addRow(dim: Dimension, rowWidth: Int, rowHeight: Int) {
+        dim.width = maxOf(dim.width, rowWidth)
+        if (dim.height > 0) {
+            dim.height += vgap
+        }
+        dim.height += rowHeight
+    }
+}
+
+/**
  * Circular buffer for trace events with bounded memory usage.
  */
 private class CircularBuffer(private val maxSize: Int) {
@@ -259,7 +326,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         val toolbar = JToolBar()
         toolbar.isFloatable = false
 
-        // Auto-integrate button (highlighted - primary action)
+        // Auto-integrate button (highlighted - primary action) - only show if not already integrated
         val autoIntegrateButton = JButton("Auto-Integrate into Repo")
         autoIntegrateButton.toolTipText = "Automatically set up tracing by selecting your Python entry point"
         autoIntegrateButton.addActionListener {
@@ -267,7 +334,11 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         }
         autoIntegrateButton.background = java.awt.Color(76, 175, 80) // Green highlight
         autoIntegrateButton.foreground = java.awt.Color.WHITE
-        toolbar.add(autoIntegrateButton)
+
+        // Check if already integrated - hide button if so
+        if (!isProjectAlreadyIntegrated()) {
+            toolbar.add(autoIntegrateButton)
+        }
 
         // Attach/Detach button (second button - most important after auto-integrate)
         attachButton = JButton("Attach to Server")
@@ -322,14 +393,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         }
         toolbar.add(autoTraceCheckbox)
 
-        toolbar.addSeparator()
-
-        // Export button
-        val exportButton = JButton("Export")
-        exportButton.addActionListener {
-            exportCurrentView()
-        }
-        toolbar.add(exportButton)
+        // Export button moved to stats panel row 3
 
         mainPanel.toolbar = toolbar
     }
@@ -339,106 +403,148 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         dialog.show()
     }
 
+    /**
+     * Check if the project already has TrueFlow integration (runtime injector deployed).
+     * Returns true if .pycharm_plugin/runtime_injector exists with essential files.
+     */
+    private fun isProjectAlreadyIntegrated(): Boolean {
+        val pluginDir = java.io.File("${project.basePath}/.pycharm_plugin")
+        val runtimeInjectorDir = java.io.File(pluginDir, "runtime_injector")
+
+        if (!runtimeInjectorDir.exists()) {
+            return false
+        }
+
+        // Check for essential files
+        val essentialFiles = listOf(
+            "python_runtime_instrumentor.py",
+            "sitecustomize.py"
+        )
+
+        return essentialFiles.all { java.io.File(runtimeInjectorDir, it).exists() }
+    }
+
     private var statsExpanded = false
     private lateinit var expandedStatsPanel: JPanel
     private lateinit var statsToggleButton: JButton
     private lateinit var manageFiltersButton: JButton
+    private lateinit var filtersAppliedButton: JButton
 
     private fun createStatsPanel() {
-        statsPanel.layout = BorderLayout()
-        statsPanel.border = JBUI.Borders.empty(2, 5)
+        // Compact dashboard with 3 organized rows - centered
+        statsPanel.layout = BoxLayout(statsPanel, BoxLayout.Y_AXIS)
+        statsPanel.border = JBUI.Borders.empty(4, 4)
 
-        // Main content panel using FlowLayout for wrapping on narrow widths
-        val contentPanel = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.LEFT, 4, 2))
+        // Increased font sizes for better readability
+        val smallFont = Font("SansSerif", Font.PLAIN, 13)
+        val normalFont = Font("SansSerif", Font.PLAIN, 14)
+        val boldFont = Font("SansSerif", Font.BOLD, 14)
 
-        // === Essential stats (always visible, compact) ===
+        // === ROW 1: Version | Mode | Session | Process ===
+        val row1 = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.CENTER, 6, 2))
+        row1.border = JBUI.Borders.emptyBottom(2)
 
-        // Calls count - important metric
-        totalCallsLabel.font = totalCallsLabel.font.deriveFont(Font.BOLD, 11f)
+        // Version badge
+        versionLabel.font = smallFont
+        versionLabel.foreground = JBColor(0x666666, 0xAAAAAA)
+        row1.add(versionLabel)
+
+        row1.add(createSeparator())
+
+        // Mode (connection status) - prominent with status color
+        traceModeLabel.font = boldFont
+        traceModeLabel.foreground = JBColor(0xCC4400, 0xFF6633)  // Orange = disconnected
+        row1.add(traceModeLabel)
+
+        row1.add(createSeparator())
+
+        // Session ID
+        currentSessionLabel.font = smallFont
+        currentSessionLabel.foreground = JBColor(0x666666, 0x999999)
+        row1.add(currentSessionLabel)
+
+        row1.add(createSeparator())
+
+        // Process info
+        processInfoLabel.font = smallFont
+        processInfoLabel.foreground = JBColor(0x666666, 0x999999)
+        row1.add(processInfoLabel)
+
+        statsPanel.add(row1)
+
+        // === ROW 2: Calls | Avg Time | Dead Code | Total Time | Export ===
+        val row2 = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.CENTER, 6, 2))
+        row2.border = JBUI.Borders.emptyBottom(3)
+
+        // Total Calls - blue (primary metric)
+        totalCallsLabel.font = boldFont
         totalCallsLabel.foreground = JBColor(0x0066CC, 0x66AAFF)
-        contentPanel.add(totalCallsLabel)
+        row2.add(totalCallsLabel)
 
-        contentPanel.add(createSeparator())
+        row2.add(createSeparator())
 
-        // Avg time - important metric
-        avgTimeLabel.font = avgTimeLabel.font.deriveFont(Font.BOLD, 11f)
-        avgTimeLabel.foreground = JBColor(0x006600, 0x66FF66)
-        contentPanel.add(avgTimeLabel)
+        // Avg time - green (performance)
+        avgTimeLabel.font = boldFont
+        avgTimeLabel.foreground = JBColor(0x228B22, 0x66CC66)
+        row2.add(avgTimeLabel)
 
-        contentPanel.add(createSeparator())
+        row2.add(createSeparator())
 
-        // Dead code % - important metric (highlighted if > 0)
-        deadCodePercentLabel.font = deadCodePercentLabel.font.deriveFont(Font.BOLD, 11f)
+        // Dead code % - orange (warning indicator)
+        deadCodePercentLabel.font = boldFont
         deadCodePercentLabel.foreground = JBColor(0xCC6600, 0xFFAA33)
-        contentPanel.add(deadCodePercentLabel)
+        row2.add(deadCodePercentLabel)
 
-        contentPanel.add(createSeparator())
+        row2.add(createSeparator())
 
-        // Filter stats - shows active filter count
-        filterStatsLabel.foreground = JBColor(0x008800, 0x88FF88)
-        filterStatsLabel.font = filterStatsLabel.font.deriveFont(11f)
-        contentPanel.add(filterStatsLabel)
+        // Total time - muted
+        totalTimeLabel.font = normalFont
+        totalTimeLabel.foreground = JBColor(0x555555, 0xAAAAAA)
+        row2.add(totalTimeLabel)
 
-        // Manage Filters button - prominent with distinct color
-        manageFiltersButton = JButton("⚙ Filters")
-        manageFiltersButton.preferredSize = Dimension(80, 20)
-        manageFiltersButton.toolTipText = "Configure global trace filtering (applies to all tabs)"
-        manageFiltersButton.font = manageFiltersButton.font.deriveFont(Font.BOLD, 10f)
-        manageFiltersButton.background = JBColor(0xE67300, 0xCC6600)
-        manageFiltersButton.foreground = JBColor.WHITE
-        manageFiltersButton.isOpaque = true
-        manageFiltersButton.isBorderPainted = false
-        manageFiltersButton.addActionListener { showFilterManagementDialog() }
-        contentPanel.add(manageFiltersButton)
+        row2.add(createSeparator())
 
-        contentPanel.add(createSeparator())
+        // Export button - important, always visible in row 2
+        val exportButton = JButton("Export")
+        exportButton.toolTipText = "Export current view data"
+        exportButton.font = smallFont
+        exportButton.margin = java.awt.Insets(2, 8, 2, 8)
+        exportButton.addActionListener { exportCurrentView() }
+        row2.add(exportButton)
 
-        // Toggle button to expand/collapse additional stats
-        statsToggleButton = JButton("▶ More")
-        statsToggleButton.preferredSize = Dimension(65, 20)
-        statsToggleButton.toolTipText = "Show/hide additional statistics (version, session, process info)"
-        statsToggleButton.font = statsToggleButton.font.deriveFont(10f)
-        statsToggleButton.addActionListener { toggleStatsExpansion() }
-        contentPanel.add(statsToggleButton)
+        statsPanel.add(row2)
 
-        statsPanel.add(contentPanel, BorderLayout.NORTH)
+        // === ROW 3: Single Filters button (shows status + manages filters) ===
+        val row3 = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.CENTER, 8, 3))
+        row3.background = JBColor(0xF0F0F0, 0x3A3A3A)
+        row3.isOpaque = true
+        row3.border = JBUI.Borders.empty(2, 4)
 
-        // Expanded details panel (hidden by default) - secondary info
-        expandedStatsPanel = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.LEFT, 8, 2))
-        expandedStatsPanel.border = JBUI.Borders.empty(0, 5, 2, 5)
+        // Single Filters button - shows filter status, styled by state, click to manage
+        filtersAppliedButton = JButton("Filters: Default")
+        filtersAppliedButton.toolTipText = "Click to manage filters"
+        filtersAppliedButton.font = smallFont
+        filtersAppliedButton.margin = java.awt.Insets(2, 12, 2, 12)
+        filtersAppliedButton.addActionListener { showFilterManagementDialog() }
+        updateFiltersAppliedButton()  // Set initial style and text
+        row3.add(filtersAppliedButton)
+
+        // Hidden label for compatibility (filter stats now in button)
+        filterStatsLabel.isVisible = false
+
+        // Hidden button for compatibility
+        manageFiltersButton = JButton("")
+        manageFiltersButton.isVisible = false
+
+        statsPanel.add(row3)
+
+        // Hidden expanded panel (kept for compatibility but not used)
+        expandedStatsPanel = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.LEFT, 0, 0))
         expandedStatsPanel.isVisible = false
 
-        // Version - secondary info
-        versionLabel.foreground = JBColor.BLUE
-        versionLabel.font = versionLabel.font.deriveFont(10f)
-        expandedStatsPanel.add(versionLabel)
-
-        expandedStatsPanel.add(createSeparator())
-
-        // Session label - secondary
-        currentSessionLabel.font = currentSessionLabel.font.deriveFont(10f)
-        expandedStatsPanel.add(currentSessionLabel)
-
-        expandedStatsPanel.add(createSeparator())
-
-        // Process info - secondary
-        processInfoLabel.font = processInfoLabel.font.deriveFont(10f)
-        expandedStatsPanel.add(processInfoLabel)
-
-        expandedStatsPanel.add(createSeparator())
-
-        // Total time - secondary
-        totalTimeLabel.font = totalTimeLabel.font.deriveFont(10f)
-        expandedStatsPanel.add(totalTimeLabel)
-
-        expandedStatsPanel.add(createSeparator())
-
-        // Trace mode - secondary
-        traceModeLabel.foreground = JBColor.GRAY
-        traceModeLabel.font = traceModeLabel.font.deriveFont(10f)
-        expandedStatsPanel.add(traceModeLabel)
-
-        statsPanel.add(expandedStatsPanel, BorderLayout.CENTER)
+        // Hidden toggle button (kept for compatibility but not used)
+        statsToggleButton = JButton("")
+        statsToggleButton.isVisible = false
 
         // Register filter change listener
         traceFilter.addChangeListener {
@@ -453,6 +559,8 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private fun createSeparator(): JLabel {
         val sep = JBLabel("|")
         sep.foreground = JBColor(0xCCCCCC, 0x555555)
+        sep.font = Font("SansSerif", Font.PLAIN, 11)
+        sep.border = JBUI.Borders.empty(0, 2)
         return sep
     }
 
@@ -466,6 +574,35 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
     private fun updateFilterStatsLabel() {
         filterStatsLabel.text = "Filters: ${traceFilter.getStats()}"
+        // Also update the filters button
+        updateFiltersAppliedButton()
+    }
+
+    /**
+     * Update the Filters button appearance based on filter state.
+     * - Default filters: White background, dark grey text
+     * - Custom filters: Highlighted with filter count
+     */
+    private fun updateFiltersAppliedButton() {
+        if (!::filtersAppliedButton.isInitialized) return
+
+        val stats = traceFilter.getStats()
+        val isDefault = traceFilter.isDefault()
+
+        if (isDefault) {
+            // Default filters - white/light background, dark grey text
+            filtersAppliedButton.text = "Filters: Default"
+            filtersAppliedButton.background = JBColor(0xFFFFFF, 0x4A4A4A)  // White / Dark grey
+            filtersAppliedButton.foreground = JBColor(0x555555, 0xBBBBBB)  // Dark grey / Light grey
+            filtersAppliedButton.toolTipText = "Using default filters - click to customize"
+        } else {
+            // Custom filters - show count, slightly highlighted
+            filtersAppliedButton.text = "Filters: $stats"
+            filtersAppliedButton.background = JBColor(0xE8F0FE, 0x3A4A5A)  // Light blue / Darker blue-grey
+            filtersAppliedButton.foreground = JBColor(0x1967D2, 0x8AB4F8)  // Blue / Light blue
+            filtersAppliedButton.toolTipText = "Custom filters applied - click to manage"
+        }
+        filtersAppliedButton.isOpaque = true
     }
 
     private fun createDiagramTab() {
@@ -1856,6 +1993,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         sqlFiles?.firstOrNull()?.let { sqlAnalyzerPanel.loadSqlAnalysis(it) }
         metricsFiles?.firstOrNull()?.let { liveMetricsPanel.loadMetrics(it) }
         distributedFiles?.firstOrNull()?.let { distributedPanel.loadDistributedAnalysis(it) }
+
+        // Save snapshot for AI context (async to not block UI)
+        Thread { saveSnapshot() }.start()
     }
 
     private fun startAutoRefresh() {
@@ -2404,6 +2544,168 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         }
 
         file.writeText(builder.toString())
+    }
+
+    /**
+     * Save a comprehensive snapshot of all tab data for AI context.
+     * Creates timestamped JSON files with performance, dead code, and diagram data.
+     * Maintains only the last 5 snapshots to avoid disk bloat.
+     * This is called automatically when trace data updates.
+     */
+    private fun saveSnapshot() {
+        try {
+            val traceDir = currentTraceDirectory ?: return
+
+            // Create timestamped filename
+            val timestamp = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
+            val snapshotFile = File(traceDir, "snapshot_$timestamp.json")
+
+            // Clean up old snapshots, keep only last 5
+            cleanupOldSnapshots(traceDir, 5)
+
+            val snapshot = buildString {
+                append("{\n")
+
+                // Performance data (hotspots)
+                append("  \"performance\": {\n")
+                append("    \"hotspots\": [\n")
+                for (row in 0 until performanceTableModel.rowCount) {
+                    if (row > 0) append(",\n")
+                    append("      {\n")
+                    append("        \"function\": \"")
+                    append(performanceTableModel.getValueAt(row, 0)?.toString()?.replace("\"", "\\\"") ?: "")
+                    append("\",\n")
+                    append("        \"calls\": ")
+                    append(performanceTableModel.getValueAt(row, 1)?.toString()?.toIntOrNull() ?: 0)
+                    append(",\n")
+                    append("        \"total_ms\": ")
+                    append(performanceTableModel.getValueAt(row, 2)?.toString()?.toDoubleOrNull() ?: 0.0)
+                    append(",\n")
+                    append("        \"avg_ms\": ")
+                    append(performanceTableModel.getValueAt(row, 3)?.toString()?.toDoubleOrNull() ?: 0.0)
+                    append(",\n")
+                    append("        \"file\": \"")
+                    append(performanceTableModel.getValueAt(row, 5)?.toString()?.replace("\"", "\\\"") ?: "")
+                    append("\"\n")
+                    append("      }")
+                }
+                append("\n    ]\n")
+                append("  },\n")
+
+                // Dead code data
+                append("  \"deadCode\": {\n")
+                append("    \"dead_functions\": [\n")
+                for (row in 0 until deadCodeTableModel.rowCount) {
+                    if (row > 0) append(",\n")
+                    append("      {\n")
+                    append("        \"function\": \"")
+                    append(deadCodeTableModel.getValueAt(row, 0)?.toString()?.replace("\"", "\\\"") ?: "")
+                    append("\",\n")
+                    append("        \"file\": \"")
+                    append(deadCodeTableModel.getValueAt(row, 1)?.toString()?.replace("\"", "\\\"") ?: "")
+                    append("\",\n")
+                    append("        \"line\": ")
+                    append(deadCodeTableModel.getValueAt(row, 2)?.toString()?.toIntOrNull() ?: 0)
+                    append(",\n")
+                    append("        \"status\": \"")
+                    append(deadCodeTableModel.getValueAt(row, 3)?.toString()?.replace("\"", "\\\"") ?: "")
+                    append("\"\n")
+                    append("      }")
+                }
+                append("\n    ]\n")
+                append("  },\n")
+
+                // SQL Analysis data
+                append("  \"sqlAnalysis\": {\n")
+                val sqlData = sqlAnalyzerPanel.getSqlData()
+                if (sqlData != null) {
+                    append("    \"totalQueries\": ${sqlData.statistics.totalQueries},\n")
+                    append("    \"nPlus1Issues\": ${sqlData.statistics.nPlus1Issues},\n")
+                    append("    \"issues\": [\n")
+                    sqlData.nPlus1Issues.forEachIndexed { idx, issue ->
+                        if (idx > 0) append(",\n")
+                        append("      {\n")
+                        append("        \"severity\": \"${issue.severity}\",\n")
+                        append("        \"pattern\": \"${issue.pattern.replace("\"", "\\\"").replace("\n", "\\n")}\",\n")
+                        append("        \"count\": ${issue.count},\n")
+                        append("        \"suggestion\": \"${issue.suggestion.replace("\"", "\\\"")}\"\n")
+                        append("      }")
+                    }
+                    append("\n    ],\n")
+                    append("    \"queries\": [\n")
+                    sqlData.allQueries.take(20).forEachIndexed { idx, query ->
+                        if (idx > 0) append(",\n")
+                        append("      {\n")
+                        append("        \"query\": \"${query.query.replace("\"", "\\\"").replace("\n", " ").take(200)}\",\n")
+                        append("        \"module\": \"${query.module}\",\n")
+                        append("        \"function\": \"${query.function}\"\n")
+                        append("      }")
+                    }
+                    append("\n    ]\n")
+                } else {
+                    append("    \"totalQueries\": 0,\n")
+                    append("    \"nPlus1Issues\": 0,\n")
+                    append("    \"issues\": [],\n")
+                    append("    \"queries\": []\n")
+                }
+                append("  },\n")
+
+                // Diagram data
+                append("  \"diagram\": {\n")
+                append("    \"type\": \"")
+                append(diagramTypeCombo.selectedItem?.toString() ?: "PlantUML")
+                append("\",\n")
+                append("    \"content\": ")
+                // Escape the diagram content for JSON
+                val escapedDiagram = diagramTextArea.text
+                    .replace("\\", "\\\\")
+                    .replace("\"", "\\\"")
+                    .replace("\n", "\\n")
+                    .replace("\r", "")
+                    .replace("\t", "\\t")
+                append("\"$escapedDiagram\"\n")
+                append("  },\n")
+
+                // Metadata
+                append("  \"metadata\": {\n")
+                append("    \"timestamp\": \"")
+                append(java.time.Instant.now().toString())
+                append("\",\n")
+                append("    \"totalCalls\": ")
+                append(totalCallsLabel.text.substringAfter(": ").toIntOrNull() ?: 0)
+                append(",\n")
+                append("    \"deadCodeCount\": ")
+                append(deadCodeLabel.text.substringAfter(": ").toIntOrNull() ?: 0)
+                append(",\n")
+                append("    \"source\": \"pycharm\"\n")
+                append("  }\n")
+
+                append("}")
+            }
+
+            snapshotFile.writeText(snapshot)
+        } catch (e: Exception) {
+            // Silent fail - snapshot is auxiliary feature
+        }
+    }
+
+    /**
+     * Clean up old snapshot files, keeping only the most recent ones.
+     */
+    private fun cleanupOldSnapshots(traceDir: File, keepCount: Int) {
+        try {
+            val snapshotFiles = traceDir.listFiles { _, name ->
+                name.startsWith("snapshot_") && name.endsWith(".json")
+            }?.sortedByDescending { it.lastModified() } ?: return
+
+            // Delete all but the most recent 'keepCount' files
+            if (snapshotFiles.size > keepCount) {
+                snapshotFiles.drop(keepCount).forEach { it.delete() }
+            }
+        } catch (e: Exception) {
+            // Silent fail
+        }
     }
 
     private fun disconnectSocketTrace() {

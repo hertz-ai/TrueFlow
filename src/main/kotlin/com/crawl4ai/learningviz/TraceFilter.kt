@@ -371,18 +371,33 @@ class TraceFilter : PersistentStateComponent<TraceFilter.FilterState> {
     }
 
     /**
-     * Get filter statistics
+     * Get filter statistics as a short string
      */
     fun getStats(): String {
-        return buildString {
-            append("Excluded Folders: ${config.excludedFolders.size}, ")
-            append("Excluded Files: ${config.excludedFiles.size}, ")
-            append("Excluded Modules: ${config.excludedModules.size}, ")
-            append("Patterns: ${config.excludedPatterns.size}")
-            if (config.includeOnly.isNotEmpty()) {
-                append(", Include-Only: ${config.includeOnly.size}")
-            }
+        val totalExclusions = config.excludedFolders.size + config.excludedFiles.size +
+                              config.excludedModules.size + config.excludedPatterns.size
+        val includeCount = config.includeOnly.size
+        return if (includeCount > 0) {
+            "${totalExclusions} excluded, ${includeCount} include-only"
+        } else {
+            "${totalExclusions} exclusions"
         }
+    }
+
+    /**
+     * Check if using default filters (no custom exclusions beyond defaults)
+     */
+    fun isDefault(): Boolean {
+        // Check if all filter lists are at their default sizes or empty
+        // Default folders are: site-packages, venv, .git, __pycache__, node_modules, .idea, .vscode
+        val defaultFolderCount = 7
+        val defaultModuleCount = 5  // logging, asyncio, concurrent, socket, threading
+
+        return config.excludedFolders.size <= defaultFolderCount &&
+               config.excludedFiles.isEmpty() &&
+               config.excludedModules.size <= defaultModuleCount &&
+               config.excludedPatterns.isEmpty() &&
+               config.includeOnly.isEmpty()
     }
 
     // === PersistentStateComponent Implementation ===

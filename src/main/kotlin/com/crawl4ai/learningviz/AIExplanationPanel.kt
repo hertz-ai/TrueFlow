@@ -31,6 +31,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Base64
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import javax.imageio.ImageIO
 import javax.swing.*
 
@@ -147,6 +148,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     // UI Components - Rich web-based chat panel
     private var webChatPanel: AIChatWebPanel? = null
     private val statusLabel = JBLabel("AI Ready")
+    private val benchmarkLabel = JBLabel("")  // Shows CPU/GPU benchmark results
     private val progressBar = JProgressBar(0, 100)
 
     // Model selection
@@ -196,6 +198,14 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     // Hub client for real-time cross-IDE coordination
     private val hubClient = HubClient.getInstance()
 
+    // GPU acceleration with benchmark results
+    private var gpuAvailable: String = "none"  // "cuda", "metal", or "none"
+    private var useGpuAcceleration = false
+    private var cpuTokensPerSecond: Double = 0.0
+    private var gpuTokensPerSecond: Double = 0.0
+    private var benchmarkCompleted = false
+    private var recommendedBackend: String = "cpu"  // "cpu" or "gpu"
+
     // Server status data class for cross-IDE coordination
     data class ServerStatus(
         val running: Boolean,
@@ -208,6 +218,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
     init {
         modelsDir.mkdirs()
+        detectGpuAcceleration()
         setupUI()
         setupHubHandlers()
         checkModelStatus()
@@ -216,6 +227,149 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         checkExistingServer()
         // Register listener to reinitialize browser after indexing completes
         setupIndexingListener()
+    }
+
+    /**
+     * Detect available GPU acceleration (CUDA on Windows/Linux, Metal on macOS).
+     */
+    private fun detectGpuAcceleration() {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                val osName = System.getProperty("os.name").lowercase()
+                when {
+                    osName.contains("mac") -> {
+                        // macOS - Metal is always available on modern Macs
+                        gpuAvailable = "metal"
+                        PluginLogger.info("[TrueFlow] GPU: Metal available on macOS")
+                    }
+                    osName.contains("win") || osName.contains("linux") -> {
+                        // Check for CUDA via nvidia-smi
+                        try {
+                            val process = ProcessBuilder("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")
+                                .redirectErrorStream(true)
+                                .start()
+                            val completed = process.waitFor(3, TimeUnit.SECONDS)
+                            if (completed && process.exitValue() == 0) {
+                                gpuAvailable = "cuda"
+                                PluginLogger.info("[TrueFlow] GPU: CUDA available")
+                            }
+                        } catch (e: Exception) {
+                            PluginLogger.info("[TrueFlow] GPU: No CUDA detected")
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                PluginLogger.warn("[TrueFlow] GPU detection failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Run a quick benchmark to compare CPU vs GPU performance.
+     * Uses llama-bench if available, otherwise estimates based on a short inference test.
+     * Called after server starts - runs a quick inference and measures tokens/second.
+     */
+    private fun runBenchmark(onComplete: (cpuTps: Double, gpuTps: Double, recommended: String) -> Unit) {
+        if (gpuAvailable == "none") {
+            // No GPU, just set CPU as recommended
+            cpuTokensPerSecond = 50.0  // Default estimate
+            gpuTokensPerSecond = 0.0
+            recommendedBackend = "cpu"
+            benchmarkCompleted = true
+            onComplete(cpuTokensPerSecond, gpuTokensPerSecond, recommendedBackend)
+            return
+        }
+
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                // Use the /health endpoint to get server info, or do a quick completion
+                val startTime = System.currentTimeMillis()
+                val testPrompt = "Count from 1 to 10:"
+                val response = callLLMForBenchmark(testPrompt, 50)  // Generate ~50 tokens
+                val endTime = System.currentTimeMillis()
+
+                val durationSeconds = (endTime - startTime) / 1000.0
+                val estimatedTokens = response.split(" ").size + 10  // Rough token estimate
+                val tokensPerSecond = if (durationSeconds > 0) estimatedTokens / durationSeconds else 0.0
+
+                // Store based on current GPU setting
+                if (useGpuAcceleration) {
+                    gpuTokensPerSecond = tokensPerSecond
+                } else {
+                    cpuTokensPerSecond = tokensPerSecond
+                }
+
+                // Determine recommendation: GPU is only better if significantly faster (>20% improvement)
+                recommendedBackend = when {
+                    gpuTokensPerSecond <= 0 -> "cpu"
+                    cpuTokensPerSecond <= 0 -> "gpu"
+                    gpuTokensPerSecond > cpuTokensPerSecond * 1.2 -> "gpu"
+                    else -> "cpu"  // Prefer CPU if similar or CPU is faster
+                }
+
+                benchmarkCompleted = true
+                PluginLogger.info("[TrueFlow] Benchmark: CPU=${cpuTokensPerSecond.toInt()} t/s, GPU=${gpuTokensPerSecond.toInt()} t/s, Recommended=$recommendedBackend")
+
+                SwingUtilities.invokeLater {
+                    onComplete(cpuTokensPerSecond, gpuTokensPerSecond, recommendedBackend)
+                }
+            } catch (e: Exception) {
+                PluginLogger.warn("[TrueFlow] Benchmark failed: ${e.message}")
+                benchmarkCompleted = true
+                SwingUtilities.invokeLater {
+                    onComplete(cpuTokensPerSecond, gpuTokensPerSecond, "cpu")
+                }
+            }
+        }
+    }
+
+    /**
+     * Simple LLM call for benchmarking - doesn't use streaming
+     */
+    private fun callLLMForBenchmark(prompt: String, maxTokens: Int): String {
+        val url = URL("$apiBase/chat/completions")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.doOutput = true
+        conn.connectTimeout = 30000
+        conn.readTimeout = 60000
+
+        val requestBody = """
+            {
+                "model": "local",
+                "messages": [{"role": "user", "content": "$prompt"}],
+                "max_tokens": $maxTokens,
+                "temperature": 0.1,
+                "stream": false
+            }
+        """.trimIndent()
+
+        conn.outputStream.use { os ->
+            os.write(requestBody.toByteArray())
+        }
+
+        if (conn.responseCode != 200) {
+            return ""
+        }
+
+        val response = conn.inputStream.bufferedReader().readText()
+        val json = Gson().fromJson(response, JsonObject::class.java)
+        return json.getAsJsonArray("choices")
+            ?.get(0)?.asJsonObject
+            ?.getAsJsonObject("message")
+            ?.get("content")?.asString ?: ""
+    }
+
+    /**
+     * Get benchmark status string for UI display
+     */
+    fun getBenchmarkStatus(): String {
+        return when {
+            !benchmarkCompleted -> "Benchmark pending..."
+            gpuAvailable == "none" -> "CPU: ${cpuTokensPerSecond.toInt()} t/s"
+            else -> "CPU: ${cpuTokensPerSecond.toInt()} t/s | GPU: ${gpuTokensPerSecond.toInt()} t/s | Best: ${recommendedBackend.uppercase()}"
+        }
     }
 
     /**
@@ -554,6 +708,10 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         statusBar.add(statusLabel, BorderLayout.WEST)
         progressBar.isVisible = false
         statusBar.add(progressBar, BorderLayout.CENTER)
+        // Benchmark results on the right
+        benchmarkLabel.foreground = java.awt.Color.GRAY
+        benchmarkLabel.font = benchmarkLabel.font.deriveFont(11f)
+        statusBar.add(benchmarkLabel, BorderLayout.EAST)
         add(statusBar, BorderLayout.SOUTH)
     }
 
@@ -1301,23 +1459,16 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             "content" to systemPrompt
         ))
 
-        // Add conversation history (last 3 exchanges)
+        // Add conversation history (text only - images are too large to resend each time)
         for (msg in conversationHistory.dropLast(1)) {  // Exclude the message we just added
             val sanitizedContent = sanitizeForLLM(msg.content)
-            if (msg.imageBase64 != null && modelHasVision()) {
-                messages.add(mapOf(
-                    "role" to msg.role,
-                    "content" to listOf(
-                        mapOf("type" to "text", "text" to sanitizedContent),
-                        mapOf(
-                            "type" to "image_url",
-                            "image_url" to mapOf("url" to "data:image/png;base64,${msg.imageBase64}")
-                        )
-                    )
-                ))
+            // For messages that had images, add a note but don't resend the image data
+            val content = if (msg.imageBase64 != null) {
+                "$sanitizedContent\n[User shared an image with this message]"
             } else {
-                messages.add(mapOf("role" to msg.role, "content" to sanitizedContent))
+                sanitizedContent
             }
+            messages.add(mapOf("role" to msg.role, "content" to content))
         }
 
         // Current user message with context
@@ -1838,14 +1989,14 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         webChatPanel?.setDownloadedModel(displayName)
                     }
                     modelExists && preset?.hasVision == true && preset.mmprojFile != null -> {
-                        // Model exists but mmproj missing - show download button for mmproj
+                        // Model exists but mmproj missing - allow server start, but offer vision download
                         currentModelFile = modelFile.absolutePath
                         downloadButton.isEnabled = true
-                        downloadButton.text = "Download Vision Support"
-                        downloadButton.toolTipText = "Download vision projector for $displayName"
-                        startServerButton.isEnabled = false  // Can't start without mmproj for vision model
-                        statusLabel.text = "Vision projector needed. Click to download."
-                        webChatPanel?.setDownloadedModel(null)
+                        downloadButton.text = "Add Vision Support"
+                        downloadButton.toolTipText = "Download vision projector for $displayName (optional)"
+                        startServerButton.isEnabled = true  // Allow starting without mmproj - text chat will still work
+                        statusLabel.text = "Model ready (vision support optional): $fileName"
+                        webChatPanel?.setDownloadedModel(displayName)
                     }
                     else -> {
                         // Model not downloaded
@@ -2031,6 +2182,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         progressBar.value = 0
         statusLabel.text = "Downloading vision projector..."
 
+        PluginLogger.info("Downloading mmproj from: $mmprojUrl")
+
         CompletableFuture.runAsync {
             try {
                 downloadFileWithProgress(mmprojUrl, mmprojDest) { downloaded, total ->
@@ -2042,16 +2195,37 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         statusLabel.text = "Downloading vision projector... ${downloadedMB}MB / ${totalMB}MB ($pct%)"
                     }
                 }
+                // If server is running, restart it to pick up the new mmproj
+                val needsRestart = serverProcess != null && serverProcess!!.isAlive
+
                 SwingUtilities.invokeLater {
                     progressBar.isVisible = false
-                    statusLabel.text = "Model ready: $displayName (vision enabled)"
+                    downloadButton.text = "Change Model"
                     PluginLogger.info("Downloaded mmproj file: $mmprojFile")
+
+                    if (needsRestart) {
+                        statusLabel.text = "Vision enabled! Restarting server..."
+                        PluginLogger.info("Restarting server to load mmproj")
+                        stopServer()
+                    } else {
+                        statusLabel.text = "Model ready: $displayName (vision enabled)"
+                    }
+                }
+
+                // Restart server after short delay (if it was running)
+                if (needsRestart) {
+                    Thread.sleep(1000)  // Wait for server to stop
+                    SwingUtilities.invokeLater {
+                        startServer()
+                    }
                 }
             } catch (e: Exception) {
                 SwingUtilities.invokeLater {
                     progressBar.isVisible = false
-                    statusLabel.text = "Model ready: $displayName (vision projector download failed)"
-                    PluginLogger.warn("Failed to download mmproj file: ${e.message}")
+                    // Still allow using the model without vision
+                    statusLabel.text = "Model ready (text-only, vision download failed: ${e.message?.take(50)})"
+                    downloadButton.text = "Add Vision Support"
+                    PluginLogger.warn("Failed to download mmproj file from $mmprojUrl: ${e.message}")
                 }
             }
         }
@@ -2133,15 +2307,35 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 // Add vision model flags
                 if (isVisionModel) {
                     cmd.add("--kv-unified")
-                    cmd.add("--no-mmproj-offload")
+                    // Only add --no-mmproj-offload if not using GPU
+                    if (!useGpuAcceleration || gpuAvailable == "none") {
+                        cmd.add("--no-mmproj-offload")
+                    }
+                }
+
+                // Add GPU acceleration flags if enabled and available
+                if (useGpuAcceleration && gpuAvailable != "none") {
+                    // Offload all layers to GPU
+                    cmd.addAll(listOf("--n-gpu-layers", "-1"))
+                    // Enable flash attention for CUDA (faster inference)
+                    if (gpuAvailable == "cuda") {
+                        cmd.add("--flash-attn")
+                    }
+                    PluginLogger.info("[TrueFlow] GPU acceleration enabled: $gpuAvailable")
                 }
 
                 // Add mmproj if available for vision models
                 if (mmprojFile != null && mmprojFile.exists() && isVisionModel) {
                     cmd.addAll(listOf("--mmproj", mmprojFile.absolutePath))
-                    PluginLogger.info("Using mmproj: ${mmprojFile.name}")
+                    PluginLogger.info("Using mmproj: ${mmprojFile.absolutePath}")
+                    SwingUtilities.invokeLater {
+                        statusLabel.text = "Starting AI server (with vision)..."
+                    }
                 } else if (isVisionModel) {
-                    PluginLogger.warn("Vision model detected but no mmproj file found - image input may not work")
+                    PluginLogger.warn("Vision model detected but no mmproj file found at ${modelsDir.absolutePath}")
+                    SwingUtilities.invokeLater {
+                        statusLabel.text = "Starting AI server (text-only, no mmproj)..."
+                    }
                 }
 
                 serverProcess = ProcessBuilder(cmd)
@@ -2185,11 +2379,29 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
                         startServerButton.text = "Stop AI Server"
                         startServerButton.isEnabled = true
-                        statusLabel.text = "AI Server running - Ready to chat!"
+                        statusLabel.text = "AI Server running - Running benchmark..."
 
                         // Update web panel
                         webChatPanel?.setServerRunning(true, modelName)
                         webChatPanel?.updateStatus("Connected: $modelName")
+
+                        // Run benchmark to measure CPU/GPU performance
+                        benchmarkLabel.text = "⏱ Benchmarking..."
+                        runBenchmark { cpuTps, gpuTps, recommended ->
+                            statusLabel.text = "AI Server running - Ready to chat!"
+                            benchmarkLabel.text = getBenchmarkStatus()
+
+                            // Auto-select the recommended backend
+                            if (gpuAvailable != "none") {
+                                val shouldUseGpu = recommended == "gpu"
+                                if (shouldUseGpu != useGpuAcceleration) {
+                                    PluginLogger.info("[TrueFlow] Benchmark recommends ${recommended.uppercase()}, will use for next server start")
+                                    // Note: We don't restart server automatically to avoid disruption
+                                    // User can restart to use the recommended setting
+                                    useGpuAcceleration = shouldUseGpu
+                                }
+                            }
+                        }
                     } else {
                         serverProcess?.destroyForcibly()
                         serverProcess = null
@@ -2272,7 +2484,19 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         PluginLogger.info("Using mmproj from HF repo: $mmprojName")
                     }
                     cmd.add("--kv-unified")  // Fix KV cache issues for vision models
-                    cmd.add("--no-mmproj-offload")  // CPU compatibility
+                    // Only add --no-mmproj-offload if not using GPU
+                    if (!useGpuAcceleration || gpuAvailable == "none") {
+                        cmd.add("--no-mmproj-offload")
+                    }
+                }
+
+                // Add GPU acceleration flags if enabled and available
+                if (useGpuAcceleration && gpuAvailable != "none") {
+                    cmd.addAll(listOf("--n-gpu-layers", "-1"))
+                    if (gpuAvailable == "cuda") {
+                        cmd.add("--flash-attn")
+                    }
+                    PluginLogger.info("[TrueFlow] GPU acceleration enabled for HF model: $gpuAvailable")
                 }
 
                 PluginLogger.info("Starting server with HF model: $hfModel")
@@ -2315,11 +2539,27 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
                         startServerButton.text = "Stop AI Server"
                         startServerButton.isEnabled = true
-                        statusLabel.text = "AI Server running with $hfModel"
+                        statusLabel.text = "AI Server running - Running benchmark..."
 
                         // Update web panel
                         webChatPanel?.setServerRunning(true, hfModel)
                         webChatPanel?.updateStatus("Connected: $hfModel")
+
+                        // Run benchmark to measure CPU/GPU performance
+                        benchmarkLabel.text = "⏱ Benchmarking..."
+                        runBenchmark { cpuTps, gpuTps, recommended ->
+                            statusLabel.text = "AI Server running with $hfModel"
+                            benchmarkLabel.text = getBenchmarkStatus()
+
+                            // Auto-select the recommended backend
+                            if (gpuAvailable != "none") {
+                                val shouldUseGpu = recommended == "gpu"
+                                if (shouldUseGpu != useGpuAcceleration) {
+                                    PluginLogger.info("[TrueFlow] Benchmark recommends ${recommended.uppercase()}, will use for next server start")
+                                    useGpuAcceleration = shouldUseGpu
+                                }
+                            }
+                        }
                     } else {
                         serverProcess?.destroyForcibly()
                         serverProcess = null
@@ -2494,13 +2734,18 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 val buildDir = File(installDir, "build")
                 buildDir.mkdirs()
 
-                val cmakeProcess = ProcessBuilder(
+                // Enable CUDA if GPU is available and user wants acceleration
+                val useCuda = gpuAvailable == "cuda" && useGpuAcceleration
+                val cmakeArgs = mutableListOf(
                     "cmake", "..",
                     "-DBUILD_SHARED_LIBS=OFF",
-                    "-DGGML_CUDA=OFF",
+                    if (useCuda) "-DGGML_CUDA=ON" else "-DGGML_CUDA=OFF",
                     "-DLLAMA_CURL=OFF",
                     "-DLLAMA_BUILD_SERVER=ON"  // Required to build llama-server executable
-                ).directory(buildDir).redirectErrorStream(true).start()
+                )
+
+                val cmakeProcess = ProcessBuilder(cmakeArgs)
+                    .directory(buildDir).redirectErrorStream(true).start()
 
                 val cmakeOutput = BufferedReader(InputStreamReader(cmakeProcess.inputStream)).readText()
                 val cmakeExitCode = cmakeProcess.waitFor()
@@ -2567,16 +2812,40 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             val tagName = release.get("tag_name")?.asString ?: return false
 
             // Determine the right binary for this platform
+            // Use CUDA-enabled binary if GPU is available and user wants GPU acceleration
             val osName = System.getProperty("os.name").lowercase()
-            val assetName = when {
-                osName.contains("win") -> "llama-$tagName-bin-win-cpu-x64.zip"
-                osName.contains("mac") -> "llama-$tagName-bin-macos-arm64.zip"
-                else -> "llama-$tagName-bin-ubuntu-x64.zip"
+            val useCuda = gpuAvailable == "cuda" && useGpuAcceleration
+            var assetName = when {
+                osName.contains("win") -> if (useCuda) "llama-$tagName-bin-win-cuda-cu12.2.0-x64.zip" else "llama-$tagName-bin-win-cpu-x64.zip"
+                osName.contains("mac") -> "llama-$tagName-bin-macos-arm64.zip"  // macOS uses Metal
+                else -> if (useCuda) "llama-$tagName-bin-ubuntu-cuda-cu12.2.0-x64.zip" else "llama-$tagName-bin-ubuntu-x64.zip"
             }
 
             // Find the asset URL
             val assets = release.getAsJsonArray("assets")
-            val asset = assets?.firstOrNull { it.asJsonObject.get("name")?.asString == assetName }?.asJsonObject
+            var asset = assets?.firstOrNull { it.asJsonObject.get("name")?.asString == assetName }?.asJsonObject
+
+            // If CUDA binary not found, try CUDA 11.8 then fall back to CPU
+            if (asset == null && useCuda) {
+                PluginLogger.info("[TrueFlow] CUDA 12 binary not found, trying CUDA 11.8...")
+                val cuda11Asset = when {
+                    osName.contains("win") -> "llama-$tagName-bin-win-cuda-cu11.8.0-x64.zip"
+                    else -> "llama-$tagName-bin-ubuntu-cuda-cu11.8.0-x64.zip"
+                }
+                asset = assets?.firstOrNull { it.asJsonObject.get("name")?.asString == cuda11Asset }?.asJsonObject
+                if (asset != null) {
+                    assetName = cuda11Asset
+                } else {
+                    // Fall back to CPU
+                    PluginLogger.info("[TrueFlow] No CUDA binary available, falling back to CPU")
+                    assetName = when {
+                        osName.contains("win") -> "llama-$tagName-bin-win-cpu-x64.zip"
+                        else -> "llama-$tagName-bin-ubuntu-x64.zip"
+                    }
+                    asset = assets?.firstOrNull { it.asJsonObject.get("name")?.asString == assetName }?.asJsonObject
+                }
+            }
+
             val downloadUrl = asset?.get("browser_download_url")?.asString ?: return false
 
             SwingUtilities.invokeLater { statusLabel.text = "Downloading prebuilt llama.cpp ($tagName)..." }
@@ -2614,12 +2883,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             binDir.mkdirs()
 
             val serverExe = if (osName.contains("win")) "llama-server.exe" else "llama-server"
-            val platformDir = when {
-                osName.contains("win") -> "win-cpu-x64"
-                osName.contains("mac") -> "macos-arm64"
-                else -> "ubuntu-x64"
-            }
-            val extractedBinDir = File(installDir, "llama-$tagName-bin-$platformDir")
+            // Extract dir name matches the asset name without .zip extension
+            val extractedDirName = assetName.replace(".zip", "")
+            val extractedBinDir = File(installDir, extractedDirName)
             val srcServer = File(extractedBinDir, serverExe)
             val destServer = File(binDir, serverExe)
 

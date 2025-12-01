@@ -303,10 +303,14 @@ class HubClient private constructor() : Disposable {
         try {
             // Find the hub script in various locations
             val homeDir = System.getProperty("user.home")
-            val possiblePaths = listOf(
+            val possiblePaths = mutableListOf(
+                // 1. Project's .pycharm_plugin folder (deployed by PyCharm plugin)
+                projectPath?.let { "$it/.pycharm_plugin/runtime_injector/trueflow_mcp_hub.py" },
+                // 2. Home directory fallback
                 "$homeDir/.trueflow/trueflow_mcp_hub.py",
+                // 3. Development source path
                 "src/main/resources/runtime_injector/trueflow_mcp_hub.py"
-            )
+            ).filterNotNull()
 
             var hubScript: java.io.File? = null
             for (path in possiblePaths) {

@@ -94,12 +94,11 @@ object PluginPaths {
     }
 
     /**
-     * Traces root directory: traces/
-     * (Note: This is at project root, not in .pycharm_plugin)
+     * Traces root directory: .pycharm_plugin/traces/
      */
     fun getTracesRoot(project: Project): File {
         val projectPath = project.basePath ?: "."
-        return File(projectPath, "traces").also { it.mkdirs() }
+        return File(File(projectPath, ".pycharm_plugin"), "traces").also { it.mkdirs() }
     }
 
     /**

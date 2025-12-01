@@ -235,29 +235,36 @@ export class HubClient {
             return;
         }
 
-        // Find the hub script
+        // Find the hub script - try multiple locations
         const extensionPath = vscode.extensions.getExtension('hevolve-ai.trueflow')?.extensionPath;
+        const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+
+        const possiblePaths = [
+            // 1. Extension path (bundled with extension)
+            extensionPath ? path.join(extensionPath, 'runtime_injector', 'trueflow_mcp_hub.py') : '',
+            // 2. Workspace .trueflow path (VS Code auto-integrated projects)
+            workspaceFolder ? path.join(workspaceFolder.uri.fsPath, '.trueflow', 'runtime_injector', 'trueflow_mcp_hub.py') : '',
+            // 3. Workspace .pycharm_plugin path (PyCharm auto-integrated projects)
+            workspaceFolder ? path.join(workspaceFolder.uri.fsPath, '.pycharm_plugin', 'runtime_injector', 'trueflow_mcp_hub.py') : '',
+            // 4. Workspace src path (for TrueFlow development)
+            workspaceFolder ? path.join(workspaceFolder.uri.fsPath, 'src', 'main', 'resources', 'runtime_injector', 'trueflow_mcp_hub.py') : '',
+            // 5. Home directory
+            path.join(homeDir, '.trueflow', 'trueflow_mcp_hub.py'),
+        ].filter(p => p !== '');
+
         let hubScript = '';
-
-        if (extensionPath) {
-            hubScript = path.join(extensionPath, 'runtime_injector', 'trueflow_mcp_hub.py');
-        }
-
-        // Fallback to workspace
-        if (!hubScript) {
-            const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-            if (workspaceFolder) {
-                hubScript = path.join(
-                    workspaceFolder.uri.fsPath,
-                    'src', 'main', 'resources', 'runtime_injector', 'trueflow_mcp_hub.py'
-                );
+        for (const scriptPath of possiblePaths) {
+            if (fs.existsSync(scriptPath)) {
+                hubScript = scriptPath;
+                console.log(`[TrueFlow Hub] Found hub script at: ${scriptPath}`);
+                break;
             }
         }
 
-        // Try home directory
         if (!hubScript) {
-            const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-            hubScript = path.join(homeDir, '.trueflow', 'trueflow_mcp_hub.py');
+            console.error('[TrueFlow Hub] Hub script not found in any location. Tried:', possiblePaths);
+            return;
         }
 
         try {

@@ -62,7 +62,6 @@ def print_section(text: str):
     print(f"{Colors.CYAN}{text}{Colors.ENDC}")
     print(f"{Colors.CYAN}{'-'*50}{Colors.ENDC}")
 
-
 def print_result(name: str, passed: bool, duration: float, details: str = ""):
     """Print a test result."""
     status = f"{Colors.GREEN}PASSED{Colors.ENDC}" if passed else f"{Colors.FAIL}FAILED{Colors.ENDC}"
