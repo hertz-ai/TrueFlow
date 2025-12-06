@@ -56,12 +56,10 @@ intellij {
     version.set("2023.3.2")
     type.set(ideType)
 
-    // For IntelliJ IDEA, include Python plugin as optional dependency
-    // This enables Python features when Python plugin is installed
-    if (ideType == "IU" || ideType == "IC") {
-        plugins.set(listOf("PythonCore:233.11799.241"))  // Python Community plugin
-    }
-    // PyCharm (PC) has Python built-in, no additional plugins needed
+    // No bundled plugins needed - Python is:
+    // - Built-in for PyCharm (PC)
+    // - Optional dependency declared in plugin.xml for IntelliJ (IU/IC)
+    // Users install Python plugin separately in IntelliJ if they want Python features
 }
 
 dependencies {
@@ -292,7 +290,8 @@ tasks {
 
     patchPluginXml {
         sinceBuild.set("231")
-        untilBuild.set("251.*")  // Supports up to Android Studio 2025.1 (Meerkat)
+        // No untilBuild = compatible with all future versions
+        // Only set untilBuild if using APIs that are known to break in future versions
 
         pluginDescription.set("""
             TrueFlow - Deterministic Code Visualizer & Explainer

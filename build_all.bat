@@ -27,10 +27,9 @@ goto :parse_args
 
 echo.
 echo ============================================================
-echo TrueFlow - Building All Variants
-echo   - PyCharm Plugin (Python support built-in)
-echo   - IntelliJ IDEA Ultimate Plugin (Python optional)
-echo   - Java Agent (for Java runtime instrumentation)
+echo TrueFlow - Building All Components
+echo   - JetBrains Plugin (PyCharm, IntelliJ, Android Studio)
+echo   - Java Agent (for Java/Kotlin runtime instrumentation)
 echo   - VS Code Extension
 echo ============================================================
 echo.
@@ -49,7 +48,7 @@ REM 0. Install Python Dependencies (if not skipped)
 REM ============================================================
 if "%SKIP_PYTHON%"=="0" (
     echo.
-    echo [0/5] Installing Python Dependencies...
+    echo [0/4] Installing Python Dependencies...
     echo ------------------------------------------------------------
 
     cd /d "%SCRIPT_DIR%"
@@ -75,14 +74,14 @@ if "%SKIP_PYTHON%"=="0" (
     )
 ) else (
     echo.
-    echo [0/5] Skipping Python dependencies (--skip-python)
+    echo [0/4] Skipping Python dependencies (--skip-python)
 )
 
 REM ============================================================
-REM 1. Build PyCharm Plugin (Kotlin/Gradle) - Default, Python built-in
+REM 1. Build JetBrains Plugin (Universal - works on PyCharm, IntelliJ, Android Studio)
 REM ============================================================
 echo.
-echo [1/5] Building PyCharm Plugin...
+echo [1/4] Building JetBrains Plugin (Universal)...
 echo ------------------------------------------------------------
 
 cd /d "%SCRIPT_DIR%"
@@ -94,61 +93,33 @@ if exist "%GRADLE_EXE%" (
     call gradlew.bat clean --no-daemon -q 2>nul || call gradle clean --no-daemon -q
 )
 
-REM Build PyCharm plugin (PC = PyCharm Community, has Python built-in)
+REM Build universal plugin (works on PyCharm, IntelliJ IDEA, Android Studio)
+REM Python features are optional via plugin.xml dependency declaration
 if exist "%GRADLE_EXE%" (
-    call "%GRADLE_EXE%" buildPlugin -PideType=PC --no-daemon
+    call "%GRADLE_EXE%" buildPlugin --no-daemon
 ) else (
-    call gradlew.bat buildPlugin -PideType=PC --no-daemon 2>nul || call gradle buildPlugin -PideType=PC --no-daemon
+    call gradlew.bat buildPlugin --no-daemon 2>nul || call gradle buildPlugin --no-daemon
 )
 
 if %ERRORLEVEL% neq 0 (
-    echo [FAILED] PyCharm plugin build failed!
+    echo [FAILED] JetBrains plugin build failed!
     set "BUILD_SUCCESS=0"
 ) else (
-    echo [SUCCESS] PyCharm plugin built successfully!
+    echo [SUCCESS] JetBrains plugin built successfully!
+    echo   Works on: PyCharm, IntelliJ IDEA Ultimate/Community, Android Studio
 
-    REM Copy to named output
+    REM Display the built plugin
     for /f "delims=" %%i in ('dir /b "%SCRIPT_DIR%build\distributions\*.zip" 2^>nul') do (
-        copy "%SCRIPT_DIR%build\distributions\%%i" "%SCRIPT_DIR%build\distributions\trueflow-pycharm-%%i" >nul 2>nul
         echo   Output: build\distributions\%%i
     )
 )
 
 REM ============================================================
-REM 2. Build IntelliJ IDEA Ultimate Plugin (Python optional)
-REM ============================================================
-echo.
-echo [2/5] Building IntelliJ IDEA Ultimate Plugin...
-echo ------------------------------------------------------------
-
-cd /d "%SCRIPT_DIR%"
-
-REM Build IntelliJ IDEA Ultimate plugin (IU = IntelliJ Ultimate, Python is optional)
-if exist "%GRADLE_EXE%" (
-    call "%GRADLE_EXE%" buildPlugin -PideType=IU --no-daemon
-) else (
-    call gradlew.bat buildPlugin -PideType=IU --no-daemon 2>nul || call gradle buildPlugin -PideType=IU --no-daemon
-)
-
-if %ERRORLEVEL% neq 0 (
-    echo [FAILED] IntelliJ IDEA plugin build failed!
-    set "BUILD_SUCCESS=0"
-) else (
-    echo [SUCCESS] IntelliJ IDEA Ultimate plugin built successfully!
-
-    REM Copy to named output
-    for /f "delims=" %%i in ('dir /b "%SCRIPT_DIR%build\distributions\*.zip" 2^>nul') do (
-        copy "%SCRIPT_DIR%build\distributions\%%i" "%SCRIPT_DIR%build\distributions\trueflow-intellij-%%i" >nul 2>nul
-        echo   Output: build\distributions\%%i
-    )
-)
-
-REM ============================================================
-REM 3. Build Java Agent (if not skipped)
+REM 2. Build Java Agent (if not skipped)
 REM ============================================================
 if "%SKIP_JAVA_AGENT%"=="0" (
     echo.
-    echo [3/5] Building Java Agent...
+    echo [2/4] Building Java Agent...
     echo ------------------------------------------------------------
 
     cd /d "%SCRIPT_DIR%java-agent"
@@ -180,17 +151,17 @@ if "%SKIP_JAVA_AGENT%"=="0" (
     )
 ) else (
     echo.
-    echo [3/5] Skipping Java agent (--skip-java-agent)
+    echo [2/4] Skipping Java agent (--skip-java-agent)
 )
 :java_agent_done
 
 REM ============================================================
-REM 4. Build VS Code Extension (TypeScript/npm)
+REM 3. Build VS Code Extension (TypeScript/npm)
 REM    Uses build-both.js to auto-increment version and build
 REM    for both Open VSX (hevolve-ai) and VS Marketplace (hertzai)
 REM ============================================================
 echo.
-echo [4/5] Building VS Code Extension...
+echo [3/4] Building VS Code Extension...
 echo ------------------------------------------------------------
 
 cd /d "%SCRIPT_DIR%vscode-extension"
@@ -243,11 +214,11 @@ if %ERRORLEVEL% equ 0 (
 :vscode_done
 
 REM ============================================================
-REM 5. Run Tests (if --test flag provided)
+REM 4. Run Tests (if --test flag provided)
 REM ============================================================
 if "%RUN_TESTS%"=="1" (
     echo.
-    echo [5/5] Running Tests...
+    echo [4/4] Running Tests...
     echo ------------------------------------------------------------
 
     cd /d "%SCRIPT_DIR%"
@@ -272,7 +243,7 @@ if "%RUN_TESTS%"=="1" (
     )
 ) else (
     echo.
-    echo [5/5] Skipping tests (use --test to run)
+    echo [4/4] Skipping tests (use --test to run)
 )
 
 REM ============================================================
@@ -286,27 +257,13 @@ echo ============================================================
 cd /d "%SCRIPT_DIR%"
 
 echo.
-echo PyCharm Plugin (Python built-in):
-if exist "build\distributions\*pycharm*.zip" (
-    for /f "delims=" %%i in ('dir /b "build\distributions\*pycharm*.zip" 2^>nul') do (
-        echo   [OK] build\distributions\%%i
-    )
-) else if exist "build\distributions\*.zip" (
+echo JetBrains Plugin (PyCharm, IntelliJ IDEA, Android Studio):
+if exist "build\distributions\*.zip" (
     for /f "delims=" %%i in ('dir /b "build\distributions\*.zip" 2^>nul') do (
         echo   [OK] build\distributions\%%i
     )
 ) else (
     echo   [MISSING] No plugin ZIP found
-)
-
-echo.
-echo IntelliJ IDEA Ultimate Plugin (Python optional):
-if exist "build\distributions\*intellij*.zip" (
-    for /f "delims=" %%i in ('dir /b "build\distributions\*intellij*.zip" 2^>nul') do (
-        echo   [OK] build\distributions\%%i
-    )
-) else (
-    echo   [INFO] IntelliJ plugin shares same build as PyCharm
 )
 
 echo.

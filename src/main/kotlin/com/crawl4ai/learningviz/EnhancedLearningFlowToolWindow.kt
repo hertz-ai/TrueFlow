@@ -326,19 +326,25 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         val toolbar = JToolBar()
         toolbar.isFloatable = false
 
-        // Auto-integrate button (highlighted - primary action) - only show if not already integrated
-        val autoIntegrateButton = JButton("Auto-Integrate into Repo")
-        autoIntegrateButton.toolTipText = "Automatically set up tracing by selecting your Python entry point"
+        // Auto-integrate button (highlighted - primary action)
+        val isIntegrated = isProjectAlreadyIntegrated()
+        val autoIntegrateButton = JButton(if (isIntegrated) "Re-Integrate" else "Auto-Integrate into Repo")
+        autoIntegrateButton.toolTipText = if (isIntegrated)
+            "TrueFlow is already set up. Click to reconfigure or update."
+        else
+            "Automatically set up tracing by selecting your Python entry point"
         autoIntegrateButton.addActionListener {
             openAutoIntegrateDialog()
         }
-        autoIntegrateButton.background = java.awt.Color(76, 175, 80) // Green highlight
-        autoIntegrateButton.foreground = java.awt.Color.WHITE
-
-        // Check if already integrated - hide button if so
-        if (!isProjectAlreadyIntegrated()) {
-            toolbar.add(autoIntegrateButton)
+        // Green if not integrated (call to action), gray if already done
+        if (isIntegrated) {
+            autoIntegrateButton.background = java.awt.Color(100, 100, 100) // Gray - already done
+            autoIntegrateButton.foreground = java.awt.Color.WHITE
+        } else {
+            autoIntegrateButton.background = java.awt.Color(76, 175, 80) // Green highlight - action needed
+            autoIntegrateButton.foreground = java.awt.Color.WHITE
         }
+        toolbar.add(autoIntegrateButton)
 
         // Attach/Detach button (second button - most important after auto-integrate)
         attachButton = JButton("Attach to Server")
@@ -408,20 +414,21 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
      * Returns true if .pycharm_plugin/runtime_injector exists with essential files.
      */
     private fun isProjectAlreadyIntegrated(): Boolean {
-        val pluginDir = java.io.File("${project.basePath}/.pycharm_plugin")
-        val runtimeInjectorDir = java.io.File(pluginDir, "runtime_injector")
+        // Check both .pycharm_plugin (legacy) and .trueflow (new) directories
+        val possibleDirs = listOf(
+            java.io.File("${project.basePath}/.pycharm_plugin/runtime_injector"),
+            java.io.File("${project.basePath}/.trueflow/runtime_injector")
+        )
 
-        if (!runtimeInjectorDir.exists()) {
-            return false
-        }
-
-        // Check for essential files
+        // Check for essential files in any of the possible directories
         val essentialFiles = listOf(
             "python_runtime_instrumentor.py",
             "sitecustomize.py"
         )
 
-        return essentialFiles.all { java.io.File(runtimeInjectorDir, it).exists() }
+        return possibleDirs.any { runtimeInjectorDir ->
+            runtimeInjectorDir.exists() && essentialFiles.all { java.io.File(runtimeInjectorDir, it).exists() }
+        }
     }
 
     private var statsExpanded = false
@@ -2676,7 +2683,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
                 append(totalCallsLabel.text.substringAfter(": ").toIntOrNull() ?: 0)
                 append(",\n")
                 append("    \"deadCodeCount\": ")
-                append(deadCodeLabel.text.substringAfter(": ").toIntOrNull() ?: 0)
+                // deadCodeStatsLabel format: "Functions: X total, Y called, Z dead (P%)"
+                val deadMatch = Regex("(\\d+) dead").find(deadCodeStatsLabel.text)
+                append(deadMatch?.groupValues?.get(1)?.toIntOrNull() ?: 0)
                 append(",\n")
                 append("    \"source\": \"pycharm\"\n")
                 append("  }\n")

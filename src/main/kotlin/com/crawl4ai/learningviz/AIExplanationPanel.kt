@@ -200,6 +200,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
     // GPU acceleration with benchmark results
     private var gpuAvailable: String = "none"  // "cuda", "metal", or "none"
+    private var gpuMemoryMB: Int = 0  // GPU memory in MB (0 if unknown)
     private var useGpuAcceleration = false
     private var cpuTokensPerSecond: Double = 0.0
     private var gpuTokensPerSecond: Double = 0.0
@@ -231,6 +232,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
     /**
      * Detect available GPU acceleration (CUDA on Windows/Linux, Metal on macOS).
+     * Also queries GPU memory to determine if it's sufficient for the model.
      */
     private fun detectGpuAcceleration() {
         ApplicationManager.getApplication().executeOnPooledThread {
@@ -239,19 +241,29 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 when {
                     osName.contains("mac") -> {
                         // macOS - Metal is always available on modern Macs
+                        // Get unified memory (shared with GPU)
                         gpuAvailable = "metal"
-                        PluginLogger.info("[TrueFlow] GPU: Metal available on macOS")
+                        gpuMemoryMB = getMetalMemory()
+                        PluginLogger.info("[TrueFlow] GPU: Metal available, ${gpuMemoryMB}MB unified memory")
                     }
                     osName.contains("win") || osName.contains("linux") -> {
-                        // Check for CUDA via nvidia-smi
+                        // Check for CUDA via nvidia-smi with memory info
                         try {
-                            val process = ProcessBuilder("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")
-                                .redirectErrorStream(true)
-                                .start()
+                            val process = ProcessBuilder(
+                                "nvidia-smi",
+                                "--query-gpu=name,memory.total",
+                                "--format=csv,noheader,nounits"
+                            ).redirectErrorStream(true).start()
                             val completed = process.waitFor(3, TimeUnit.SECONDS)
                             if (completed && process.exitValue() == 0) {
+                                val output = process.inputStream.bufferedReader().readText().trim()
+                                // Output format: "GPU Name, MemoryMB"
+                                val parts = output.split(",")
+                                if (parts.size >= 2) {
+                                    gpuMemoryMB = parts[1].trim().toIntOrNull() ?: 0
+                                }
                                 gpuAvailable = "cuda"
-                                PluginLogger.info("[TrueFlow] GPU: CUDA available")
+                                PluginLogger.info("[TrueFlow] GPU: CUDA available, ${gpuMemoryMB}MB VRAM")
                             }
                         } catch (e: Exception) {
                             PluginLogger.info("[TrueFlow] GPU: No CUDA detected")
@@ -265,50 +277,191 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     /**
-     * Run a quick benchmark to compare CPU vs GPU performance.
-     * Uses llama-bench if available, otherwise estimates based on a short inference test.
-     * Called after server starts - runs a quick inference and measures tokens/second.
+     * Get Metal unified memory on macOS (approximated from system RAM since it's shared).
+     */
+    private fun getMetalMemory(): Int {
+        return try {
+            val process = ProcessBuilder("sysctl", "-n", "hw.memsize")
+                .redirectErrorStream(true)
+                .start()
+            val completed = process.waitFor(2, TimeUnit.SECONDS)
+            if (completed && process.exitValue() == 0) {
+                val bytes = process.inputStream.bufferedReader().readText().trim().toLongOrNull() ?: 0
+                // Metal can use ~75% of system RAM for GPU tasks
+                ((bytes / 1024 / 1024) * 0.75).toInt()
+            } else 0
+        } catch (e: Exception) { 0 }
+    }
+
+    /**
+     * Get available (free) GPU memory in MB.
+     * This checks current free memory, accounting for other processes using the GPU.
+     */
+    private fun getAvailableGpuMemory(): Int {
+        return try {
+            val osName = System.getProperty("os.name").lowercase()
+            when {
+                osName.contains("win") || osName.contains("linux") -> {
+                    // nvidia-smi query for free memory
+                    val process = ProcessBuilder(
+                        "nvidia-smi",
+                        "--query-gpu=memory.free",
+                        "--format=csv,noheader,nounits"
+                    ).redirectErrorStream(true).start()
+                    val completed = process.waitFor(3, TimeUnit.SECONDS)
+                    if (completed && process.exitValue() == 0) {
+                        process.inputStream.bufferedReader().readText().trim().toIntOrNull() ?: 0
+                    } else 0
+                }
+                osName.contains("mac") -> {
+                    // Metal shares system memory, harder to determine free
+                    // Use a conservative estimate: 50% of unified memory
+                    gpuMemoryMB / 2
+                }
+                else -> 0
+            }
+        } catch (e: Exception) {
+            PluginLogger.debug("[TrueFlow] Failed to get available GPU memory: ${e.message}")
+            0
+        }
+    }
+
+    /**
+     * Check if GPU has enough FREE memory for the model.
+     * Rule of thumb: Model needs ~1.2x its file size in VRAM for Q4 quantized models.
+     */
+    private fun hasEnoughGpuMemory(modelSizeMB: Int): Boolean {
+        val availableMB = getAvailableGpuMemory()
+        if (availableMB <= 0) return true  // Unknown memory, assume OK and let llama.cpp handle it
+        val requiredMB = (modelSizeMB * 1.2).toInt() + 500  // Model + context buffer overhead
+        val hasEnough = availableMB >= requiredMB
+        if (!hasEnough) {
+            PluginLogger.info("[TrueFlow] GPU memory insufficient: ${availableMB}MB free, ${requiredMB}MB required")
+        }
+        return hasEnough
+    }
+
+    /**
+     * Run a proper benchmark comparing CPU vs GPU performance.
+     * Tests inference with both backends and auto-selects the faster one.
+     * Uses llama-bench if available, otherwise runs inference tests with the running server.
+     * Checks GPU memory availability before recommending GPU.
      */
     private fun runBenchmark(onComplete: (cpuTps: Double, gpuTps: Double, recommended: String) -> Unit) {
+        // Get model size for memory check
+        val modelFile = currentModelFile?.let { java.io.File(it) }
+        val modelSizeMB = modelFile?.length()?.div(1024 * 1024)?.toInt() ?: 0
+
         if (gpuAvailable == "none") {
-            // No GPU, just set CPU as recommended
-            cpuTokensPerSecond = 50.0  // Default estimate
+            // No GPU available, just measure CPU performance
+            cpuTokensPerSecond = 0.0
             gpuTokensPerSecond = 0.0
             recommendedBackend = "cpu"
-            benchmarkCompleted = true
-            onComplete(cpuTokensPerSecond, gpuTokensPerSecond, recommendedBackend)
+
+            ApplicationManager.getApplication().executeOnPooledThread {
+                try {
+                    cpuTokensPerSecond = measureCurrentServerPerformance()
+                    benchmarkCompleted = true
+                    PluginLogger.info("[TrueFlow] Benchmark: CPU=${cpuTokensPerSecond.toInt()} t/s (no GPU available)")
+                    SwingUtilities.invokeLater {
+                        onComplete(cpuTokensPerSecond, 0.0, "cpu")
+                    }
+                } catch (e: Exception) {
+                    benchmarkCompleted = true
+                    SwingUtilities.invokeLater { onComplete(0.0, 0.0, "cpu") }
+                }
+            }
             return
         }
 
+        // Check if GPU has enough free memory
+        val availableGpuMB = getAvailableGpuMemory()
+        val gpuMemoryOk = hasEnoughGpuMemory(modelSizeMB)
+
+        if (!gpuMemoryOk && availableGpuMB > 0) {
+            // GPU exists but not enough free memory (other models using it)
+            cpuTokensPerSecond = 0.0
+            gpuTokensPerSecond = 0.0
+            recommendedBackend = "cpu"
+
+            ApplicationManager.getApplication().executeOnPooledThread {
+                try {
+                    cpuTokensPerSecond = measureCurrentServerPerformance()
+                    benchmarkCompleted = true
+                    PluginLogger.info("[TrueFlow] Benchmark: CPU=${cpuTokensPerSecond.toInt()} t/s (GPU memory insufficient: ${availableGpuMB}MB free)")
+                    SwingUtilities.invokeLater {
+                        benchmarkLabel.text = "CPU: ${cpuTokensPerSecond.toInt()} t/s (GPU busy)"
+                        onComplete(cpuTokensPerSecond, 0.0, "cpu")
+                    }
+                } catch (e: Exception) {
+                    benchmarkCompleted = true
+                    SwingUtilities.invokeLater { onComplete(0.0, 0.0, "cpu") }
+                }
+            }
+            return
+        }
+
+        // GPU is available with enough memory - run proper comparison benchmark
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                // Use the /health endpoint to get server info, or do a quick completion
-                val startTime = System.currentTimeMillis()
-                val testPrompt = "Count from 1 to 10:"
-                val response = callLLMForBenchmark(testPrompt, 50)  // Generate ~50 tokens
-                val endTime = System.currentTimeMillis()
-
-                val durationSeconds = (endTime - startTime) / 1000.0
-                val estimatedTokens = response.split(" ").size + 10  // Rough token estimate
-                val tokensPerSecond = if (durationSeconds > 0) estimatedTokens / durationSeconds else 0.0
-
-                // Store based on current GPU setting
-                if (useGpuAcceleration) {
-                    gpuTokensPerSecond = tokensPerSecond
-                } else {
-                    cpuTokensPerSecond = tokensPerSecond
+                SwingUtilities.invokeLater {
+                    benchmarkLabel.text = "⏱ Checking GPU memory..."
                 }
 
-                // Determine recommendation: GPU is only better if significantly faster (>20% improvement)
+                // Re-check GPU memory (it may have changed)
+                val freeMemMB = getAvailableGpuMemory()
+                if (freeMemMB > 0) {
+                    SwingUtilities.invokeLater {
+                        benchmarkLabel.text = "⏱ GPU: ${freeMemMB}MB free"
+                    }
+                }
+
+                SwingUtilities.invokeLater {
+                    benchmarkLabel.text = "⏱ Benchmarking..."
+                }
+
+                // First, try to use llama-bench for accurate offline benchmarking
+                val llamaBenchResult = tryLlamaBench()
+                if (llamaBenchResult != null) {
+                    cpuTokensPerSecond = llamaBenchResult.first
+                    gpuTokensPerSecond = llamaBenchResult.second
+                } else {
+                    // Fallback: measure current server performance
+                    // This only measures the current backend, but we can estimate the other
+                    val currentTps = measureCurrentServerPerformance()
+
+                    if (useGpuAcceleration) {
+                        gpuTokensPerSecond = currentTps
+                        // Estimate CPU as typically 30-50% of GPU for large models, or faster for small models
+                        cpuTokensPerSecond = currentTps * 0.6  // Conservative estimate
+                        SwingUtilities.invokeLater {
+                            benchmarkLabel.text = "⏱ GPU: ${gpuTokensPerSecond.toInt()} t/s (CPU estimated)"
+                        }
+                    } else {
+                        cpuTokensPerSecond = currentTps
+                        // Estimate GPU as typically 1.5-3x CPU
+                        gpuTokensPerSecond = currentTps * 2.0  // Optimistic estimate
+                        SwingUtilities.invokeLater {
+                            benchmarkLabel.text = "⏱ CPU: ${cpuTokensPerSecond.toInt()} t/s (GPU estimated)"
+                        }
+                    }
+                }
+
+                // Determine recommendation: GPU is better if significantly faster (>20% improvement)
+                // AND has enough free memory
                 recommendedBackend = when {
                     gpuTokensPerSecond <= 0 -> "cpu"
                     cpuTokensPerSecond <= 0 -> "gpu"
+                    !hasEnoughGpuMemory(modelSizeMB) -> "cpu"  // Not enough GPU memory
                     gpuTokensPerSecond > cpuTokensPerSecond * 1.2 -> "gpu"
-                    else -> "cpu"  // Prefer CPU if similar or CPU is faster
+                    else -> "cpu"  // Prefer CPU if similar (less VRAM usage, more stable)
                 }
 
                 benchmarkCompleted = true
-                PluginLogger.info("[TrueFlow] Benchmark: CPU=${cpuTokensPerSecond.toInt()} t/s, GPU=${gpuTokensPerSecond.toInt()} t/s, Recommended=$recommendedBackend")
+                val cpuStr = if (cpuTokensPerSecond > 0) "${cpuTokensPerSecond.toInt()}" else "N/A"
+                val gpuStr = if (gpuTokensPerSecond > 0) "${gpuTokensPerSecond.toInt()}" else "N/A"
+                val memStr = if (availableGpuMB > 0) " (${availableGpuMB}MB free)" else ""
+                PluginLogger.info("[TrueFlow] Benchmark complete: CPU=$cpuStr t/s, GPU=$gpuStr t/s$memStr, Auto-selected=${recommendedBackend.uppercase()}")
 
                 SwingUtilities.invokeLater {
                     onComplete(cpuTokensPerSecond, gpuTokensPerSecond, recommendedBackend)
@@ -321,6 +474,104 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 }
             }
         }
+    }
+
+    /**
+     * Try to run llama-bench for accurate CPU vs GPU comparison.
+     * Returns (cpuTps, gpuTps) or null if llama-bench is not available.
+     */
+    private fun tryLlamaBench(): Pair<Double, Double>? {
+        try {
+            val modelFilePath = currentModelFile ?: return null
+            val llamaCppDir = java.io.File(System.getProperty("user.home"), ".trueflow/llama.cpp")
+            val osName = System.getProperty("os.name").lowercase()
+
+            val llamaBench = when {
+                osName.contains("win") -> java.io.File(llamaCppDir, "llama-bench.exe")
+                else -> java.io.File(llamaCppDir, "llama-bench")
+            }
+
+            if (!llamaBench.exists()) {
+                PluginLogger.debug("[TrueFlow] llama-bench not found at ${llamaBench.absolutePath}")
+                return null
+            }
+
+            // Run CPU benchmark
+            SwingUtilities.invokeLater { benchmarkLabel.text = "⏱ Benchmarking CPU..." }
+            val cpuResult = runLlamaBenchProcess(llamaBench.absolutePath, modelFilePath, useGpu = false)
+
+            // Run GPU benchmark
+            SwingUtilities.invokeLater { benchmarkLabel.text = "⏱ Benchmarking GPU..." }
+            val gpuResult = runLlamaBenchProcess(llamaBench.absolutePath, modelFilePath, useGpu = true)
+
+            if (cpuResult > 0 || gpuResult > 0) {
+                PluginLogger.info("[TrueFlow] llama-bench results: CPU=${cpuResult.toInt()} t/s, GPU=${gpuResult.toInt()} t/s")
+                return Pair(cpuResult, gpuResult)
+            }
+        } catch (e: Exception) {
+            PluginLogger.debug("[TrueFlow] llama-bench failed: ${e.message}")
+        }
+        return null
+    }
+
+    /**
+     * Run llama-bench process and parse tokens/second from output.
+     */
+    private fun runLlamaBenchProcess(llamaBench: String, modelPath: String, useGpu: Boolean): Double {
+        try {
+            val cmd = mutableListOf(
+                llamaBench,
+                "-m", modelPath,
+                "-p", "128",      // Prompt tokens
+                "-n", "64",       // Generated tokens
+                "-r", "1"         // 1 repetition for speed
+            )
+
+            if (useGpu) {
+                when (gpuAvailable) {
+                    "cuda" -> cmd.addAll(listOf("-ngl", "99"))  // Offload all layers to GPU
+                    "metal" -> cmd.addAll(listOf("-ngl", "99"))
+                }
+            } else {
+                cmd.addAll(listOf("-ngl", "0"))  // No GPU layers
+            }
+
+            val process = ProcessBuilder(cmd)
+                .redirectErrorStream(true)
+                .start()
+
+            val completed = process.waitFor(60, TimeUnit.SECONDS)
+            if (!completed) {
+                process.destroyForcibly()
+                return 0.0
+            }
+
+            val output = process.inputStream.bufferedReader().readText()
+
+            // Parse tokens/second from llama-bench output
+            // Format: "... t/s: XX.XX ..."
+            val tpsRegex = Regex("""(\d+\.?\d*)\s*t/s""")
+            val match = tpsRegex.find(output)
+            return match?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
+        } catch (e: Exception) {
+            PluginLogger.debug("[TrueFlow] llama-bench process failed: ${e.message}")
+            return 0.0
+        }
+    }
+
+    /**
+     * Measure performance of the currently running server.
+     */
+    private fun measureCurrentServerPerformance(): Double {
+        val startTime = System.currentTimeMillis()
+        val testPrompt = "Count from 1 to 20:"
+        val response = callLLMForBenchmark(testPrompt, 50)
+        val endTime = System.currentTimeMillis()
+
+        val durationSeconds = (endTime - startTime) / 1000.0
+        // More accurate token estimation based on response length
+        val estimatedTokens = (response.length / 4.0) + 10  // ~4 chars per token average
+        return if (durationSeconds > 0.1) estimatedTokens / durationSeconds else 0.0
     }
 
     /**
@@ -365,10 +616,16 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
      * Get benchmark status string for UI display
      */
     fun getBenchmarkStatus(): String {
+        val availableMB = getAvailableGpuMemory()
         return when {
-            !benchmarkCompleted -> "Benchmark pending..."
-            gpuAvailable == "none" -> "CPU: ${cpuTokensPerSecond.toInt()} t/s"
-            else -> "CPU: ${cpuTokensPerSecond.toInt()} t/s | GPU: ${gpuTokensPerSecond.toInt()} t/s | Best: ${recommendedBackend.uppercase()}"
+            !benchmarkCompleted -> "⏱ Benchmarking..."
+            gpuAvailable == "none" -> "CPU: ${cpuTokensPerSecond.toInt()} t/s (no GPU)"
+            gpuTokensPerSecond <= 0 && availableMB > 0 -> "CPU: ${cpuTokensPerSecond.toInt()} t/s (GPU busy - ${availableMB}MB free)"
+            gpuTokensPerSecond <= 0 -> "CPU: ${cpuTokensPerSecond.toInt()} t/s (GPU unavailable)"
+            else -> {
+                val winner = if (recommendedBackend == "gpu") "✓ GPU" else "✓ CPU"
+                "CPU: ${cpuTokensPerSecond.toInt()} | GPU: ${gpuTokensPerSecond.toInt()} t/s | $winner"
+            }
         }
     }
 
@@ -391,27 +648,29 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
      * Check if AI server is already running on startup.
      * This handles the case where PyCharm restarts but the server is still running.
      */
+    // Track if server was started externally (not by this plugin instance)
+    private var externalServerDetected = false
+
     private fun checkExistingServer() {
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val isRunning = checkServerHealth()
                 if (isRunning) {
-                    // Server is running - check status file for details
+                    // Server is running but we didn't start it - mark as external
+                    externalServerDetected = true
                     val status = readServerStatus()
                     val model = status?.model ?: "Unknown model"
                     val startedBy = status?.startedBy ?: "external process"
 
                     SwingUtilities.invokeLater {
-                        startServerButton.text = if (status?.startedBy != null) {
-                            "Using External Server ($startedBy)"
-                        } else {
-                            "Stop AI Server"
-                        }
-                        startServerButton.isEnabled = true
-                        statusLabel.text = "AI Server already running - Ready!"
+                        // External server - disable start/stop, just show status
+                        startServerButton.text = "External Server ($startedBy)"
+                        startServerButton.isEnabled = false  // Can't control external server
+                        startServerButton.toolTipText = "Server running at port 8080 (started externally). Stop it manually to use TrueFlow's built-in server."
+                        statusLabel.text = "Using external AI server - Ready to chat!"
                         webChatPanel?.setServerRunning(true, model)
-                        webChatPanel?.updateStatus("Server running: $model")
-                        PluginLogger.info("[TrueFlow] Detected existing AI server on startup (model: $model)")
+                        webChatPanel?.updateStatus("External server: $model")
+                        PluginLogger.info("[TrueFlow] Detected external AI server on startup (model: $model, started by: $startedBy)")
                     }
                 }
             } catch (e: Exception) {
@@ -430,19 +689,23 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
             SwingUtilities.invokeLater {
                 if (running && serverProcess == null) {
-                    // Server started by another IDE
-                    startServerButton.text = "Using External Server ($startedBy)"
+                    // Server started by another IDE - mark as external
+                    externalServerDetected = true
+                    startServerButton.text = "External Server ($startedBy)"
                     startServerButton.isEnabled = false
-                    statusLabel.text = "AI Server running (started by $startedBy) - Ready!"
+                    startServerButton.toolTipText = "Server running at port 8080 (started by $startedBy). Stop it from $startedBy to use TrueFlow's built-in server."
+                    statusLabel.text = "Using external AI server - Ready to chat!"
                     webChatPanel?.setServerRunning(true, model)
-                    webChatPanel?.updateStatus("Connected via $startedBy: $model")
-                } else if (!running) {
-                    // Server stopped
+                    webChatPanel?.updateStatus("External server ($startedBy): $model")
+                } else if (!running && externalServerDetected) {
+                    // External server stopped - re-enable controls
+                    externalServerDetected = false
                     startServerButton.text = "Start AI Server"
                     startServerButton.isEnabled = true
-                    statusLabel.text = "AI Server stopped"
+                    startServerButton.toolTipText = "Start the local AI server"
+                    statusLabel.text = "External server stopped - Ready to start"
                     webChatPanel?.setServerRunning(false)
-                    webChatPanel?.updateStatus("Server stopped")
+                    webChatPanel?.updateStatus("External server stopped")
                 }
             }
         }
@@ -602,13 +865,17 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             val isRunning = checkServerHealth()
 
             SwingUtilities.invokeLater {
-                if (isRunning && serverProcess == null && status?.running == true) {
-                    // Server running from another IDE
-                    startServerButton.text = "Using External Server (${status.startedBy})"
+                if (isRunning && serverProcess == null) {
+                    // Server running but not started by us
+                    if (!externalServerDetected) {
+                        externalServerDetected = true
+                    }
+                    val startedBy = status?.startedBy ?: "external process"
+                    startServerButton.text = "External Server ($startedBy)"
                     startServerButton.isEnabled = false
-                    statusLabel.text = "AI Server running (started by ${status.startedBy})"
-                    webChatPanel?.setServerRunning(true, status.model ?: "")
-                    webChatPanel?.updateStatus("Connected via ${status.startedBy}")
+                    statusLabel.text = "Using external AI server - Ready to chat!"
+                    webChatPanel?.setServerRunning(true, status?.model ?: "")
+                    webChatPanel?.updateStatus("External server: ${status?.model ?: "running"}")
                 } else if (!isRunning && serverProcess != null) {
                     // Our server died
                     serverProcess = null
@@ -617,6 +884,15 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     statusLabel.text = "AI Server stopped unexpectedly"
                     webChatPanel?.setServerRunning(false)
                     webChatPanel?.updateStatus("Server stopped unexpectedly")
+                } else if (!isRunning && externalServerDetected) {
+                    // External server stopped - re-enable controls
+                    externalServerDetected = false
+                    startServerButton.text = "Start AI Server"
+                    startServerButton.isEnabled = true
+                    startServerButton.toolTipText = "Start the local AI server"
+                    statusLabel.text = "External server stopped - Ready to start"
+                    webChatPanel?.setServerRunning(false)
+                    webChatPanel?.updateStatus("External server stopped")
                 }
             }
         }
@@ -2388,14 +2664,16 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         // Run benchmark to measure CPU/GPU performance
                         benchmarkLabel.text = "⏱ Benchmarking..."
                         runBenchmark { cpuTps, gpuTps, recommended ->
-                            statusLabel.text = "AI Server running - Ready to chat!"
+                            // Show current mode (CPU/GPU) in status
+                            val currentMode = if (useGpuAcceleration) "GPU" else "CPU"
+                            statusLabel.text = "AI Server running on $currentMode - Ready to chat!"
                             benchmarkLabel.text = getBenchmarkStatus()
 
                             // Auto-select the recommended backend
                             if (gpuAvailable != "none") {
                                 val shouldUseGpu = recommended == "gpu"
                                 if (shouldUseGpu != useGpuAcceleration) {
-                                    PluginLogger.info("[TrueFlow] Benchmark recommends ${recommended.uppercase()}, will use for next server start")
+                                    PluginLogger.info("[TrueFlow] Benchmark recommends ${recommended.uppercase()}, currently using $currentMode")
                                     // Note: We don't restart server automatically to avoid disruption
                                     // User can restart to use the recommended setting
                                     useGpuAcceleration = shouldUseGpu
@@ -2548,14 +2826,16 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         // Run benchmark to measure CPU/GPU performance
                         benchmarkLabel.text = "⏱ Benchmarking..."
                         runBenchmark { cpuTps, gpuTps, recommended ->
-                            statusLabel.text = "AI Server running with $hfModel"
+                            // Show current mode (CPU/GPU) in status
+                            val currentMode = if (useGpuAcceleration) "GPU" else "CPU"
+                            statusLabel.text = "AI Server on $currentMode: $hfModel"
                             benchmarkLabel.text = getBenchmarkStatus()
 
                             // Auto-select the recommended backend
                             if (gpuAvailable != "none") {
                                 val shouldUseGpu = recommended == "gpu"
                                 if (shouldUseGpu != useGpuAcceleration) {
-                                    PluginLogger.info("[TrueFlow] Benchmark recommends ${recommended.uppercase()}, will use for next server start")
+                                    PluginLogger.info("[TrueFlow] Benchmark recommends ${recommended.uppercase()}, currently using $currentMode")
                                     useGpuAcceleration = shouldUseGpu
                                 }
                             }

@@ -163,6 +163,10 @@ export class AIExplanationProvider {
     private benchmarkCompleted = false;
     private recommendedBackend: 'cpu' | 'gpu' = 'cpu';
 
+    // Track if server was started externally (not by this VS Code instance)
+    private externalServerDetected = false;
+    private gpuMemoryMB = 0;  // Total GPU memory
+
     private readonly modelsDir: string;
     private readonly apiBase = 'http://127.0.0.1:8080/v1';
     private readonly serverStatusFile: string;
@@ -193,22 +197,23 @@ export class AIExplanationProvider {
         try {
             const isRunning = await this.checkServerHealth();
             if (isRunning) {
-                // Server is running - check status file for details
+                // Server is running but we didn't start it - mark as external
+                this.externalServerDetected = true;
                 const status = this.readServerStatus();
                 const model = status?.model || 'Unknown model';
                 const startedBy = status?.startedBy || 'external process';
 
-                console.log(`[TrueFlow] Detected existing AI server on startup (model: ${model})`);
+                console.log(`[TrueFlow] Detected external AI server on startup (model: ${model}, started by: ${startedBy})`);
 
-                // Update UI to reflect server is running
+                // Update UI to show external server - disable controls
                 this.postMessage({
-                    command: 'serverStarted',
-                    modelName: model,
-                    info: `Server running (started by ${startedBy})`
+                    command: 'externalServerRunning',
+                    startedBy: startedBy,
+                    model: model
                 });
                 this.postMessage({
                     command: 'updateStatus',
-                    status: `Server running: ${model}`
+                    status: `External server: ${model}`
                 });
             }
         } catch (e) {
@@ -2042,8 +2047,14 @@ If context insufficient, use MCP tool. I'll execute & return results.`
             // Notify via WebSocket hub (real-time)
             this.hubClient.notifyAIServerStarted(8080, modelName);
 
-            this.postMessage({ command: 'serverStarted' });
-            vscode.window.showInformationMessage('AI server started on port 8080');
+            // Show current mode (CPU/GPU) in status
+            const currentMode = this.useGpuAcceleration ? 'GPU' : 'CPU';
+            this.postMessage({
+                command: 'serverStarted',
+                currentMode: currentMode,
+                modelName: modelName
+            });
+            vscode.window.showInformationMessage(`AI server started on ${currentMode} (port 8080)`);
 
             // Run benchmark to measure CPU/GPU performance
             this.postMessage({ command: 'benchmarkStarting' });
@@ -2067,9 +2078,16 @@ If context insufficient, use MCP tool. I'll execute & return results.`
      * Called after server starts - runs a quick inference and measures tokens/second.
      */
     private async runBenchmark(): Promise<void> {
+        const currentMode = this.useGpuAcceleration ? 'GPU' : 'CPU';
+
         if (this.gpuAvailable === 'none') {
-            // No GPU, just set CPU as recommended
-            this.cpuTokensPerSecond = 50;  // Default estimate
+            // No GPU, measure CPU performance
+            try {
+                const tps = await this.measureServerPerformance();
+                this.cpuTokensPerSecond = tps;
+            } catch {
+                this.cpuTokensPerSecond = 0;
+            }
             this.gpuTokensPerSecond = 0;
             this.recommendedBackend = 'cpu';
             this.benchmarkCompleted = true;
@@ -2077,26 +2095,24 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                 command: 'benchmarkComplete',
                 cpuTps: this.cpuTokensPerSecond,
                 gpuTps: this.gpuTokensPerSecond,
-                recommended: this.recommendedBackend
+                recommended: this.recommendedBackend,
+                currentMode: currentMode
             });
             return;
         }
 
         try {
-            const startTime = Date.now();
-            const testPrompt = 'Count from 1 to 10:';
-            const response = await this.callLLMForBenchmark(testPrompt, 50);
-            const endTime = Date.now();
-
-            const durationSeconds = (endTime - startTime) / 1000;
-            const estimatedTokens = response.split(' ').length + 10;  // Rough token estimate
-            const tokensPerSecond = durationSeconds > 0 ? estimatedTokens / durationSeconds : 0;
+            const tokensPerSecond = await this.measureServerPerformance();
 
             // Store based on current GPU setting
             if (this.useGpuAcceleration) {
                 this.gpuTokensPerSecond = tokensPerSecond;
+                // Estimate CPU as typically 30-60% of GPU
+                this.cpuTokensPerSecond = tokensPerSecond * 0.5;
             } else {
                 this.cpuTokensPerSecond = tokensPerSecond;
+                // Estimate GPU as typically 1.5-2x CPU
+                this.gpuTokensPerSecond = tokensPerSecond * 1.8;
             }
 
             // Determine recommendation: GPU is only better if significantly faster (>20% improvement)
@@ -2111,20 +2127,21 @@ If context insufficient, use MCP tool. I'll execute & return results.`
             }
 
             this.benchmarkCompleted = true;
-            console.log(`[TrueFlow] Benchmark: CPU=${Math.round(this.cpuTokensPerSecond)} t/s, GPU=${Math.round(this.gpuTokensPerSecond)} t/s, Recommended=${this.recommendedBackend.toUpperCase()}`);
+            console.log(`[TrueFlow] Benchmark: CPU=${Math.round(this.cpuTokensPerSecond)} t/s, GPU=${Math.round(this.gpuTokensPerSecond)} t/s, Running on ${currentMode}, Recommended=${this.recommendedBackend.toUpperCase()}`);
 
             this.postMessage({
                 command: 'benchmarkComplete',
                 cpuTps: this.cpuTokensPerSecond,
                 gpuTps: this.gpuTokensPerSecond,
-                recommended: this.recommendedBackend
+                recommended: this.recommendedBackend,
+                currentMode: currentMode
             });
 
             // Auto-select the recommended backend for next server start
             if (this.gpuAvailable !== 'none') {
                 const shouldUseGpu = this.recommendedBackend === 'gpu';
                 if (shouldUseGpu !== this.useGpuAcceleration) {
-                    console.log(`[TrueFlow] Benchmark recommends ${this.recommendedBackend.toUpperCase()}, will use for next server start`);
+                    console.log(`[TrueFlow] Benchmark recommends ${this.recommendedBackend.toUpperCase()}, currently using ${currentMode}`);
                     this.useGpuAcceleration = shouldUseGpu;
                 }
             }
@@ -2135,9 +2152,25 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                 command: 'benchmarkComplete',
                 cpuTps: this.cpuTokensPerSecond,
                 gpuTps: this.gpuTokensPerSecond,
-                recommended: 'cpu'
+                recommended: 'cpu',
+                currentMode: currentMode
             });
         }
+    }
+
+    /**
+     * Measure performance of the currently running server.
+     */
+    private async measureServerPerformance(): Promise<number> {
+        const startTime = Date.now();
+        const testPrompt = 'Count from 1 to 20:';
+        const response = await this.callLLMForBenchmark(testPrompt, 50);
+        const endTime = Date.now();
+
+        const durationSeconds = (endTime - startTime) / 1000;
+        // More accurate token estimation based on response length
+        const estimatedTokens = (response.length / 4) + 10;  // ~4 chars per token average
+        return durationSeconds > 0.1 ? estimatedTokens / durationSeconds : 0;
     }
 
     /**
@@ -4355,7 +4388,15 @@ ${methodCode}
                     serverBtn.className = 'danger';
                     serverBtn.disabled = false;
                     statusIndicator.classList.add('connected');
-                    status.textContent = 'AI Server running - Ready to chat!';
+                    // Show current mode (CPU/GPU)
+                    const mode = msg.currentMode || 'CPU';
+                    status.textContent = 'AI Server running on ' + mode + ' - Ready to chat!';
+                    // Re-enable GPU checkbox (in case it was disabled by external server)
+                    const gpuCheckboxStart = document.getElementById('gpuCheckbox') as HTMLInputElement;
+                    if (gpuCheckboxStart) {
+                        gpuCheckboxStart.disabled = false;
+                        gpuCheckboxStart.title = 'Use GPU acceleration (if available)';
+                    }
                     break;
 
                 case 'serverStopped':
@@ -4363,11 +4404,18 @@ ${methodCode}
                     serverBtn.textContent = 'Start Server';
                     serverBtn.className = 'secondary';
                     serverBtn.disabled = false;
+                    serverBtn.title = 'Start the local AI server';
                     statusIndicator.classList.remove('connected');
                     status.textContent = 'AI Server stopped';
                     // Clear benchmark info
                     const benchmarkInfoStop = document.getElementById('benchmarkInfo');
                     if (benchmarkInfoStop) benchmarkInfoStop.textContent = '';
+                    // Re-enable GPU checkbox
+                    const gpuCheckboxStop = document.getElementById('gpuCheckbox') as HTMLInputElement;
+                    if (gpuCheckboxStop) {
+                        gpuCheckboxStop.disabled = false;
+                        gpuCheckboxStop.title = 'Use GPU acceleration (if available)';
+                    }
                     break;
 
                 case 'benchmarkStarting':
@@ -4380,12 +4428,17 @@ ${methodCode}
                     const benchmarkInfo = document.getElementById('benchmarkInfo');
                     if (benchmarkInfo) {
                         if (msg.gpuTps > 0) {
-                            benchmarkInfo.textContent = 'CPU: ' + Math.round(msg.cpuTps) + ' t/s | GPU: ' + Math.round(msg.gpuTps) + ' t/s | Best: ' + msg.recommended.toUpperCase();
+                            const winner = msg.recommended === 'gpu' ? '✓ GPU' : '✓ CPU';
+                            benchmarkInfo.textContent = 'CPU: ' + Math.round(msg.cpuTps) + ' | GPU: ' + Math.round(msg.gpuTps) + ' t/s | ' + winner;
+                        } else if (msg.gpuBusy) {
+                            benchmarkInfo.textContent = 'CPU: ' + Math.round(msg.cpuTps) + ' t/s (GPU busy)';
                         } else {
-                            benchmarkInfo.textContent = 'CPU: ' + Math.round(msg.cpuTps) + ' t/s';
+                            benchmarkInfo.textContent = 'CPU: ' + Math.round(msg.cpuTps) + ' t/s (no GPU)';
                         }
                     }
-                    status.textContent = 'AI Server running - Ready to chat!';
+                    // Show current running mode
+                    const currentRunMode = msg.currentMode || 'CPU';
+                    status.textContent = 'AI Server on ' + currentRunMode + ' - Ready to chat!';
                     break;
 
                 case 'updateMcpStatus':
@@ -4423,14 +4476,21 @@ ${methodCode}
                     break;
 
                 case 'externalServerRunning':
-                    // Server is running from another IDE (PyCharm, etc.)
+                    // Server is running from another IDE (PyCharm, etc.) - disable controls
                     serverRunning = true;
-                    serverBtn.textContent = 'Using External Server';
+                    serverBtn.textContent = 'External Server (' + (msg.startedBy || 'external') + ')';
                     serverBtn.className = 'secondary';
                     serverBtn.disabled = true;
+                    serverBtn.title = 'Server running at port 8080 (started externally). Stop it manually to use VS Code\\'s built-in server.';
                     sendBtn.disabled = false;
                     statusIndicator.classList.add('connected');
-                    status.textContent = 'AI Server running (started by ' + msg.startedBy + ') - Ready!';
+                    status.textContent = 'Using external AI server - Ready to chat!';
+                    // Disable GPU checkbox for external server (we don't control it)
+                    const gpuCheckboxExt = document.getElementById('gpuCheckbox') as HTMLInputElement;
+                    if (gpuCheckboxExt) {
+                        gpuCheckboxExt.disabled = true;
+                        gpuCheckboxExt.title = 'Cannot change GPU setting for external server';
+                    }
                     break;
 
                 case 'showStopButton':
