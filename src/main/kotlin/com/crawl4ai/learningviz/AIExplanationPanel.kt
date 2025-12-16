@@ -213,8 +213,10 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         val pid: Int?,
         val port: Int,
         val model: String?,
-        val startedBy: String,
-        val startedAt: String
+        val startedBy: String,      // IDE type: "PyCharm", "IntelliJ IDEA", "VS Code", etc.
+        val startedAt: String,
+        val projectPath: String? = null,  // Full path to project that started the server
+        val projectName: String? = null   // Project name for display
     )
 
     init {
@@ -650,32 +652,135 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
      */
     // Track if server was started externally (not by this plugin instance)
     private var externalServerDetected = false
+    // Track if port 8080 is occupied by a non-llama.cpp service
+    private var portConflictDetected = false
 
+    /**
+     * Check if AI server is already running on startup.
+     * IMPORTANT: Health check is the PRIMARY source of truth - if the server responds
+     * on port 8080, it's running regardless of what the status file says.
+     * This handles:
+     * - IDE restart (server still running from before)
+     * - Server started by another IDE
+     * - Server started externally (llama-server command line)
+     * - Server started by VS Code extension
+     */
     private fun checkExistingServer() {
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val isRunning = checkServerHealth()
-                if (isRunning) {
-                    // Server is running but we didn't start it - mark as external
-                    externalServerDetected = true
-                    val status = readServerStatus()
-                    val model = status?.model ?: "Unknown model"
-                    val startedBy = status?.startedBy ?: "external process"
+                // Check what's running on port 8080 (if anything)
+                val serverCheck = checkLlamaCppServer()
 
-                    SwingUtilities.invokeLater {
-                        // External server - disable start/stop, just show status
-                        startServerButton.text = "External Server ($startedBy)"
-                        startServerButton.isEnabled = false  // Can't control external server
-                        startServerButton.toolTipText = "Server running at port 8080 (started externally). Stop it manually to use TrueFlow's built-in server."
-                        statusLabel.text = "Using external AI server - Ready to chat!"
-                        webChatPanel?.setServerRunning(true, model)
-                        webChatPanel?.updateStatus("External server: $model")
-                        PluginLogger.info("[TrueFlow] Detected external AI server on startup (model: $model, started by: $startedBy)")
+                when (serverCheck) {
+                    ServerCheckResult.LLAMA_CPP_RUNNING -> {
+                        // llama.cpp server is running
+                        // We didn't start it (serverProcess is null), so treat as external
+                        externalServerDetected = true
+
+                        // Try to get metadata from status file (optional info)
+                        val status = readServerStatus()
+                        val model = status?.model ?: "Unknown model"
+
+                        // Build a descriptive "started by" string including project info
+                        val startedByDisplay = buildStartedByDisplay(status)
+
+                        // Check if this is the same project that started the server
+                        val isSameProject = status?.projectPath == project.basePath
+
+                        SwingUtilities.invokeLater {
+                            // Server is running - update UI to reflect this
+                            if (isSameProject) {
+                                // This project started the server (e.g., before IDE restart)
+                                startServerButton.text = "Stop AI Server"
+                                startServerButton.isEnabled = true
+                                startServerButton.toolTipText = "Stop the AI server started by this project"
+                                statusLabel.text = "AI Server running (started by this project) - Ready to chat!"
+                                // Mark as our server so we can control it
+                                externalServerDetected = false
+                            } else {
+                                // Different project or external process started the server
+                                startServerButton.text = "External Server ($startedByDisplay)"
+                                startServerButton.isEnabled = false  // Can't control external server
+                                startServerButton.toolTipText = "llama.cpp server on port 8080 (started by $startedByDisplay). Stop it from there to use TrueFlow's built-in server."
+                                statusLabel.text = "Using external AI server - Ready to chat!"
+                            }
+                            webChatPanel?.setServerRunning(true, model)
+                            webChatPanel?.updateStatus("Server: $model")
+                            PluginLogger.info("[TrueFlow] Detected llama.cpp server on startup (model: $model, started by: $startedByDisplay, same project: $isSameProject)")
+
+                            // Start polling to detect when external server stops
+                            startStatusPolling()
+                        }
+                    }
+
+                    ServerCheckResult.OTHER_SERVICE_RUNNING -> {
+                        // Port 8080 is occupied by a non-llama.cpp service
+                        SwingUtilities.invokeLater {
+                            externalServerDetected = false
+                            portConflictDetected = true
+                            startServerButton.text = "Port 8080 Conflict!"
+                            startServerButton.isEnabled = false
+                            startServerButton.toolTipText = "Another service is using port 8080. Stop it first or configure a different port."
+                            statusLabel.text = "⚠️ Port 8080 in use by another service"
+                            webChatPanel?.setServerRunning(false)
+                            webChatPanel?.updateStatus("Port conflict: 8080 in use")
+                            PluginLogger.warn("[TrueFlow] Port 8080 is occupied by a non-llama.cpp service")
+
+                            // Start polling to detect when the other service stops
+                            startStatusPolling()
+                        }
+                    }
+
+                    ServerCheckResult.NOT_RUNNING -> {
+                        // Nothing running on port 8080 - ready to start
+                        SwingUtilities.invokeLater {
+                            externalServerDetected = false
+                            portConflictDetected = false
+                            startServerButton.text = "Start AI Server"
+                            startServerButton.isEnabled = true
+                            startServerButton.toolTipText = "Start the local AI server"
+                            statusLabel.text = "AI Server stopped - Click to start"
+                            webChatPanel?.setServerRunning(false)
+
+                            // Start polling to detect when external server starts
+                            startStatusPolling()
+                        }
                     }
                 }
             } catch (e: Exception) {
-                PluginLogger.debug("[TrueFlow] No existing server detected: ${e.message}")
+                PluginLogger.debug("[TrueFlow] Error checking server: ${e.message}")
+                // Start polling anyway to keep monitoring
+                SwingUtilities.invokeLater { startStatusPolling() }
             }
+        }
+    }
+
+    /**
+     * Build a human-readable "started by" string from server status.
+     * Examples: "PyCharm: MyProject", "VS Code: webapp", "external process"
+     */
+    private fun buildStartedByDisplay(status: ServerStatus?): String {
+        if (status == null) return "external process"
+
+        val ide = status.startedBy ?: return "external process"
+        val projectName = status.projectName
+
+        return if (projectName != null) {
+            "$ide: $projectName"
+        } else {
+            ide
+        }
+    }
+
+    /**
+     * Get the name of the current IDE (PyCharm, IntelliJ IDEA, Android Studio, etc.)
+     */
+    private fun getIDEName(): String {
+        return try {
+            val appInfo = com.intellij.openapi.application.ApplicationInfo.getInstance()
+            appInfo.versionName  // "PyCharm", "IntelliJ IDEA", "Android Studio", etc.
+        } catch (e: Exception) {
+            "JetBrains IDE"
         }
     }
 
@@ -799,9 +904,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             if (connected) {
                 PluginLogger.info("[TrueFlow] Connected to MCP Hub for cross-IDE coordination")
             } else {
-                PluginLogger.info("[TrueFlow] Hub not available, using file-based status polling")
-                // Fall back to polling if hub not available
-                SwingUtilities.invokeLater { startStatusPolling() }
+                PluginLogger.info("[TrueFlow] Hub not available, will use health check polling")
+                // Note: startStatusPolling() is already called from checkExistingServer()
+                // which uses health check as the PRIMARY source of truth
             }
         }
     }
@@ -817,7 +922,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     port = json.get("port")?.asInt ?: 8080,
                     model = json.get("model")?.asString,
                     startedBy = json.get("startedBy")?.asString ?: "unknown",
-                    startedAt = json.get("startedAt")?.asString ?: ""
+                    startedAt = json.get("startedAt")?.asString ?: "",
+                    projectPath = json.get("projectPath")?.asString,
+                    projectName = json.get("projectName")?.asString
                 )
             } else null
         } catch (e: Exception) {
@@ -840,6 +947,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     status.model?.let { addProperty("model", it) }
                     addProperty("startedBy", status.startedBy)
                     addProperty("startedAt", status.startedAt)
+                    status.projectPath?.let { addProperty("projectPath", it) }
+                    status.projectName?.let { addProperty("projectName", it) }
                 }
                 serverStatusFile.writeText(Gson().toJson(json))
             }
@@ -848,51 +957,185 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
     }
 
+    /**
+     * Check if llama.cpp server is running on port 8080.
+     * Returns a result indicating: not running, llama.cpp running, or other service running.
+     */
+    private enum class ServerCheckResult {
+        NOT_RUNNING,           // No service on port 8080
+        LLAMA_CPP_RUNNING,     // llama.cpp server detected
+        OTHER_SERVICE_RUNNING  // Some other service is using port 8080
+    }
+
     private fun checkServerHealth(): Boolean {
+        return checkLlamaCppServer() == ServerCheckResult.LLAMA_CPP_RUNNING
+    }
+
+    /**
+     * Check what's running on port 8080.
+     * llama.cpp server has specific endpoints we can verify:
+     * - GET /health returns {"status":"ok"} or {"status":"loading model"} or {"status":"error"}
+     * - GET /v1/models returns a list of models (OpenAI-compatible)
+     */
+    private fun checkLlamaCppServer(): ServerCheckResult {
         return try {
-            val conn = URL("http://127.0.0.1:8080/health").openConnection() as HttpURLConnection
-            conn.connectTimeout = 2000
-            conn.readTimeout = 2000
-            conn.responseCode == 200
+            // First check /health endpoint
+            val healthConn = URL("http://127.0.0.1:8080/health").openConnection() as HttpURLConnection
+            healthConn.connectTimeout = 2000
+            healthConn.readTimeout = 2000
+            healthConn.setRequestProperty("Accept", "application/json")
+
+            if (healthConn.responseCode != 200) {
+                // Something is running but doesn't respond to /health with 200
+                return ServerCheckResult.OTHER_SERVICE_RUNNING
+            }
+
+            // Read the response body to verify it's llama.cpp format
+            val healthResponse = healthConn.inputStream.bufferedReader().readText()
+
+            // llama.cpp health returns JSON with "status" field
+            // e.g., {"status":"ok"} or {"status":"loading model","progress":0.5}
+            if (!healthResponse.contains("\"status\"")) {
+                // Response doesn't look like llama.cpp
+                return ServerCheckResult.OTHER_SERVICE_RUNNING
+            }
+
+            // Double-check by calling /v1/models (OpenAI-compatible endpoint)
+            try {
+                val modelsConn = URL("http://127.0.0.1:8080/v1/models").openConnection() as HttpURLConnection
+                modelsConn.connectTimeout = 1000
+                modelsConn.readTimeout = 1000
+                modelsConn.setRequestProperty("Accept", "application/json")
+
+                if (modelsConn.responseCode == 200) {
+                    val modelsResponse = modelsConn.inputStream.bufferedReader().readText()
+                    // llama.cpp returns {"object":"list","data":[...]}
+                    if (modelsResponse.contains("\"object\"") && modelsResponse.contains("\"data\"")) {
+                        return ServerCheckResult.LLAMA_CPP_RUNNING
+                    }
+                }
+            } catch (e: Exception) {
+                // /v1/models failed but /health succeeded with status - still likely llama.cpp
+            }
+
+            // Health check passed with "status" field - assume llama.cpp
+            ServerCheckResult.LLAMA_CPP_RUNNING
+        } catch (e: java.net.ConnectException) {
+            // Connection refused - nothing running on port 8080
+            ServerCheckResult.NOT_RUNNING
+        } catch (e: java.net.SocketTimeoutException) {
+            // Timeout - something might be running but not responding
+            ServerCheckResult.NOT_RUNNING
+        } catch (e: Exception) {
+            // Other error - assume not running
+            ServerCheckResult.NOT_RUNNING
+        }
+    }
+
+    /**
+     * Check if port 8080 is available (nothing running on it).
+     */
+    private fun isPortAvailable(port: Int = 8080): Boolean {
+        return try {
+            java.net.ServerSocket(port).use { true }
         } catch (e: Exception) {
             false
         }
     }
 
+    /**
+     * Start polling to monitor server status.
+     * Uses checkLlamaCppServer() to distinguish between llama.cpp, other services, and no service.
+     * This is called from checkExistingServer() on startup to ensure continuous monitoring.
+     */
     private fun startStatusPolling() {
+        // Prevent duplicate timers
+        if (statusCheckTimer != null) {
+            return
+        }
+
         statusCheckTimer = javax.swing.Timer(2000) {
-            val status = readServerStatus()
-            val isRunning = checkServerHealth()
+            // Check what's actually running on port 8080
+            val serverCheck = checkLlamaCppServer()
+            val status = readServerStatus()  // Optional metadata
 
             SwingUtilities.invokeLater {
-                if (isRunning && serverProcess == null) {
-                    // Server running but not started by us
-                    if (!externalServerDetected) {
-                        externalServerDetected = true
+                when (serverCheck) {
+                    ServerCheckResult.LLAMA_CPP_RUNNING -> {
+                        // Clear port conflict if it was set
+                        if (portConflictDetected) {
+                            portConflictDetected = false
+                        }
+
+                        if (serverProcess == null) {
+                            // Server running but not started by us
+                            val isSameProject = status?.projectPath == project.basePath
+
+                            if (isSameProject && !externalServerDetected) {
+                                // Same project - allow control
+                                startServerButton.text = "Stop AI Server"
+                                startServerButton.isEnabled = true
+                                statusLabel.text = "AI Server running (started by this project) - Ready to chat!"
+                                webChatPanel?.setServerRunning(true, status?.model ?: "")
+                            } else if (!isSameProject) {
+                                // Different project or external - mark as external
+                                if (!externalServerDetected) {
+                                    externalServerDetected = true
+                                    PluginLogger.info("[TrueFlow] Detected external llama.cpp server via health check")
+                                }
+                                val startedByDisplay = buildStartedByDisplay(status)
+                                startServerButton.text = "External Server ($startedByDisplay)"
+                                startServerButton.isEnabled = false
+                                statusLabel.text = "Using external AI server - Ready to chat!"
+                                webChatPanel?.setServerRunning(true, status?.model ?: "")
+                                webChatPanel?.updateStatus("External server: ${status?.model ?: "running"}")
+                            }
+                        }
+                        // else: Our server is running - all good
                     }
-                    val startedBy = status?.startedBy ?: "external process"
-                    startServerButton.text = "External Server ($startedBy)"
-                    startServerButton.isEnabled = false
-                    statusLabel.text = "Using external AI server - Ready to chat!"
-                    webChatPanel?.setServerRunning(true, status?.model ?: "")
-                    webChatPanel?.updateStatus("External server: ${status?.model ?: "running"}")
-                } else if (!isRunning && serverProcess != null) {
-                    // Our server died
-                    serverProcess = null
-                    startServerButton.text = "Start AI Server"
-                    startServerButton.isEnabled = true
-                    statusLabel.text = "AI Server stopped unexpectedly"
-                    webChatPanel?.setServerRunning(false)
-                    webChatPanel?.updateStatus("Server stopped unexpectedly")
-                } else if (!isRunning && externalServerDetected) {
-                    // External server stopped - re-enable controls
-                    externalServerDetected = false
-                    startServerButton.text = "Start AI Server"
-                    startServerButton.isEnabled = true
-                    startServerButton.toolTipText = "Start the local AI server"
-                    statusLabel.text = "External server stopped - Ready to start"
-                    webChatPanel?.setServerRunning(false)
-                    webChatPanel?.updateStatus("External server stopped")
+
+                    ServerCheckResult.OTHER_SERVICE_RUNNING -> {
+                        // Port 8080 is occupied by a non-llama.cpp service
+                        if (!portConflictDetected) {
+                            portConflictDetected = true
+                            externalServerDetected = false
+                            PluginLogger.warn("[TrueFlow] Port 8080 is now occupied by a non-llama.cpp service")
+                        }
+                        startServerButton.text = "Port 8080 Conflict!"
+                        startServerButton.isEnabled = false
+                        startServerButton.toolTipText = "Another service is using port 8080. Stop it first."
+                        statusLabel.text = "⚠️ Port 8080 in use by another service"
+                        webChatPanel?.setServerRunning(false)
+                    }
+
+                    ServerCheckResult.NOT_RUNNING -> {
+                        // Nothing running on port 8080
+                        if (serverProcess != null) {
+                            // Our server died unexpectedly
+                            serverProcess = null
+                            externalServerDetected = false
+                            portConflictDetected = false
+                            startServerButton.text = "Start AI Server"
+                            startServerButton.isEnabled = true
+                            statusLabel.text = "AI Server stopped unexpectedly"
+                            webChatPanel?.setServerRunning(false)
+                            webChatPanel?.updateStatus("Server stopped unexpectedly")
+                        } else if (externalServerDetected || portConflictDetected) {
+                            // External server or conflicting service stopped - re-enable controls
+                            externalServerDetected = false
+                            portConflictDetected = false
+                            startServerButton.text = "Start AI Server"
+                            startServerButton.isEnabled = true
+                            startServerButton.toolTipText = "Start the local AI server"
+                            statusLabel.text = "Port 8080 available - Ready to start"
+                            webChatPanel?.setServerRunning(false)
+                            webChatPanel?.updateStatus("Ready to start")
+                        } else if (serverProcess == null) {
+                            // No server running anywhere - ensure UI reflects this
+                            startServerButton.text = "Start AI Server"
+                            startServerButton.isEnabled = true
+                        }
+                    }
                 }
             }
         }
@@ -2518,17 +2761,42 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     private fun startServer() {
-        // Check if server is already running from another IDE
-        val existingStatus = readServerStatus()
-        if (existingStatus?.running == true && checkServerHealth()) {
-            SwingUtilities.invokeLater {
-                startServerButton.text = "Using External Server (${existingStatus.startedBy})"
-                startServerButton.isEnabled = false
-                statusLabel.text = "AI Server already running (started by ${existingStatus.startedBy})"
-                webChatPanel?.setServerRunning(true, existingStatus.model ?: "")
-                webChatPanel?.updateStatus("Connected via ${existingStatus.startedBy}")
+        // Check what's currently running on port 8080
+        val serverCheck = checkLlamaCppServer()
+
+        when (serverCheck) {
+            ServerCheckResult.LLAMA_CPP_RUNNING -> {
+                // llama.cpp already running - check who started it
+                val existingStatus = readServerStatus()
+                val startedByDisplay = buildStartedByDisplay(existingStatus)
+                SwingUtilities.invokeLater {
+                    startServerButton.text = "Using External Server ($startedByDisplay)"
+                    startServerButton.isEnabled = false
+                    statusLabel.text = "AI Server already running (started by $startedByDisplay)"
+                    webChatPanel?.setServerRunning(true, existingStatus?.model ?: "")
+                    webChatPanel?.updateStatus("Connected via $startedByDisplay")
+                    externalServerDetected = true
+                }
+                return
             }
-            return
+
+            ServerCheckResult.OTHER_SERVICE_RUNNING -> {
+                // Port 8080 is occupied by a non-llama.cpp service
+                SwingUtilities.invokeLater {
+                    portConflictDetected = true
+                    startServerButton.text = "Port 8080 Conflict!"
+                    startServerButton.isEnabled = false
+                    statusLabel.text = "⚠️ Cannot start: Port 8080 is in use by another service"
+                    webChatPanel?.updateStatus("Port conflict: 8080 in use by another service")
+                    PluginLogger.error("[TrueFlow] Cannot start server: port 8080 is occupied by a non-llama.cpp service")
+                }
+                return
+            }
+
+            ServerCheckResult.NOT_RUNNING -> {
+                // Port is available - proceed with starting
+                portConflictDetected = false
+            }
         }
 
         val modelFile = currentModelFile
@@ -2641,13 +2909,16 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         val modelName = File(modelFile).name
 
                         // Write shared status so other IDEs know the server is running (file-based fallback)
+                        // Include project info so we can identify the same project after IDE restart
                         writeServerStatus(ServerStatus(
                             running = true,
                             pid = null,  // Java Process doesn't easily expose PID
                             port = 8080,
                             model = modelName,
-                            startedBy = "pycharm",
-                            startedAt = java.time.Instant.now().toString()
+                            startedBy = getIDEName(),
+                            startedAt = java.time.Instant.now().toString(),
+                            projectPath = project.basePath,
+                            projectName = project.name
                         ))
 
                         // Notify via WebSocket hub (real-time)
@@ -2722,6 +2993,42 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     private fun startServerWithHF(hfModel: String) {
+        // Check what's currently running on port 8080
+        val serverCheck = checkLlamaCppServer()
+
+        when (serverCheck) {
+            ServerCheckResult.LLAMA_CPP_RUNNING -> {
+                // llama.cpp already running
+                val existingStatus = readServerStatus()
+                val startedByDisplay = buildStartedByDisplay(existingStatus)
+                SwingUtilities.invokeLater {
+                    startServerButton.text = "Using External Server ($startedByDisplay)"
+                    startServerButton.isEnabled = false
+                    statusLabel.text = "AI Server already running (started by $startedByDisplay)"
+                    webChatPanel?.setServerRunning(true, existingStatus?.model ?: "")
+                    externalServerDetected = true
+                }
+                return
+            }
+
+            ServerCheckResult.OTHER_SERVICE_RUNNING -> {
+                // Port 8080 is occupied by a non-llama.cpp service
+                SwingUtilities.invokeLater {
+                    portConflictDetected = true
+                    startServerButton.text = "Port 8080 Conflict!"
+                    startServerButton.isEnabled = false
+                    statusLabel.text = "⚠️ Cannot start: Port 8080 is in use by another service"
+                    PluginLogger.error("[TrueFlow] Cannot start HF server: port 8080 is occupied")
+                }
+                return
+            }
+
+            ServerCheckResult.NOT_RUNNING -> {
+                // Port is available - proceed
+                portConflictDetected = false
+            }
+        }
+
         startServerButton.isEnabled = false
         statusLabel.text = "Starting AI server with HuggingFace model..."
 
@@ -2803,13 +3110,16 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 SwingUtilities.invokeLater {
                     if (ready) {
                         // Write shared status for file-based fallback
+                        // Include project info so we can identify the same project after IDE restart
                         writeServerStatus(ServerStatus(
                             running = true,
                             pid = null,
                             port = 8080,
                             model = hfModel,
-                            startedBy = "pycharm",
-                            startedAt = java.time.Instant.now().toString()
+                            startedBy = getIDEName(),
+                            startedAt = java.time.Instant.now().toString(),
+                            projectPath = project.basePath,
+                            projectName = project.name
                         ))
 
                         // Notify via WebSocket hub (real-time)

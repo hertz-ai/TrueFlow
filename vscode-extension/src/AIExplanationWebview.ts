@@ -122,8 +122,17 @@ interface ServerStatus {
     pid?: number;
     port: number;
     model?: string;
-    startedBy: string;  // 'vscode' or 'pycharm'
+    startedBy: string;      // IDE name: 'VS Code', 'PyCharm', 'IntelliJ IDEA', etc.
     startedAt: string;
+    projectPath?: string;   // Full path to project that started the server
+    projectName?: string;   // Project name for display
+}
+
+// Result of checking what's running on port 8080
+enum ServerCheckResult {
+    NOT_RUNNING = 'NOT_RUNNING',           // No service on port 8080
+    LLAMA_CPP_RUNNING = 'LLAMA_CPP_RUNNING',     // llama.cpp server detected
+    OTHER_SERVICE_RUNNING = 'OTHER_SERVICE_RUNNING'  // Some other service is using port 8080
 }
 
 export class AIExplanationProvider {
@@ -165,6 +174,8 @@ export class AIExplanationProvider {
 
     // Track if server was started externally (not by this VS Code instance)
     private externalServerDetected = false;
+    // Track if port 8080 is occupied by a non-llama.cpp service
+    private portConflictDetected = false;
     private gpuMemoryMB = 0;  // Total GPU memory
 
     private readonly modelsDir: string;
@@ -191,33 +202,202 @@ export class AIExplanationProvider {
 
     /**
      * Check if AI server is already running on startup.
-     * This handles the case where VS Code restarts but the server is still running.
+     * IMPORTANT: Uses checkLlamaCppServer() to distinguish between:
+     * - llama.cpp server (ours or external)
+     * - Other service on port 8080 (conflict)
+     * - Nothing running (available)
      */
     private async checkExistingServer(): Promise<void> {
         try {
-            const isRunning = await this.checkServerHealth();
-            if (isRunning) {
-                // Server is running but we didn't start it - mark as external
-                this.externalServerDetected = true;
-                const status = this.readServerStatus();
-                const model = status?.model || 'Unknown model';
-                const startedBy = status?.startedBy || 'external process';
+            const serverCheck = await this.checkLlamaCppServer();
+            const status = this.readServerStatus();
+            const currentProjectPath = this.getProjectPath();
 
-                console.log(`[TrueFlow] Detected external AI server on startup (model: ${model}, started by: ${startedBy})`);
+            switch (serverCheck) {
+                case ServerCheckResult.LLAMA_CPP_RUNNING: {
+                    // llama.cpp server is running
+                    const model = status?.model || 'Unknown model';
+                    const startedByDisplay = this.buildStartedByDisplay(status);
 
-                // Update UI to show external server - disable controls
-                this.postMessage({
-                    command: 'externalServerRunning',
-                    startedBy: startedBy,
-                    model: model
-                });
-                this.postMessage({
-                    command: 'updateStatus',
-                    status: `External server: ${model}`
-                });
+                    // Check if this is the same project that started the server
+                    const isSameProject = status?.projectPath === currentProjectPath;
+
+                    if (isSameProject) {
+                        // This project started the server (e.g., before VS Code restart)
+                        this.externalServerDetected = false;
+                        console.log(`[TrueFlow] Detected AI server from this project (model: ${model})`);
+
+                        this.postMessage({
+                            command: 'serverRunning',
+                            model: model,
+                            canControl: true
+                        });
+                        this.postMessage({
+                            command: 'updateStatus',
+                            status: `AI Server running (started by this project) - Ready to chat!`
+                        });
+                    } else {
+                        // Different project or external process started the server
+                        this.externalServerDetected = true;
+                        console.log(`[TrueFlow] Detected external llama.cpp server (model: ${model}, started by: ${startedByDisplay})`);
+
+                        this.postMessage({
+                            command: 'externalServerRunning',
+                            startedBy: startedByDisplay,
+                            model: model
+                        });
+                        this.postMessage({
+                            command: 'updateStatus',
+                            status: `Using external AI server - Ready to chat!`
+                        });
+                    }
+
+                    // Start polling to detect when server stops
+                    this.startStatusPolling();
+                    break;
+                }
+
+                case ServerCheckResult.OTHER_SERVICE_RUNNING: {
+                    // Port 8080 is occupied by a non-llama.cpp service
+                    this.portConflictDetected = true;
+                    this.externalServerDetected = false;
+                    console.warn(`[TrueFlow] Port 8080 is occupied by a non-llama.cpp service`);
+
+                    this.postMessage({
+                        command: 'portConflict'
+                    });
+                    this.postMessage({
+                        command: 'updateStatus',
+                        status: '⚠️ Port 8080 in use by another service'
+                    });
+
+                    // Start polling to detect when the other service stops
+                    this.startStatusPolling();
+                    break;
+                }
+
+                case ServerCheckResult.NOT_RUNNING: {
+                    // Nothing running on port 8080 - ready to start
+                    this.externalServerDetected = false;
+                    this.portConflictDetected = false;
+
+                    this.postMessage({
+                        command: 'updateStatus',
+                        status: 'AI Server stopped - Click to start'
+                    });
+
+                    // Start polling to detect when external server starts
+                    this.startStatusPolling();
+                    break;
+                }
             }
         } catch (e) {
-            // No server running, that's fine
+            console.error(`[TrueFlow] Error checking server: ${e}`);
+            this.startStatusPolling();
+        }
+    }
+
+    /**
+     * Start polling to monitor server status.
+     * Detects when external server stops or port becomes available.
+     */
+    private startStatusPolling(): void {
+        // Prevent duplicate timers
+        if (this.statusCheckInterval) {
+            return;
+        }
+
+        this.statusCheckInterval = setInterval(async () => {
+            const serverCheck = await this.checkLlamaCppServer();
+            const status = this.readServerStatus();
+            const currentProjectPath = this.getProjectPath();
+
+            switch (serverCheck) {
+                case ServerCheckResult.LLAMA_CPP_RUNNING: {
+                    // Clear port conflict if it was set
+                    if (this.portConflictDetected) {
+                        this.portConflictDetected = false;
+                    }
+
+                    if (!this.serverProcess) {
+                        // Server running but not started by us
+                        const isSameProject = status?.projectPath === currentProjectPath;
+
+                        if (isSameProject && !this.externalServerDetected) {
+                            // Same project - allow control
+                            this.postMessage({
+                                command: 'serverRunning',
+                                model: status?.model || '',
+                                canControl: true
+                            });
+                        } else if (!isSameProject && !this.externalServerDetected) {
+                            // Different project - mark as external
+                            this.externalServerDetected = true;
+                            const startedByDisplay = this.buildStartedByDisplay(status);
+                            console.log(`[TrueFlow] Detected external llama.cpp server via polling`);
+
+                            this.postMessage({
+                                command: 'externalServerRunning',
+                                startedBy: startedByDisplay,
+                                model: status?.model || ''
+                            });
+                        }
+                    }
+                    break;
+                }
+
+                case ServerCheckResult.OTHER_SERVICE_RUNNING: {
+                    // Port 8080 is occupied by a non-llama.cpp service
+                    if (!this.portConflictDetected) {
+                        this.portConflictDetected = true;
+                        this.externalServerDetected = false;
+                        console.warn(`[TrueFlow] Port 8080 is now occupied by a non-llama.cpp service`);
+
+                        this.postMessage({
+                            command: 'portConflict'
+                        });
+                    }
+                    break;
+                }
+
+                case ServerCheckResult.NOT_RUNNING: {
+                    // Nothing running on port 8080
+                    if (this.serverProcess) {
+                        // Our server died unexpectedly
+                        this.serverProcess = undefined;
+                        this.externalServerDetected = false;
+                        this.portConflictDetected = false;
+
+                        this.postMessage({
+                            command: 'serverStopped',
+                            unexpected: true
+                        });
+                    } else if (this.externalServerDetected || this.portConflictDetected) {
+                        // External server or conflicting service stopped
+                        this.externalServerDetected = false;
+                        this.portConflictDetected = false;
+
+                        this.postMessage({
+                            command: 'portAvailable'
+                        });
+                        this.postMessage({
+                            command: 'updateStatus',
+                            status: 'Port 8080 available - Ready to start'
+                        });
+                    }
+                    break;
+                }
+            }
+        }, 2000);
+    }
+
+    /**
+     * Stop the status polling timer.
+     */
+    private stopStatusPolling(): void {
+        if (this.statusCheckInterval) {
+            clearInterval(this.statusCheckInterval);
+            this.statusCheckInterval = undefined;
         }
     }
 
@@ -458,39 +638,6 @@ export class AIExplanationProvider {
             return await this.checkServerHealth();
         } catch {
             return false;
-        }
-    }
-
-    // Start polling for server status changes
-    private startStatusPolling(): void {
-        if (this.statusCheckInterval) {
-            return;
-        }
-
-        this.statusCheckInterval = setInterval(async () => {
-            const status = this.readServerStatus();
-            const isRunning = await this.isServerRunningAnywhere();
-
-            // Update UI based on server state
-            if (isRunning && !this.serverProcess) {
-                // Server is running but not started by us
-                this.postMessage({
-                    command: 'externalServerRunning',
-                    startedBy: status?.startedBy || 'external',
-                    model: status?.model || 'unknown'
-                });
-            } else if (!isRunning && this.serverProcess) {
-                // Our server died unexpectedly
-                this.serverProcess = undefined;
-                this.postMessage({ command: 'serverStopped' });
-            }
-        }, 2000);  // Check every 2 seconds
-    }
-
-    private stopStatusPolling(): void {
-        if (this.statusCheckInterval) {
-            clearInterval(this.statusCheckInterval);
-            this.statusCheckInterval = undefined;
         }
     }
 
@@ -869,13 +1016,16 @@ export class AIExplanationProvider {
 
         if (ready) {
             // Write shared status for file-based fallback
+            // Include project info so we can identify the same project after VS Code restart
             this.writeServerStatus({
                 running: true,
                 pid: this.serverProcess?.pid,
                 port: 8080,
                 model: hfModel,
-                startedBy: 'vscode',
-                startedAt: new Date().toISOString()
+                startedBy: 'VS Code',
+                startedAt: new Date().toISOString(),
+                projectPath: this.getProjectPath(),
+                projectName: this.getProjectName()
             });
 
             // Notify via WebSocket hub (real-time)
@@ -1901,23 +2051,47 @@ If context insufficient, use MCP tool. I'll execute & return results.`
             return;
         }
 
-        // Check if server is already running from another IDE
+        // Check what's currently running on port 8080
+        const serverCheck = await this.checkLlamaCppServer();
         const existingStatus = this.readServerStatus();
-        if (existingStatus?.running) {
-            const isHealthy = await this.checkServerHealth();
-            if (isHealthy) {
+
+        switch (serverCheck) {
+            case ServerCheckResult.LLAMA_CPP_RUNNING: {
+                // llama.cpp already running - check who started it
+                const startedByDisplay = this.buildStartedByDisplay(existingStatus);
                 vscode.window.showInformationMessage(
-                    `AI server already running (started by ${existingStatus.startedBy}). Using existing server.`
+                    `AI server already running (started by ${startedByDisplay}). Using existing server.`
                 );
+                this.externalServerDetected = true;
                 this.postMessage({
                     command: 'externalServerRunning',
-                    startedBy: existingStatus.startedBy,
-                    model: existingStatus.model
+                    startedBy: startedByDisplay,
+                    model: existingStatus?.model
                 });
                 return;
             }
-            // Server status file exists but server not responding - clean up
-            this.writeServerStatus(null);
+
+            case ServerCheckResult.OTHER_SERVICE_RUNNING: {
+                // Port 8080 is occupied by a non-llama.cpp service
+                this.portConflictDetected = true;
+                vscode.window.showErrorMessage(
+                    'Cannot start AI server: Port 8080 is in use by another service. Stop that service first.'
+                );
+                this.postMessage({
+                    command: 'portConflict'
+                });
+                return;
+            }
+
+            case ServerCheckResult.NOT_RUNNING: {
+                // Port is available - proceed with starting
+                this.portConflictDetected = false;
+                // Clean up stale status file if exists
+                if (existingStatus?.running) {
+                    this.writeServerStatus(null);
+                }
+                break;
+            }
         }
 
         if (!this.currentModelFile) {
@@ -2035,13 +2209,16 @@ If context insufficient, use MCP tool. I'll execute & return results.`
             const modelName = this.currentModelFile ? path.basename(this.currentModelFile) : 'unknown';
 
             // Write shared status so other IDEs know the server is running (file-based fallback)
+            // Include project info so we can identify the same project after VS Code restart
             this.writeServerStatus({
                 running: true,
                 pid: this.serverProcess?.pid,
                 port: 8080,
                 model: modelName,
-                startedBy: 'vscode',
-                startedAt: new Date().toISOString()
+                startedBy: 'VS Code',
+                startedAt: new Date().toISOString(),
+                projectPath: this.getProjectPath(),
+                projectName: this.getProjectName()
             });
 
             // Notify via WebSocket hub (real-time)
@@ -2066,11 +2243,108 @@ If context insufficient, use MCP tool. I'll execute & return results.`
     }
 
     private checkServerHealth(): Promise<boolean> {
-        return new Promise((resolve) => {
-            http.get('http://127.0.0.1:8080/health', { timeout: 2000 }, (res) => {
-                resolve(res.statusCode === 200);
-            }).on('error', () => resolve(false));
+        return new Promise(async (resolve) => {
+            const result = await this.checkLlamaCppServer();
+            resolve(result === ServerCheckResult.LLAMA_CPP_RUNNING);
         });
+    }
+
+    /**
+     * Check what's running on port 8080.
+     * llama.cpp server has specific endpoints we can verify:
+     * - GET /health returns {"status":"ok"} or {"status":"loading model"} or {"status":"error"}
+     * - GET /v1/models returns a list of models (OpenAI-compatible)
+     */
+    private checkLlamaCppServer(): Promise<ServerCheckResult> {
+        return new Promise((resolve) => {
+            // First check /health endpoint
+            const req = http.get('http://127.0.0.1:8080/health', { timeout: 2000 }, (res) => {
+                if (res.statusCode !== 200) {
+                    // Something is running but doesn't respond to /health with 200
+                    resolve(ServerCheckResult.OTHER_SERVICE_RUNNING);
+                    return;
+                }
+
+                // Read the response body to verify it's llama.cpp format
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    // llama.cpp health returns JSON with "status" field
+                    // e.g., {"status":"ok"} or {"status":"loading model","progress":0.5}
+                    if (!data.includes('"status"')) {
+                        // Response doesn't look like llama.cpp
+                        resolve(ServerCheckResult.OTHER_SERVICE_RUNNING);
+                        return;
+                    }
+
+                    // Double-check by calling /v1/models (OpenAI-compatible endpoint)
+                    const modelsReq = http.get('http://127.0.0.1:8080/v1/models', { timeout: 1000 }, (modelsRes) => {
+                        if (modelsRes.statusCode === 200) {
+                            let modelsData = '';
+                            modelsRes.on('data', chunk => modelsData += chunk);
+                            modelsRes.on('end', () => {
+                                // llama.cpp returns {"object":"list","data":[...]}
+                                if (modelsData.includes('"object"') && modelsData.includes('"data"')) {
+                                    resolve(ServerCheckResult.LLAMA_CPP_RUNNING);
+                                } else {
+                                    // Health passed but models didn't - still likely llama.cpp
+                                    resolve(ServerCheckResult.LLAMA_CPP_RUNNING);
+                                }
+                            });
+                        } else {
+                            // /v1/models failed but /health succeeded with status - still likely llama.cpp
+                            resolve(ServerCheckResult.LLAMA_CPP_RUNNING);
+                        }
+                    });
+                    modelsReq.on('error', () => {
+                        // /v1/models failed but /health succeeded - assume llama.cpp
+                        resolve(ServerCheckResult.LLAMA_CPP_RUNNING);
+                    });
+                });
+            });
+
+            req.on('error', (err: NodeJS.ErrnoException) => {
+                if (err.code === 'ECONNREFUSED') {
+                    // Connection refused - nothing running on port 8080
+                    resolve(ServerCheckResult.NOT_RUNNING);
+                } else if (err.code === 'ETIMEDOUT') {
+                    // Timeout - something might be running but not responding
+                    resolve(ServerCheckResult.NOT_RUNNING);
+                } else {
+                    // Other error - assume not running
+                    resolve(ServerCheckResult.NOT_RUNNING);
+                }
+            });
+        });
+    }
+
+    /**
+     * Build a human-readable "started by" string from server status.
+     * Examples: "PyCharm: MyProject", "VS Code: webapp", "external process"
+     */
+    private buildStartedByDisplay(status: ServerStatus | null): string {
+        if (!status) return 'external process';
+
+        const ide = status.startedBy || 'external process';
+        const projectName = status.projectName;
+
+        return projectName ? `${ide}: ${projectName}` : ide;
+    }
+
+    /**
+     * Get the current workspace folder name for project identification
+     */
+    private getProjectName(): string | undefined {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        return workspaceFolders?.[0]?.name;
+    }
+
+    /**
+     * Get the current workspace folder path for project identification
+     */
+    private getProjectPath(): string | undefined {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        return workspaceFolders?.[0]?.uri.fsPath;
     }
 
     /**
