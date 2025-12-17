@@ -290,8 +290,7 @@ tasks {
 
     patchPluginXml {
         sinceBuild.set("231")
-        // No untilBuild = compatible with all future versions
-        // Only set untilBuild if using APIs that are known to break in future versions
+        untilBuild.set("")  // Empty string = no upper bound, compatible with all future versions
 
         pluginDescription.set("""
             TrueFlow - Deterministic Code Visualizer & Explainer

@@ -2,7 +2,7 @@
   "name": "trueflow",
   "displayName": "TrueFlow - Deterministic Code Visualizer",
   "description": "Unblackbox LLM code with deterministic truth. Zero-code Python runtime instrumentation with 3D animated execution videos.",
-  "version": "0.1.99",
+  "version": "0.1.107",
   "publisher": "hevolve-ai",
   "license": "MIT",
   "icon": "resources/icon.png",
