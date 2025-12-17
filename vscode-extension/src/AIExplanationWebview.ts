@@ -855,6 +855,8 @@ export class AIExplanationProvider {
     private async fetchJSON(url: string): Promise<any> {
         return new Promise((resolve, reject) => {
             https.get(url, { headers: { 'User-Agent': 'TrueFlow/1.0' } }, (res) => {
+                // Set UTF-8 encoding for proper handling of international characters
+                res.setEncoding('utf8');
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
@@ -1488,6 +1490,8 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                 },
                 timeout: 120000
             }, (res) => {
+                // IMPORTANT: Set UTF-8 encoding to properly handle non-ASCII characters (Tamil, Chinese, etc.)
+                res.setEncoding('utf8');
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
@@ -1573,6 +1577,8 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                 },
                 timeout: 120000
             }, (res) => {
+                // IMPORTANT: Set UTF-8 encoding to properly handle non-ASCII characters
+                res.setEncoding('utf8');
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
@@ -1750,6 +1756,8 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                 },
                 timeout: 120000
             }, (res) => {
+                // IMPORTANT: Set UTF-8 encoding to properly handle non-ASCII characters (Tamil, Chinese, etc.)
+                res.setEncoding('utf8');
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
@@ -2471,6 +2479,8 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                 },
                 timeout: 60000
             }, (res) => {
+                // IMPORTANT: Set UTF-8 encoding to properly handle non-ASCII characters
+                res.setEncoding('utf8');
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {

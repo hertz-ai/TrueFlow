@@ -1534,9 +1534,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
         // System prompt with original question context for better chunk analysis
         val systemContent = if (sanitizedQuestion != null) {
-            sanitizeForLLM("TrueFlow AI: You are analyzing code execution context in chunks. The user's question is: \"$sanitizedQuestion\". Analyze the provided context chunk and extract relevant information to answer this question. Focus on facts from the context, not speculation.")
+            sanitizeForLLM("TrueFlow AI Developed By Hevolve.ai: You are analyzing code execution context in chunks. The user's question is: \"$sanitizedQuestion\". Analyze the provided context chunk and extract relevant information to answer this question. Focus on facts from the context, not speculation.")
         } else {
-            "TrueFlow AI: Analyze the provided context and answer concisely."
+            "TrueFlow AI Developed By Hevolve.ai: Analyze the provided context and answer concisely."
         }
         messages.add(mapOf(
             "role" to "system",
@@ -1575,7 +1575,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
         val responseCode = conn.responseCode
         if (responseCode != 200) {
-            val errorBody = conn.errorStream?.let { BufferedReader(InputStreamReader(it)).use { r -> r.readText() } } ?: ""
+            val errorBody = conn.errorStream?.let { BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { r -> r.readText() } } ?: ""
             val errorMsg = when (responseCode) {
                 500 -> "Server error (500): $errorBody. This may be due to: (1) Model not fully loaded - wait a few seconds, (2) Out of memory - try a smaller model, (3) Invalid request format."
                 503 -> "Server unavailable (503): The AI server is still initializing. Please wait a moment."
@@ -1584,7 +1584,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             throw RuntimeException(errorMsg)
         }
 
-        val response = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
+        // IMPORTANT: Explicitly use UTF-8 to properly handle non-ASCII characters (Tamil, Chinese, etc.)
+        val response = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
         val json = Gson().fromJson(response, JsonObject::class.java)
 
         return json.getAsJsonArray("choices")
@@ -1648,10 +1649,10 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
     private fun buildWelcomeMessage(): String {
         return """
-            |TrueFlow AI Assistant
+            |TrueFlow AI
             |=====================
             |
-            |I'm a local AI powered by Qwen3-VL running on your machine.
+            |I'm a local AI powered By Hevolve.ai running on your machine.
             |I can help you understand your code execution traces.
             |
             |What I can do:
@@ -1968,7 +1969,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         val mcpToolsDocs = buildMCPToolsDocumentation()
 
         // Compact system prompt with MCP awareness
-        val systemPrompt = sanitizeForLLM("""TrueFlow AI: Code analysis assistant. Be concise and technical.
+        val systemPrompt = sanitizeForLLM("""TrueFlow AI Developed By Hevolve.ai: Code analysis assistant. Be concise and technical.
                 |$mcpToolsDocs
                 |If context insufficient, use MCP tool. I will execute and return results.
             """.trimMargin())
@@ -2031,7 +2032,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
         val responseCode = conn.responseCode
         if (responseCode != 200) {
-            val errorBody = conn.errorStream?.let { BufferedReader(InputStreamReader(it)).use { r -> r.readText() } } ?: ""
+            val errorBody = conn.errorStream?.let { BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { r -> r.readText() } } ?: ""
             PluginLogger.error("LLM API error $responseCode: $errorBody")
             PluginLogger.debug("Request body was: ${requestBody.take(500)}...")
             val errorMsg = when (responseCode) {
@@ -2042,7 +2043,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             throw RuntimeException(errorMsg)
         }
 
-        val response = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
+        // IMPORTANT: Explicitly use UTF-8 to properly handle non-ASCII characters (Tamil, Chinese, etc.)
+        val response = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
         val json = Gson().fromJson(response, JsonObject::class.java)
 
         val content = json.getAsJsonArray("choices")
@@ -2081,12 +2083,12 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
             val followUpCode = followUpConn.responseCode
             if (followUpCode != 200) {
-                val followUpError = followUpConn.errorStream?.let { BufferedReader(InputStreamReader(it)).use { r -> r.readText() } } ?: ""
+                val followUpError = followUpConn.errorStream?.let { BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { r -> r.readText() } } ?: ""
                 PluginLogger.error("Follow-up LLM API error $followUpCode: $followUpError")
                 return content  // Fallback to original response
             }
 
-            val followUpResponse = BufferedReader(InputStreamReader(followUpConn.inputStream)).use { it.readText() }
+            val followUpResponse = BufferedReader(InputStreamReader(followUpConn.inputStream, Charsets.UTF_8)).use { it.readText() }
             val followUpJson = Gson().fromJson(followUpResponse, JsonObject::class.java)
 
             return followUpJson.getAsJsonArray("choices")
@@ -3190,7 +3192,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 conn.setRequestProperty("User-Agent", "TrueFlow/1.0")
                 conn.connectTimeout = 10000
 
-                val response = BufferedReader(InputStreamReader(conn.inputStream)).readText()
+                val response = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).readText()
                 val models = Gson().fromJson(response, JsonArray::class.java)
 
                 hfSearchResults.clear()
@@ -3243,7 +3245,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 return null
             }
 
-            val response = BufferedReader(InputStreamReader(conn.inputStream)).readText()
+            val response = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).readText()
             val files = Gson().fromJson(response, JsonArray::class.java)
 
             val mmprojFiles = mutableListOf<String>()
@@ -3306,7 +3308,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     installDir.absolutePath
                 ).redirectErrorStream(true).start()
 
-                val cloneOutput = BufferedReader(InputStreamReader(cloneProcess.inputStream)).readText()
+                val cloneOutput = BufferedReader(InputStreamReader(cloneProcess.inputStream, Charsets.UTF_8)).readText()
                 val cloneExitCode = cloneProcess.waitFor()
 
                 if (cloneExitCode != 0) {
@@ -3337,7 +3339,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 val cmakeProcess = ProcessBuilder(cmakeArgs)
                     .directory(buildDir).redirectErrorStream(true).start()
 
-                val cmakeOutput = BufferedReader(InputStreamReader(cmakeProcess.inputStream)).readText()
+                val cmakeOutput = BufferedReader(InputStreamReader(cmakeProcess.inputStream, Charsets.UTF_8)).readText()
                 val cmakeExitCode = cmakeProcess.waitFor()
 
                 if (cmakeExitCode != 0) {
@@ -3356,7 +3358,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     "cmake", "--build", ".", "--config", "Release", "-j"
                 ).directory(buildDir).redirectErrorStream(true).start()
 
-                val buildOutput = BufferedReader(InputStreamReader(buildProcess.inputStream)).readText()
+                val buildOutput = BufferedReader(InputStreamReader(buildProcess.inputStream, Charsets.UTF_8)).readText()
                 val buildExitCode = buildProcess.waitFor()
 
                 if (buildExitCode != 0) {
@@ -3397,7 +3399,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             conn.setRequestProperty("User-Agent", "TrueFlow/1.0")
             conn.connectTimeout = 10000
 
-            val releaseJson = BufferedReader(InputStreamReader(conn.inputStream)).readText()
+            val releaseJson = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).readText()
             val release = Gson().fromJson(releaseJson, JsonObject::class.java)
             val tagName = release.get("tag_name")?.asString ?: return false
 
