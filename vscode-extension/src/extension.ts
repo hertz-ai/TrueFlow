@@ -59,6 +59,7 @@ const MODEL_PRESETS: ModelPreset[] = [
 
 let llmServerProcess: child_process.ChildProcess | undefined;
 let currentModelPath: string | undefined;
+let currentContextSelection: number = 0;
 
 /**
  * TrueFlow VS Code Extension
@@ -77,6 +78,35 @@ let traceViewerPanel: vscode.WebviewPanel | undefined;
 let traceSocketClient: TraceSocketClient | undefined;
 let statusBarItem: vscode.StatusBarItem;
 let sidebarProvider: TrueFlowSidebarProvider | undefined;
+
+// Global trace filter state (applies to all tabs)
+interface TraceFilter {
+    includeModules: string[];  // Modules to include (empty = all)
+    excludeModules: string[];  // Modules to exclude
+    minDepth: number;          // Minimum call depth to show
+    maxDepth: number;          // Maximum call depth to show (0 = unlimited)
+}
+
+let traceFilter: TraceFilter = {
+    includeModules: [],
+    excludeModules: ['logging', 'asyncio', 'concurrent', 'socket', 'threading', '_frozen_importlib'],
+    minDepth: 0,
+    maxDepth: 0
+};
+
+function getFilterStats(): string {
+    const parts: string[] = [];
+    if (traceFilter.includeModules.length > 0) {
+        parts.push(`+${traceFilter.includeModules.length} inc`);
+    }
+    if (traceFilter.excludeModules.length > 0) {
+        parts.push(`-${traceFilter.excludeModules.length} exc`);
+    }
+    if (traceFilter.maxDepth > 0) {
+        parts.push(`depth<=${traceFilter.maxDepth}`);
+    }
+    return parts.length > 0 ? parts.join(', ') : 'None';
+}
 
 /**
  * WebviewViewProvider for the TrueFlow sidebar
@@ -112,7 +142,7 @@ class TrueFlowSidebarProvider implements vscode.WebviewViewProvider {
                     disconnectSocket();
                     break;
                 case 'openFullView':
-                    showTraceViewer(this._extensionContext);
+                    showTraceViewer(this._extensionContext, message.tab);
                     break;
                 case 'autoIntegrate':
                     autoIntegrateProject(this._extensionContext);
@@ -122,6 +152,14 @@ class TrueFlowSidebarProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'openAIChat':
                     AIExplanationProvider.getInstance().show(this._extensionContext);
+                    break;
+                case 'manageFilters':
+                    showFilterManagementDialog();
+                    break;
+                case 'contextChanged':
+                    // Store context selection for AI panel to use
+                    currentContextSelection = message.value;
+                    AIExplanationProvider.getInstance().setContextSelection(message.value);
                     break;
                 case 'info':
                     vscode.window.showInformationMessage(message.message);
@@ -187,15 +225,26 @@ function setupSocketClientHandlers(): void {
         statusBarItem.backgroundColor = undefined;
         vscode.window.showInformationMessage('TrueFlow: Connected to trace server');
 
-        // Update webview
+        // Update webviews
         if (traceViewerPanel) {
             traceViewerPanel.webview.postMessage({ type: 'socketConnected' });
+        }
+        if (sidebarProvider) {
+            sidebarProvider.postMessage({ type: 'socketConnected' });
         }
     });
 
     traceSocketClient.on('disconnected', () => {
         statusBarItem.text = '$(debug-disconnect) TrueFlow';
         statusBarItem.tooltip = 'TrueFlow: Disconnected from trace server';
+
+        // Notify panels
+        if (sidebarProvider) {
+            sidebarProvider.postMessage({ type: 'socketDisconnected' });
+        }
+        if (traceViewerPanel) {
+            traceViewerPanel.webview.postMessage({ type: 'socketDisconnected' });
+        }
     });
 
     traceSocketClient.on('error', (err: Error) => {
@@ -221,6 +270,26 @@ function setupSocketClientHandlers(): void {
                 data: traceSocketClient.getPerformanceData()
             });
         }
+
+        // Update AI panel with trace data for context injection
+        if (traceSocketClient) {
+            const perfData = traceSocketClient.getPerformanceData();
+            const aiProvider = AIExplanationProvider.getInstance();
+            const callTraceData = {
+                calls: events.map(e => ({
+                    function: e.function,
+                    module: e.module,
+                    depth: e.depth,
+                    duration_ms: e.duration_ms || 0,
+                    type: e.type
+                })),
+                total_calls: events.length
+            };
+            aiProvider.setCallTraceData(callTraceData);
+            aiProvider.setPerformanceData(perfData);
+            // Save snapshot after data update
+            aiProvider.saveSnapshot();
+        }
     });
 }
 
@@ -243,7 +312,99 @@ async function connectToSocket(): Promise<void> {
 
 function disconnectSocket(): void {
     traceSocketClient?.disconnect();
-    vscode.window.showInformationMessage('Disconnected from trace server');
+
+    // Notify both sidebar and trace viewer panel about disconnect
+    if (sidebarProvider) {
+        sidebarProvider.postMessage({ type: 'socketDisconnected' });
+    }
+    if (traceViewerPanel) {
+        traceViewerPanel.webview.postMessage({ type: 'socketDisconnected' });
+    }
+
+    vscode.window.showInformationMessage('Detached from trace server');
+}
+
+async function showFilterManagementDialog(): Promise<void> {
+    // Show a multi-step quick pick dialog for filter management
+    const filterAction = await vscode.window.showQuickPick([
+        { label: '$(add) Add Module to Include', description: 'Only trace these modules', value: 'addInclude' },
+        { label: '$(dash) Add Module to Exclude', description: 'Never trace these modules', value: 'addExclude' },
+        { label: '$(list-flat) Clear Include List', description: 'Remove all include filters', value: 'clearInclude' },
+        { label: '$(list-flat) Clear Exclude List', description: 'Remove all exclude filters', value: 'clearExclude' },
+        { label: '$(layers) Set Max Depth', description: `Current: ${traceFilter.maxDepth || 'unlimited'}`, value: 'setDepth' },
+        { label: '$(info) Show Current Filters', description: 'View all active filters', value: 'show' }
+    ], {
+        placeHolder: 'Manage Trace Filters (applies to all tabs)'
+    });
+
+    if (!filterAction) return;
+
+    switch (filterAction.value) {
+        case 'addInclude': {
+            const module = await vscode.window.showInputBox({
+                prompt: 'Enter module name to include (e.g., myapp, myapp.models)',
+                placeHolder: 'module.name'
+            });
+            if (module) {
+                traceFilter.includeModules.push(module);
+                vscode.window.showInformationMessage(`Added '${module}' to include list`);
+                updateFilterStats();
+            }
+            break;
+        }
+        case 'addExclude': {
+            const module = await vscode.window.showInputBox({
+                prompt: 'Enter module name to exclude (e.g., logging, asyncio)',
+                placeHolder: 'module.name'
+            });
+            if (module) {
+                traceFilter.excludeModules.push(module);
+                vscode.window.showInformationMessage(`Added '${module}' to exclude list`);
+                updateFilterStats();
+            }
+            break;
+        }
+        case 'clearInclude':
+            traceFilter.includeModules = [];
+            vscode.window.showInformationMessage('Cleared include list - now tracing all modules');
+            updateFilterStats();
+            break;
+        case 'clearExclude':
+            traceFilter.excludeModules = [];
+            vscode.window.showInformationMessage('Cleared exclude list - now tracing all modules');
+            updateFilterStats();
+            break;
+        case 'setDepth': {
+            const depthStr = await vscode.window.showInputBox({
+                prompt: 'Enter maximum call depth (0 = unlimited)',
+                value: String(traceFilter.maxDepth),
+                validateInput: (v) => isNaN(parseInt(v)) ? 'Must be a number' : null
+            });
+            if (depthStr !== undefined) {
+                traceFilter.maxDepth = parseInt(depthStr);
+                vscode.window.showInformationMessage(`Set max depth to ${traceFilter.maxDepth || 'unlimited'}`);
+                updateFilterStats();
+            }
+            break;
+        }
+        case 'show': {
+            const message = [
+                `Include modules: ${traceFilter.includeModules.length > 0 ? traceFilter.includeModules.join(', ') : '(all)'}`,
+                `Exclude modules: ${traceFilter.excludeModules.join(', ') || '(none)'}`,
+                `Max depth: ${traceFilter.maxDepth || 'unlimited'}`
+            ].join('\n');
+            vscode.window.showInformationMessage(message, { modal: true });
+            break;
+        }
+    }
+}
+
+function updateFilterStats(): void {
+    const stats = getFilterStats();
+    // Update sidebar
+    sidebarProvider?.postMessage({ type: 'updateFilters', stats });
+    // Update trace viewer if open
+    traceViewerPanel?.webview.postMessage({ type: 'updateFilters', stats });
 }
 
 async function autoIntegrateProject(context: vscode.ExtensionContext): Promise<void> {
@@ -521,29 +682,56 @@ async function createLaunchConfiguration(workspaceRoot: string, entryPoint: stri
     vscode.window.showInformationMessage('TrueFlow launch configuration created!');
 }
 
-function showTraceViewer(context: vscode.ExtensionContext): void {
+function showTraceViewer(context: vscode.ExtensionContext, initialTab?: string): void {
+    const needsTabSelection = traceViewerPanel && initialTab;
+
     if (traceViewerPanel) {
-        traceViewerPanel.reveal(vscode.ViewColumn.Two);
+        traceViewerPanel.reveal();
+        // If panel already exists and a tab was specified, select it
+        if (initialTab) {
+            traceViewerPanel.webview.postMessage({ type: 'selectTab', tab: initialTab });
+        }
         return;
+    }
+
+    // Open in existing editor group if available, otherwise use active column
+    // ViewColumn.Two opens in second group if it exists, otherwise creates it beside
+    // Check if there are visible editors to determine if we should use existing group
+    const visibleEditors = vscode.window.visibleTextEditors;
+    let viewColumn: vscode.ViewColumn;
+
+    if (visibleEditors.length > 1) {
+        // Multiple editor groups exist - use the second one (or the one not currently active)
+        const activeColumn = vscode.window.activeTextEditor?.viewColumn || vscode.ViewColumn.One;
+        viewColumn = activeColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
+    } else if (visibleEditors.length === 1) {
+        // Single editor - open beside it
+        viewColumn = vscode.ViewColumn.Beside;
+    } else {
+        // No editors open - use active/first column
+        viewColumn = vscode.ViewColumn.Active;
     }
 
     traceViewerPanel = vscode.window.createWebviewPanel(
         'trueflowTraceViewer',
         'TrueFlow Trace Viewer',
-        vscode.ViewColumn.Two,
+        { viewColumn, preserveFocus: false },
         {
             enableScripts: true,
             retainContextWhenHidden: true
         }
     );
 
-    traceViewerPanel.webview.html = getTraceViewerHtml();
+    traceViewerPanel.webview.html = getTraceViewerHtml(initialTab);
 
     // Handle messages from webview
     traceViewerPanel.webview.onDidReceiveMessage(async message => {
         switch (message.type) {
             case 'connect':
                 await connectToSocket();
+                break;
+            case 'manageFilters':
+                await showFilterManagementDialog();
                 break;
             case 'refresh':
                 if (traceSocketClient) {
@@ -714,9 +902,37 @@ function setupTraceWatcher(context: vscode.ExtensionContext): void {
 }
 
 /**
+ * Check if the workspace already has TrueFlow integration.
+ * Returns true if .trueflow/runtime_injector or .pycharm_plugin/runtime_injector exists.
+ */
+function isProjectAlreadyIntegrated(): boolean {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return false;
+    }
+
+    const workspaceRoot = workspaceFolders[0].uri.fsPath;
+
+    // Check for VS Code integration (.trueflow)
+    const trueflowInjector = path.join(workspaceRoot, '.trueflow', 'runtime_injector', 'sitecustomize.py');
+    if (fs.existsSync(trueflowInjector)) {
+        return true;
+    }
+
+    // Check for PyCharm integration (.pycharm_plugin)
+    const pycharmInjector = path.join(workspaceRoot, '.pycharm_plugin', 'runtime_injector', 'sitecustomize.py');
+    if (fs.existsSync(pycharmInjector)) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
  * Get HTML for the sidebar view - a compact dashboard with quick actions
  */
 function getSidebarHtml(isConnected: boolean): string {
+    const isIntegrated = isProjectAlreadyIntegrated();
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -864,6 +1080,39 @@ function getSidebarHtml(isConnected: boolean): string {
             background: var(--vscode-focusBorder);
             color: white;
         }
+        .context-selector {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            background: var(--vscode-sideBarSectionHeader-background);
+            border-radius: 4px;
+            margin-bottom: 12px;
+        }
+        .context-selector label {
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            white-space: nowrap;
+        }
+        .context-selector select {
+            flex: 1;
+            padding: 4px 6px;
+            font-size: 11px;
+            background: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .context-badge {
+            font-size: 9px;
+            padding: 2px 5px;
+            background: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            border-radius: 8px;
+            display: none;
+        }
+        .context-badge.active { display: inline-block; }
     </style>
 </head>
 <body>
@@ -876,12 +1125,16 @@ function getSidebarHtml(isConnected: boolean): string {
         <div class="status-row">
             <span class="status-label">Connection</span>
             <span id="connection-status" class="status-badge ${isConnected ? 'status-connected' : 'status-disconnected'}">
-                ${isConnected ? 'Connected' : 'Disconnected'}
+                ${isConnected ? 'Attached' : 'Detached'}
             </span>
         </div>
         <div class="status-row">
             <span class="status-label">Events</span>
             <span id="event-count" class="metric-value">0</span>
+        </div>
+        <div class="status-row">
+            <span class="status-label">Filters</span>
+            <span id="filter-stats" class="metric-value" style="font-size: 11px; color: var(--vscode-charts-green);">None</span>
         </div>
     </div>
 
@@ -896,19 +1149,33 @@ function getSidebarHtml(isConnected: boolean): string {
         </div>
     </div>
 
-    <div class="section-title">Quick Actions</div>
+    <div class="section-title">AI Context</div>
+    <div class="context-selector">
+        <label>📊</label>
+        <select id="contextSelect" onchange="onContextChange()">
+            <option value="0">No context</option>
+            <option value="1">Dead Code</option>
+            <option value="2">Performance</option>
+            <option value="3">Call Trace</option>
+            <option value="4">Diagram</option>
+            <option value="5">All Data</option>
+        </select>
+        <span class="context-badge" id="contextBadge">+</span>
+    </div>
+
+    <div class="section-title">Session Actions</div>
     <div class="action-buttons">
-        <button class="action-btn primary" onclick="action('autoIntegrate')">
+        ${!isIntegrated ? `<button class="action-btn primary" onclick="action('autoIntegrate')">
             <span class="icon">⚡</span>
             <span>Auto-Integrate Project</span>
-        </button>
-        <button class="action-btn" onclick="action('${isConnected ? 'disconnect' : 'connect'}')">
+        </button>` : ''}
+        <button id="attach-btn" class="action-btn" onclick="action('${isConnected ? 'disconnect' : 'connect'}')">
             <span class="icon">${isConnected ? '🔴' : '🟢'}</span>
-            <span>${isConnected ? 'Disconnect' : 'Connect to Server'}</span>
+            <span>${isConnected ? 'Detach from Server' : 'Attach to Server'}</span>
         </button>
-        <button class="action-btn" onclick="action('openFullView')">
-            <span class="icon">📊</span>
-            <span>Open Full Trace Viewer</span>
+        <button class="action-btn" onclick="action('manageFilters')">
+            <span class="icon">🔧</span>
+            <span>Manage Filters</span>
         </button>
         <button class="action-btn" onclick="action('generateVideo')">
             <span class="icon">🎬</span>
@@ -943,6 +1210,18 @@ function getSidebarHtml(isConnected: boolean): string {
             vscode.postMessage({ type: 'openFullView', tab: tab });
         }
 
+        function onContextChange() {
+            const select = document.getElementById('contextSelect');
+            const badge = document.getElementById('contextBadge');
+            const value = select.value;
+
+            // Show badge when context is selected
+            badge.classList.toggle('active', value !== '0');
+
+            // Notify VS Code extension
+            vscode.postMessage({ type: 'contextChanged', value: parseInt(value) });
+        }
+
         // Handle messages from extension
         window.addEventListener('message', event => {
             const message = event.data;
@@ -953,12 +1232,19 @@ function getSidebarHtml(isConnected: boolean): string {
                     document.getElementById('stat-depth').textContent = message.depth || 0;
                     break;
                 case 'socketConnected':
-                    document.getElementById('connection-status').textContent = 'Connected';
+                    document.getElementById('connection-status').textContent = 'Attached';
                     document.getElementById('connection-status').className = 'status-badge status-connected';
+                    document.getElementById('attach-btn').innerHTML = '<span class="icon">🔴</span><span>Detach from Server</span>';
+                    document.getElementById('attach-btn').onclick = function() { action('disconnect'); };
                     break;
                 case 'socketDisconnected':
-                    document.getElementById('connection-status').textContent = 'Disconnected';
+                    document.getElementById('connection-status').textContent = 'Detached';
                     document.getElementById('connection-status').className = 'status-badge status-disconnected';
+                    document.getElementById('attach-btn').innerHTML = '<span class="icon">🟢</span><span>Attach to Server</span>';
+                    document.getElementById('attach-btn').onclick = function() { action('connect'); };
+                    break;
+                case 'updateFilters':
+                    document.getElementById('filter-stats').textContent = message.stats || 'None';
                     break;
             }
         });
@@ -967,8 +1253,25 @@ function getSidebarHtml(isConnected: boolean): string {
 </html>`;
 }
 
-function getTraceViewerHtml(): string {
+function getTraceViewerHtml(initialTab?: string): string {
     const isConnected = traceSocketClient?.isConnected() || false;
+    // Map tab names to their data-tab values
+    const tabMap: {[key: string]: string} = {
+        'diagram': 'diagram',
+        'performance': 'performance',
+        'perf': 'performance',
+        'deadcode': 'deadcode',
+        'dead': 'deadcode',
+        'trace': 'trace',
+        'flamegraph': 'flamegraph',
+        'flame': 'flamegraph',
+        'sql': 'sql',
+        'metrics': 'metrics',
+        'distributed': 'distributed',
+        'manim': 'manim',
+        'video': 'manim'
+    };
+    const activeTab = initialTab ? (tabMap[initialTab.toLowerCase()] || 'diagram') : 'diagram';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1260,37 +1563,44 @@ function getTraceViewerHtml(): string {
         <div class="header-title">
             <span>TrueFlow</span>
             <span id="connection-status" class="status-badge ${isConnected ? 'status-connected' : 'status-disconnected'}">
-                ${isConnected ? 'Connected' : 'Disconnected'}
+                ${isConnected ? 'Attached' : 'Detached'}
             </span>
             <span id="event-counter" class="event-counter"></span>
+            <span id="filter-stats" style="font-size: 11px; color: var(--vscode-charts-green); margin-left: 10px;">Filters: ${getFilterStats()}</span>
         </div>
         <div class="header-actions">
-            <button onclick="connectSocket()">Connect</button>
+            <button onclick="connectSocket()">${isConnected ? 'Detach' : 'Attach'}</button>
+            <button onclick="manageFilters()">Manage Filters</button>
             <button onclick="refreshData()">Refresh</button>
         </div>
     </div>
 
     <div class="tab-container">
-        <div class="tab active" data-tab="diagram">Diagram</div>
-        <div class="tab" data-tab="performance">Performance</div>
-        <div class="tab" data-tab="deadcode">Dead Code</div>
-        <div class="tab" data-tab="trace">Call Trace</div>
-        <div class="tab" data-tab="flamegraph">Flamegraph</div>
-        <div class="tab" data-tab="sql">SQL Analyzer</div>
-        <div class="tab" data-tab="metrics">Live Metrics</div>
-        <div class="tab" data-tab="distributed">Distributed</div>
-        <div class="tab" data-tab="manim">Manim Video</div>
+        <div class="tab${activeTab === 'diagram' ? ' active' : ''}" data-tab="diagram">Diagram</div>
+        <div class="tab${activeTab === 'performance' ? ' active' : ''}" data-tab="performance">Performance</div>
+        <div class="tab${activeTab === 'deadcode' ? ' active' : ''}" data-tab="deadcode">Dead Code</div>
+        <div class="tab${activeTab === 'trace' ? ' active' : ''}" data-tab="trace">Call Trace</div>
+        <div class="tab${activeTab === 'flamegraph' ? ' active' : ''}" data-tab="flamegraph">Flamegraph</div>
+        <div class="tab${activeTab === 'sql' ? ' active' : ''}" data-tab="sql">SQL Analyzer</div>
+        <div class="tab${activeTab === 'metrics' ? ' active' : ''}" data-tab="metrics">Live Metrics</div>
+        <div class="tab${activeTab === 'distributed' ? ' active' : ''}" data-tab="distributed">Distributed</div>
+        <div class="tab${activeTab === 'manim' ? ' active' : ''}" data-tab="manim">Manim Video</div>
     </div>
 
     <!-- Diagram Tab -->
-    <div class="content active" id="diagram-content">
+    <div class="content${activeTab === 'diagram' ? ' active' : ''}" id="diagram-content">
         <div class="diagram-toolbar">
             <select id="diagram-type" onchange="updateDiagramType()">
                 <option value="mermaid" selected>Mermaid</option>
                 <option value="plantuml">PlantUML</option>
             </select>
+            <label style="display: flex; align-items: center; gap: 4px; margin-left: 10px;">
+                <input type="checkbox" id="show-dead-call-trees" onchange="toggleDeadCallTrees()">
+                <span style="font-size: 11px;">Show Dead Call Trees</span>
+            </label>
             <button onclick="renderDiagram()">Render</button>
             <button onclick="copyDiagram()">Copy</button>
+            <button onclick="openDiagramInBrowser()" title="Open fullscreen in browser">View Fullscreen</button>
             <span id="diagram-status"></span>
         </div>
         <div class="diagram-container">
@@ -1332,7 +1642,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Performance Tab -->
-    <div class="content" id="performance-content">
+    <div class="content${activeTab === 'performance' ? ' active' : ''}" id="performance-content">
         <table class="data-table">
             <thead>
                 <tr>
@@ -1352,7 +1662,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Dead Code Tab -->
-    <div class="content" id="deadcode-content">
+    <div class="content${activeTab === 'deadcode' ? ' active' : ''}" id="deadcode-content">
         <div id="deadcode-list">
             <div class="placeholder">
                 <p>Run your application with TrueFlow to detect uncovered functions.</p>
@@ -1361,7 +1671,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Call Trace Tab -->
-    <div class="content" id="trace-content">
+    <div class="content${activeTab === 'trace' ? ' active' : ''}" id="trace-content">
         <div id="call-tree" class="call-tree">
             <div class="placeholder">
                 <p>Connect to trace server to see live call traces.</p>
@@ -1370,7 +1680,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Flamegraph Tab -->
-    <div class="content" id="flamegraph-content">
+    <div class="content${activeTab === 'flamegraph' ? ' active' : ''}" id="flamegraph-content">
         <div class="flamegraph-container">
             <div class="flamegraph-canvas" id="flamegraph">
                 <div class="placeholder">
@@ -1381,7 +1691,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- SQL Analyzer Tab -->
-    <div class="content" id="sql-content">
+    <div class="content${activeTab === 'sql' ? ' active' : ''}" id="sql-content">
         <h3>SQL Query Analyzer</h3>
         <p>SQL queries and potential N+1 problems will appear here.</p>
         <div id="sql-queries">
@@ -1392,7 +1702,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Live Metrics Tab -->
-    <div class="content" id="metrics-content">
+    <div class="content${activeTab === 'metrics' ? ' active' : ''}" id="metrics-content">
         <div class="metrics-grid">
             <div class="metric-card">
                 <div class="metric-value" id="metric-events">0</div>
@@ -1414,7 +1724,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Distributed Tab -->
-    <div class="content" id="distributed-content">
+    <div class="content${activeTab === 'distributed' ? ' active' : ''}" id="distributed-content">
         <h3>Distributed Architecture</h3>
         <p>WebSocket, gRPC, Kafka, and other distributed calls will appear here.</p>
         <div id="distributed-calls">
@@ -1425,7 +1735,7 @@ function getTraceViewerHtml(): string {
     </div>
 
     <!-- Manim Video Tab -->
-    <div class="content" id="manim-content">
+    <div class="content${activeTab === 'manim' ? ' active' : ''}" id="manim-content">
         <h3>Manim Video</h3>
         <p>Use "TrueFlow: Generate Manim Video" command to create visualizations.</p>
         <div id="video-container">
@@ -1451,6 +1761,9 @@ function getTraceViewerHtml(): string {
         let eventsPerSecond = 0;
         let performanceData = [];
         let callTrace = [];
+        let showDeadCallTrees = false;
+        let activeParticipants = new Set();  // Modules that have at least one call
+        let allDefinedFunctions = new Set(); // All functions from static analysis (AST)
 
         // Initialize Mermaid
         mermaid.initialize({
@@ -1523,8 +1836,170 @@ function getTraceViewerHtml(): string {
             vscode.postMessage({ type: 'info', message: 'Diagram code copied!' });
         }
 
+        function openDiagramInBrowser() {
+            const code = document.getElementById('diagram-code').value;
+            const diagramType = document.getElementById('diagram-type').value;
+            const showingDeadTrees = document.getElementById('show-dead-call-trees').checked;
+
+            // Build a standalone HTML page with the diagram using string concatenation
+            // to avoid nested template literal issues
+            var htmlParts = [];
+            htmlParts.push('<!DOCTYPE html>');
+            htmlParts.push('<html lang="en">');
+            htmlParts.push('<head>');
+            htmlParts.push('<meta charset="UTF-8">');
+            htmlParts.push('<meta name="viewport" content="width=device-width, initial-scale=1.0">');
+            htmlParts.push('<title>TrueFlow Sequence Diagram - Fullscreen</title>');
+            htmlParts.push('<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"><\\/script>');
+            htmlParts.push('<style>');
+            htmlParts.push('* { margin: 0; padding: 0; box-sizing: border-box; }');
+            htmlParts.push('body { background: #1e1e1e; color: #d4d4d4; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; min-height: 100vh; display: flex; flex-direction: column; }');
+            htmlParts.push('.header { background: #252526; padding: 12px 20px; border-bottom: 1px solid #3c3c3c; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }');
+            htmlParts.push('.header h1 { font-size: 16px; font-weight: 500; color: #569cd6; }');
+            htmlParts.push('.header-info { font-size: 12px; color: #808080; }');
+            htmlParts.push('.header-info span { margin-left: 15px; padding: 3px 8px; background: #3c3c3c; border-radius: 3px; }');
+            htmlParts.push('.controls { display: flex; gap: 10px; align-items: center; }');
+            htmlParts.push('.controls button { background: #0e639c; color: white; border: none; padding: 6px 12px; border-radius: 3px; cursor: pointer; font-size: 12px; }');
+            htmlParts.push('.controls button:hover { background: #1177bb; }');
+            htmlParts.push('.controls button.secondary { background: #3c3c3c; }');
+            htmlParts.push('.controls button.secondary:hover { background: #4c4c4c; }');
+            htmlParts.push('.diagram-container { flex: 1; overflow: auto; padding: 20px; display: flex; justify-content: center; align-items: flex-start; }');
+            htmlParts.push('.mermaid { background: #2d2d2d; padding: 20px; border-radius: 8px; min-width: 300px; }');
+            htmlParts.push('.mermaid svg { max-width: 100%; height: auto; }');
+            htmlParts.push('.zoom-controls { position: fixed; bottom: 20px; right: 20px; display: flex; gap: 5px; background: #252526; padding: 8px; border-radius: 5px; border: 1px solid #3c3c3c; }');
+            htmlParts.push('.zoom-controls button { width: 32px; height: 32px; background: #3c3c3c; border: none; color: white; border-radius: 3px; cursor: pointer; font-size: 16px; }');
+            htmlParts.push('.zoom-controls button:hover { background: #4c4c4c; }');
+            htmlParts.push('.zoom-level { padding: 0 10px; line-height: 32px; font-size: 12px; }');
+            htmlParts.push('@media print { .header, .zoom-controls { display: none; } body { background: white; } .diagram-container { padding: 0; } .mermaid { background: white; } }');
+            htmlParts.push('</style>');
+            htmlParts.push('</head>');
+            htmlParts.push('<body>');
+            htmlParts.push('<div class="header">');
+            htmlParts.push('<div>');
+            htmlParts.push('<h1>TrueFlow Sequence Diagram</h1>');
+            htmlParts.push('<div class="header-info">');
+            htmlParts.push('<span id="diagram-type-label">Type: ' + (diagramType === 'mermaid' ? 'Mermaid' : 'PlantUML') + '</span>');
+            htmlParts.push('<span id="dead-trees-label">' + (showingDeadTrees ? 'Including Dead Call Trees' : 'Runtime Calls Only') + '</span>');
+            htmlParts.push('<span id="generated-label">Generated: ' + new Date().toLocaleString() + '</span>');
+            htmlParts.push('</div>');
+            htmlParts.push('</div>');
+            htmlParts.push('<div class="controls">');
+            htmlParts.push('<button onclick="window.print()" class="secondary">Print / Save PDF</button>');
+            htmlParts.push('<button onclick="downloadSVG()">Download SVG</button>');
+            htmlParts.push('</div>');
+            htmlParts.push('</div>');
+            htmlParts.push('<div class="diagram-container" id="diagram-container">');
+            htmlParts.push('<div class="mermaid" id="mermaid-diagram">');
+            htmlParts.push(code.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+            htmlParts.push('</div>');
+            htmlParts.push('</div>');
+            htmlParts.push('<div class="zoom-controls">');
+            htmlParts.push('<button onclick="zoomOut()">-</button>');
+            htmlParts.push('<span class="zoom-level" id="zoom-level">100%</span>');
+            htmlParts.push('<button onclick="zoomIn()">+</button>');
+            htmlParts.push('<button onclick="resetZoom()">Reset</button>');
+            htmlParts.push('</div>');
+            htmlParts.push('<script>');
+            htmlParts.push('var currentZoom = 1;');
+            htmlParts.push('var container = document.getElementById("diagram-container");');
+            htmlParts.push('var diagram = document.getElementById("mermaid-diagram");');
+            htmlParts.push('mermaid.initialize({ startOnLoad: true, theme: "dark", securityLevel: "loose", sequence: { diagramMarginX: 50, diagramMarginY: 10, actorMargin: 50, width: 150, height: 65, boxMargin: 10, boxTextMargin: 5, noteMargin: 10, messageMargin: 35, mirrorActors: true, useMaxWidth: false } });');
+            htmlParts.push('function zoomIn() { currentZoom = Math.min(currentZoom + 0.1, 3); applyZoom(); }');
+            htmlParts.push('function zoomOut() { currentZoom = Math.max(currentZoom - 0.1, 0.3); applyZoom(); }');
+            htmlParts.push('function resetZoom() { currentZoom = 1; applyZoom(); }');
+            htmlParts.push('function applyZoom() { diagram.style.transform = "scale(" + currentZoom + ")"; diagram.style.transformOrigin = "top center"; document.getElementById("zoom-level").textContent = Math.round(currentZoom * 100) + "%"; }');
+            htmlParts.push('function downloadSVG() { var svg = diagram.querySelector("svg"); if (!svg) { alert("No diagram rendered yet"); return; } var svgData = new XMLSerializer().serializeToString(svg); var blob = new Blob([svgData], { type: "image/svg+xml" }); var url = URL.createObjectURL(blob); var a = document.createElement("a"); a.href = url; a.download = "trueflow-sequence-diagram.svg"; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url); }');
+            htmlParts.push('document.addEventListener("keydown", function(e) { if (e.key === "+" || e.key === "=") zoomIn(); if (e.key === "-") zoomOut(); if (e.key === "0") resetZoom(); if (e.key === "p" && e.ctrlKey) { e.preventDefault(); window.print(); } });');
+            htmlParts.push('<\\/script>');
+            htmlParts.push('</body>');
+            htmlParts.push('</html>');
+            var htmlContent = htmlParts.join('\\n');
+
+            // Create a Blob and open in new tab
+            var blob = new Blob([htmlContent], { type: 'text/html' });
+            var blobUrl = URL.createObjectURL(blob);
+            window.open(blobUrl, '_blank');
+
+            // Clean up the URL after a short delay
+            setTimeout(function() { URL.revokeObjectURL(blobUrl); }, 1000);
+
+            vscode.postMessage({ type: 'info', message: 'Diagram opened in browser!' });
+        }
+
+        function toggleDeadCallTrees() {
+            showDeadCallTrees = document.getElementById('show-dead-call-trees').checked;
+            updateDiagramFromTrace();
+        }
+
+        // Generate diagram showing only active participants (with at least one call)
+        // and optionally dead call trees from AST analysis
+        function updateDiagramFromTrace() {
+            if (callTrace.length === 0) {
+                const noDataMessage = showDeadCallTrees
+                    ? 'sequenceDiagram\\n    Note over System: No trace data yet.\\n    Note over System: Dead call trees will show AST-based uncalled functions.\\n    Note over System: Start a traced process to see live data.'
+                    : 'sequenceDiagram\\n    Note over System: No trace data yet.\\n    Note over System: Start a traced Python process to see the diagram.\\n    Note over System: Enable Show Dead Call Trees for static analysis.';
+                document.getElementById('diagram-code').value = noDataMessage;
+                renderDiagram();
+                return;
+            }
+
+            // Build participants only from modules that have actual calls
+            const activeModules = new Set();
+            const calls = [];
+
+            for (const event of callTrace) {
+                if (event.type === 'call') {
+                    const module = event.module || '__main__';
+                    activeModules.add(module);
+                    calls.push(event);
+                }
+            }
+
+            // Build the Mermaid sequence diagram
+            let diagram = 'sequenceDiagram\\n';
+
+            // Add only ACTIVE participants (modules with at least one call)
+            for (const module of activeModules) {
+                const safeName = module.replace(/[^a-zA-Z0-9_]/g, '_');
+                diagram += '    participant ' + safeName + ' as ' + module + '\\n';
+            }
+
+            // Add calls between participants
+            let prevModule = null;
+            for (const event of calls.slice(-30)) { // Last 30 calls
+                const module = (event.module || '__main__').replace(/[^a-zA-Z0-9_]/g, '_');
+                const func = event.function || 'unknown';
+
+                if (prevModule && prevModule !== module) {
+                    diagram += '    ' + prevModule + '->>' + module + ': ' + func + '()\\n';
+                } else if (prevModule === module) {
+                    diagram += '    ' + module + '->>+' + module + ': ' + func + '()\\n';
+                    diagram += '    ' + module + '-->>-' + module + ': return\\n';
+                }
+                prevModule = module;
+            }
+
+            // If showDeadCallTrees is enabled, add note about dead code
+            if (showDeadCallTrees && allDefinedFunctions.size > 0) {
+                const deadFunctions = [...allDefinedFunctions].filter(f => !activeParticipants.has(f));
+                if (deadFunctions.length > 0) {
+                    diagram += '    Note over System: Dead functions (never called):\\n';
+                    for (const func of deadFunctions.slice(0, 10)) {
+                        diagram += '    Note over System: - ' + func + '\\n';
+                    }
+                }
+            }
+
+            document.getElementById('diagram-code').value = diagram;
+            renderDiagram();
+        }
+
         function connectSocket() {
             vscode.postMessage({ type: 'connect' });
+        }
+
+        function manageFilters() {
+            vscode.postMessage({ type: 'manageFilters' });
         }
 
         function refreshData() {
@@ -1631,13 +2106,17 @@ function getTraceViewerHtml(): string {
 
             switch (message.type) {
                 case 'socketConnected':
-                    document.getElementById('connection-status').textContent = 'Connected';
+                    document.getElementById('connection-status').textContent = 'Attached';
                     document.getElementById('connection-status').className = 'status-badge status-connected';
                     break;
 
                 case 'socketDisconnected':
-                    document.getElementById('connection-status').textContent = 'Disconnected';
+                    document.getElementById('connection-status').textContent = 'Detached';
                     document.getElementById('connection-status').className = 'status-badge status-disconnected';
+                    break;
+
+                case 'updateFilters':
+                    document.getElementById('filter-stats').textContent = 'Filters: ' + (message.stats || 'None');
                     break;
 
                 case 'traceEvent':
@@ -1653,10 +2132,20 @@ function getTraceViewerHtml(): string {
                     lastEventTime = now;
                     document.getElementById('metric-rate').textContent = eventsPerSecond;
 
+                    // Track active participants (modules with calls)
+                    if (message.event.type === 'call' && message.event.module) {
+                        activeParticipants.add(message.event.module + '.' + message.event.function);
+                    }
+
                     // Add to call trace
                     callTrace.push(message.event);
                     if (callTrace.length > 1000) callTrace.shift();
                     updateCallTrace(callTrace);
+
+                    // Update diagram with active participants only (throttled)
+                    if (eventCount % 10 === 0) {
+                        updateDiagramFromTrace();
+                    }
                     break;
 
                 case 'updatePerformance':
@@ -1670,6 +2159,25 @@ function getTraceViewerHtml(): string {
 
                 case 'newTrace':
                     document.getElementById('diagram-status').textContent = 'New trace: ' + message.path;
+                    break;
+
+                case 'selectTab':
+                    // Programmatically select a tab
+                    const targetTab = message.tab;
+                    if (targetTab) {
+                        // Deselect all tabs
+                        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                        document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
+
+                        // Select the target tab
+                        const tabEl = document.querySelector('.tab[data-tab="' + targetTab + '"]');
+                        const contentEl = document.getElementById(targetTab + '-content');
+                        if (tabEl) tabEl.classList.add('active');
+                        if (contentEl) contentEl.classList.add('active');
+
+                        // Show zoom controls only for diagram tab
+                        document.getElementById('zoom-controls').classList.toggle('visible', targetTab === 'diagram');
+                    }
                     break;
             }
         });

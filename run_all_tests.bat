@@ -72,7 +72,7 @@ echo.
 REM ============================================================================
 REM Section 1: Runtime Instrumentor Unit Tests (18 tests)
 REM ============================================================================
-echo %YELLOW%[1/9] Running Runtime Instrumentor Unit Tests...%RESET%
+echo %YELLOW%[1/11] Running Runtime Instrumentor Unit Tests...%RESET%
 echo ------------------------------------------------------------------------
 python -m pytest tests/test_runtime_instrumentor_unit.py -v --tb=short 2>&1
 if errorlevel 1 (
@@ -88,7 +88,7 @@ REM ============================================================================
 REM Section 2: Error Handling Tests (10 tests)
 REM ============================================================================
 echo.
-echo %YELLOW%[2/9] Running Error Handling Tests...%RESET%
+echo %YELLOW%[2/11] Running Error Handling Tests...%RESET%
 echo ------------------------------------------------------------------------
 python -m pytest tests/test_error_handling.py -v --tb=short 2>&1
 if errorlevel 1 (
@@ -104,7 +104,7 @@ REM ============================================================================
 REM Section 3: End-to-End Tests (11 tests)
 REM ============================================================================
 echo.
-echo %YELLOW%[3/9] Running End-to-End Tests...%RESET%
+echo %YELLOW%[3/11] Running End-to-End Tests...%RESET%
 echo ------------------------------------------------------------------------
 python -m pytest tests/test_end_to_end.py -v --tb=short 2>&1
 if errorlevel 1 (
@@ -120,7 +120,7 @@ REM ============================================================================
 REM Section 4: Protocol Detection Tests (4 tests)
 REM ============================================================================
 echo.
-echo %YELLOW%[4/9] Running Protocol Detection Tests...%RESET%
+echo %YELLOW%[4/11] Running Protocol Detection Tests...%RESET%
 echo ------------------------------------------------------------------------
 python -m pytest tests/test_protocol_detection_integration.py -v --tb=short 2>&1
 if errorlevel 1 (
@@ -136,7 +136,7 @@ REM ============================================================================
 REM Section 5: AI Explanation Tests (22 tests)
 REM ============================================================================
 echo.
-echo %YELLOW%[5/9] Running AI Explanation Tests...%RESET%
+echo %YELLOW%[5/11] Running AI Explanation Tests...%RESET%
 echo ------------------------------------------------------------------------
 python -m pytest tests/test_ai_explanation.py -v --tb=short 2>&1
 if errorlevel 1 (
@@ -152,7 +152,7 @@ REM ============================================================================
 REM Section 6: Manim Frame Bounds + Animation Pacing Tests (43 tests)
 REM ============================================================================
 echo.
-echo %YELLOW%[6/9] Running Manim Frame Bounds + Animation Pacing Tests...%RESET%
+echo %YELLOW%[6/11] Running Manim Frame Bounds + Animation Pacing Tests...%RESET%
 echo ------------------------------------------------------------------------
 python -m pytest manim_visualizer/tests/test_frame_bounds_validation.py manim_visualizer/tests/test_animation_pacing.py -v --tb=short 2>&1
 if errorlevel 1 (
@@ -168,7 +168,7 @@ REM ============================================================================
 REM Section 7: Manim Visual Regression Tests (15 tests)
 REM ============================================================================
 echo.
-echo %YELLOW%[7/9] Running Visual Regression Tests...%RESET%
+echo %YELLOW%[7/11] Running Visual Regression Tests...%RESET%
 echo ------------------------------------------------------------------------
 python -m pytest manim_visualizer/tests/test_visual_regression.py -v --tb=short 2>&1
 if errorlevel 1 (
@@ -184,7 +184,7 @@ REM ============================================================================
 REM Section 8: Manim E2E Regression Tests (22 tests)
 REM ============================================================================
 echo.
-echo %YELLOW%[8/9] Running E2E Regression Tests...%RESET%
+echo %YELLOW%[8/11] Running E2E Regression Tests...%RESET%
 echo ------------------------------------------------------------------------
 python -m pytest manim_visualizer/tests/test_e2e_regression.py -v --tb=short 2>&1
 if errorlevel 1 (
@@ -200,9 +200,41 @@ REM ============================================================================
 REM Section 9: Base Trace Visualizer Tests (18 tests)
 REM ============================================================================
 echo.
-echo %YELLOW%[9/9] Running Base Trace Visualizer Tests...%RESET%
+echo %YELLOW%[9/11] Running Base Trace Visualizer Tests...%RESET%
 echo ------------------------------------------------------------------------
 python -m pytest manim_visualizer/tests/test_base_trace_visualizer.py -v --tb=short 2>&1
+if errorlevel 1 (
+    echo %RED%Some tests failed%RESET%
+    set /a TOTAL_FAILED+=1
+) else (
+    echo %GREEN%All tests passed%RESET%
+    set /a TOTAL_PASSED+=1
+)
+set /a TEST_SECTIONS+=1
+
+REM ============================================================================
+REM Section 10: MCP Hub Tests (35 tests)
+REM ============================================================================
+echo.
+echo %YELLOW%[10/11] Running MCP Hub Tests...%RESET%
+echo ------------------------------------------------------------------------
+python -m pytest tests/test_mcp_hub.py -v --tb=short 2>&1
+if errorlevel 1 (
+    echo %RED%Some tests failed%RESET%
+    set /a TOTAL_FAILED+=1
+) else (
+    echo %GREEN%All tests passed%RESET%
+    set /a TOTAL_PASSED+=1
+)
+set /a TEST_SECTIONS+=1
+
+REM ============================================================================
+REM Section 11: llama.cpp Installation Tests (36 tests)
+REM ============================================================================
+echo.
+echo %YELLOW%[11/11] Running llama.cpp Installation Tests...%RESET%
+echo ------------------------------------------------------------------------
+python -m pytest tests/test_llama_cpp_installation.py -v --tb=short 2>&1
 if errorlevel 1 (
     echo %RED%Some tests failed%RESET%
     set /a TOTAL_FAILED+=1
@@ -234,8 +266,10 @@ echo   6. Frame Bounds + Pacing:      43 tests
 echo   7. Visual Regression:          15 tests
 echo   8. E2E Regression:             22 tests
 echo   9. Base Trace Visualizer:      18 tests
+echo  10. MCP Hub:                    35 tests
+echo  11. llama.cpp Installation:     36 tests
 echo   ----------------------------------
-echo   TOTAL:                        ~163 tests
+echo   TOTAL:                        ~234 tests
 echo.
 echo Quick commands:
 echo   python -m pytest tests/ -v                    # All root tests

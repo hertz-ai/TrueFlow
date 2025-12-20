@@ -337,7 +337,8 @@ class ManimAutoRenderer(
             val projectPathPosix = projectPath.replace("\\", "/")
 
             // Get visualizer directory from PluginPaths (single source of truth)
-            val visualizerDir = PluginPaths.getManimVisualizerDir(project)
+            // NOTE: Visualizer files (ultimate_architecture_viz.py, etc.) are in runtime_injector, not a separate manim_visualizer dir
+            val visualizerDir = PluginPaths.getRuntimeInjectorDir(project)
             val visualizerPathPosix = PluginPaths.toPosixPath(visualizerDir)
 
             // Build command to invoke AdvancedOperationScene visualizer

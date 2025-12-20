@@ -1,1 +1,1 @@
-rootProject.name = "SequenceDiagramPython"
+rootProject.name = "TrueFlow"

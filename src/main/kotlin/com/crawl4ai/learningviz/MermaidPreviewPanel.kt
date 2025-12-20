@@ -1,10 +1,14 @@
 package com.crawl4ai.learningviz
 
+import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.project.Project
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefBrowserBase
 import com.intellij.ui.jcef.JBCefJSQuery
 import java.awt.BorderLayout
+import java.io.File
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 import javax.swing.JPanel
 
 /**
@@ -57,6 +61,261 @@ class MermaidPreviewPanel(private val project: Project) : JPanel(BorderLayout())
      * Get the current Mermaid code.
      */
     fun getMermaidCode(): String = currentMermaidCode
+
+    /**
+     * Open the current diagram in the default browser for fullscreen viewing.
+     * @param showDeadCallTrees Whether dead call trees are being shown
+     * @param diagramType The type of diagram (mermaid or plantuml)
+     */
+    fun openInBrowser(showDeadCallTrees: Boolean = false, diagramType: String = "mermaid") {
+        if (currentMermaidCode.isBlank()) {
+            PluginLogger.warn("No diagram to open in browser")
+            return
+        }
+
+        val cleanCode = currentMermaidCode
+            .replace("```mermaid", "")
+            .replace("```", "")
+            .trim()
+
+        val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+        val deadTreesLabel = if (showDeadCallTrees) "Including Dead Call Trees" else "Runtime Calls Only"
+
+        val fullscreenHtml = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrueFlow Sequence Diagram - Fullscreen</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            background: #252526;
+            padding: 12px 20px;
+            border-bottom: 1px solid #3c3c3c;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .header h1 {
+            font-size: 16px;
+            font-weight: 500;
+            color: #569cd6;
+        }
+        .header-info {
+            font-size: 12px;
+            color: #808080;
+        }
+        .header-info span {
+            margin-left: 15px;
+            padding: 3px 8px;
+            background: #3c3c3c;
+            border-radius: 3px;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .controls button {
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .controls button:hover {
+            background: #1177bb;
+        }
+        .controls button.secondary {
+            background: #3c3c3c;
+        }
+        .controls button.secondary:hover {
+            background: #4c4c4c;
+        }
+        .diagram-container {
+            flex: 1;
+            overflow: auto;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+        }
+        .mermaid {
+            background: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            min-width: 300px;
+        }
+        .mermaid svg {
+            max-width: 100%;
+            height: auto;
+        }
+        .zoom-controls {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            gap: 5px;
+            background: #252526;
+            padding: 8px;
+            border-radius: 5px;
+            border: 1px solid #3c3c3c;
+        }
+        .zoom-controls button {
+            width: 32px;
+            height: 32px;
+            background: #3c3c3c;
+            border: none;
+            color: white;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .zoom-controls button:hover {
+            background: #4c4c4c;
+        }
+        .zoom-level {
+            padding: 0 10px;
+            line-height: 32px;
+            font-size: 12px;
+        }
+        @media print {
+            .header, .zoom-controls { display: none; }
+            body { background: white; }
+            .diagram-container { padding: 0; }
+            .mermaid { background: white; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>TrueFlow Sequence Diagram</h1>
+            <div class="header-info">
+                <span>Type: ${if (diagramType == "mermaid") "Mermaid" else "PlantUML"}</span>
+                <span>$deadTreesLabel</span>
+                <span>Generated: $timestamp</span>
+            </div>
+        </div>
+        <div class="controls">
+            <button onclick="window.print()" class="secondary">Print / Save PDF</button>
+            <button onclick="downloadSVG()">Download SVG</button>
+        </div>
+    </div>
+    <div class="diagram-container" id="diagram-container">
+        <div class="mermaid" id="mermaid-diagram">
+$cleanCode
+        </div>
+    </div>
+    <div class="zoom-controls">
+        <button onclick="zoomOut()">-</button>
+        <span class="zoom-level" id="zoom-level">100%</span>
+        <button onclick="zoomIn()">+</button>
+        <button onclick="resetZoom()">Reset</button>
+    </div>
+    <script>
+        let currentZoom = 1;
+        const diagram = document.getElementById('mermaid-diagram');
+
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            securityLevel: 'loose',
+            sequence: {
+                diagramMarginX: 50,
+                diagramMarginY: 10,
+                actorMargin: 50,
+                width: 150,
+                height: 65,
+                boxMargin: 10,
+                boxTextMargin: 5,
+                noteMargin: 10,
+                messageMargin: 35,
+                mirrorActors: true,
+                useMaxWidth: false
+            }
+        });
+
+        function zoomIn() {
+            currentZoom = Math.min(currentZoom + 0.1, 3);
+            applyZoom();
+        }
+
+        function zoomOut() {
+            currentZoom = Math.max(currentZoom - 0.1, 0.3);
+            applyZoom();
+        }
+
+        function resetZoom() {
+            currentZoom = 1;
+            applyZoom();
+        }
+
+        function applyZoom() {
+            diagram.style.transform = 'scale(' + currentZoom + ')';
+            diagram.style.transformOrigin = 'top center';
+            document.getElementById('zoom-level').textContent = Math.round(currentZoom * 100) + '%';
+        }
+
+        function downloadSVG() {
+            const svg = diagram.querySelector('svg');
+            if (!svg) {
+                alert('No diagram rendered yet');
+                return;
+            }
+            const svgData = new XMLSerializer().serializeToString(svg);
+            const blob = new Blob([svgData], { type: 'image/svg+xml' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'trueflow-sequence-diagram.svg';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.key === '+' || e.key === '=') zoomIn();
+            if (e.key === '-') zoomOut();
+            if (e.key === '0') resetZoom();
+            if (e.key === 'p' && e.ctrlKey) { e.preventDefault(); window.print(); }
+        });
+    </script>
+</body>
+</html>
+        """.trimIndent()
+
+        try {
+            // Create a temporary HTML file
+            val tempDir = System.getProperty("java.io.tmpdir")
+            val tempFile = File(tempDir, "trueflow-diagram-${System.currentTimeMillis()}.html")
+            tempFile.writeText(fullscreenHtml)
+            tempFile.deleteOnExit()
+
+            // Open in browser
+            BrowserUtil.browse(tempFile.toURI())
+            PluginLogger.info("Opened diagram in browser: ${tempFile.absolutePath}")
+        } catch (e: Exception) {
+            PluginLogger.error("Failed to open diagram in browser: ${e.message}")
+        }
+    }
 
     /**
      * Generate the HTML page with Mermaid.js for rendering.

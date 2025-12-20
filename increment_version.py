@@ -44,7 +44,7 @@ def update_file(filepath, pattern, replacement_template):
 def main():
     plugin_dir = Path(__file__).parent
 
-    # Update gradle.properties (single source of truth)
+    # Update gradle.properties (single source of truth for PyCharm)
     gradle_props = plugin_dir / "gradle.properties"
     new_version = update_file(
         gradle_props,
@@ -56,9 +56,20 @@ def main():
         print("[FAIL] Could not update gradle.properties")
         sys.exit(1)
 
+    # Update VS Code extension package.json
+    vscode_package = plugin_dir / "vscode-extension" / "package.json"
+    if vscode_package.exists():
+        vscode_version = update_file(
+            vscode_package,
+            r'"version": "([0-9]+\.[0-9]+\.[0-9]+)"',
+            '"version": "{0}"'
+        )
+        if vscode_version:
+            print(f"[OK] VS Code extension version: {vscode_version}")
+
     print(f"\n[OK] Version incremented to: {new_version}")
-    print(f"[OK] Artifact will be named: pycharm-plugin-{new_version}.jar")
-    print(f"[OK] PluginLogger.kt reads version from gradle.properties at runtime")
+    print(f"[OK] PyCharm artifact: pycharm-plugin-{new_version}.jar")
+    print(f"[OK] VS Code artifact: trueflow-{new_version}.vsix")
 
 if __name__ == "__main__":
     main()

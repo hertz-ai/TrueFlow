@@ -68,3 +68,6 @@ Thumbs.db
 .env
 *.pem
 *.key
+/.pycharm_plugin/
+/vscode-extension/out/
+/vscode-extension/runtime_injector/

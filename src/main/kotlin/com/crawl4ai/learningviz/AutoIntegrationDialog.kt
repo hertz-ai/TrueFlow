@@ -60,8 +60,8 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
             selectTraceDirectory()
         }
 
-        // Set default trace directory
-        traceDirectoryField.text = "${project.basePath}/traces"
+        // Set default trace directory to .pycharm_plugin/traces
+        traceDirectoryField.text = "${project.basePath}/.pycharm_plugin/traces"
     }
 
     override fun createCenterPanel(): JComponent {

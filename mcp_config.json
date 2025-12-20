@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "trueflow-hub": {
+      "command": "python",
+      "args": [
+        "src/main/resources/runtime_injector/trueflow_mcp_hub.py",
+        "--start"
+      ],
+      "description": "Unified TrueFlow MCP Hub - single instance coordinates all IDE projects via WebSocket pub/sub",
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

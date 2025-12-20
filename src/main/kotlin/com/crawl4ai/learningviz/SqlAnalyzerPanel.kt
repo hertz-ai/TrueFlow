@@ -185,6 +185,11 @@ class SqlAnalyzerPanel(private val project: Project) : JPanel(BorderLayout()) {
             text
         }
     }
+
+    /**
+     * Get current SQL analysis data for snapshot export.
+     */
+    fun getSqlData(): SqlAnalysisData? = sqlData
 }
 
 /**
