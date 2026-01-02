@@ -11,7 +11,14 @@ import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPanel
 import com.intellij.ui.components.JBScrollPane
+import com.intellij.ui.components.JBTabbedPane
+import com.intellij.ui.jcef.JBCefApp
+import com.intellij.ui.jcef.JBCefBrowser
+import com.intellij.ui.jcef.JBCefBrowserBase
+import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.util.ui.JBUI
+import com.google.gson.Gson
+import com.google.gson.JsonObject
 import java.awt.BorderLayout
 import java.awt.Desktop
 import java.awt.GridBagConstraints
@@ -24,14 +31,15 @@ import javax.swing.*
 /**
  * Panel for displaying and playing Manim animations.
  *
- * Since embedding video players in IntelliJ plugins is complex and requires
- * JavaFX dependencies, this panel instead:
- * 1. Lists generated Manim videos with timestamps
- * 2. Shows video metadata (duration, resolution, file size)
- * 3. Opens videos in system default player
- * 4. Auto-refreshes when new videos are detected via VFS listener
+ * Features:
+ * 1. Video List Tab: Lists generated Manim videos with timestamps
+ * 2. Interactive Explorer Tab: Three.js visualization of execution flow with dead branch analysis
  *
- * This approach is more reliable and works on all platforms.
+ * The Interactive Explorer shows:
+ * - Executed functions (green)
+ * - Dead/uncovered functions (red)
+ * - Branch points with conditions
+ * - "Why Not Covered" analysis explaining why code wasn't executed
  */
 class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(BorderLayout()), Disposable {
 
@@ -39,6 +47,14 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     private val videoList = JList(videoListModel)
     private val infoPanel = JBPanel<JBPanel<*>>(GridBagLayout())
     private val statusLabel = JBLabel("No videos found")
+
+    // Interactive Explorer (JCEF browser)
+    private var interactiveBrowser: JBCefBrowser? = null
+    private var jsQuery: JBCefJSQuery? = null
+    private val gson = Gson()
+
+    // Data for interactive visualization
+    private var visualizationData: InteractiveVisualizationData? = null
 
     // Manim output directory (use PluginPaths for single source of truth)
     private val manimOutputDir = PluginPaths.getVideosDir(project)
@@ -59,6 +75,57 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             return "${dateFormat.format(timestamp)} - $name (${sizeKB}KB)"
         }
     }
+
+    /**
+     * Data structure for the interactive Three.js visualization.
+     * Contains functions, branches, call graph, and coverage analysis.
+     */
+    data class InteractiveVisualizationData(
+        val functions: Map<String, FunctionInfo>,
+        val callGraph: Map<String, List<String>>,
+        val coveredFunctions: List<String>,
+        val deadFunctions: List<String>,
+        val whyNotCovered: Map<String, WhyNotCoveredInfo>
+    )
+
+    data class FunctionInfo(
+        val name: String,
+        val line: Int,
+        val file: String? = null,
+        val branches: List<BranchInfo> = emptyList(),
+        val callCount: Int = 0
+    )
+
+    data class BranchInfo(
+        val type: String,  // "if", "elif", "else", "try", "except", "for", "while"
+        val line: Int,
+        val condition: String
+    )
+
+    data class WhyNotCoveredInfo(
+        val function: String,
+        val rootCause: String,  // "NO_CALL_SITES", "CALLER_NOT_EXECUTED", "BRANCH_NOT_TAKEN"
+        val rootCauseDetail: WhyNotCoveredDetail? = null,
+        val reasons: List<WhyNotCoveredReason> = emptyList()
+    )
+
+    data class WhyNotCoveredDetail(
+        val type: String,
+        val caller: String? = null,
+        val line: Int? = null,
+        val branchType: String? = null,
+        val branchCondition: String? = null,
+        val branchLine: Int? = null
+    )
+
+    data class WhyNotCoveredReason(
+        val type: String,
+        val caller: String? = null,
+        val line: Int? = null,
+        val branchType: String? = null,
+        val branchCondition: String? = null,
+        val explanation: String? = null
+    )
 
     init {
         border = JBUI.Borders.empty(10)
@@ -114,9 +181,40 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
 
     override fun dispose() {
         fileWatcherConnection?.disconnect()
+        jsQuery?.dispose()
+        interactiveBrowser?.dispose()
     }
 
     private fun createUI() {
+        // Create tabbed pane with two views
+        val tabbedPane = JBTabbedPane()
+
+        // Tab 1: Video List (existing functionality)
+        val videoListPanel = createVideoListPanel()
+        tabbedPane.addTab("Video List", videoListPanel)
+
+        // Tab 2: Interactive Explorer (new Three.js visualization)
+        val interactivePanel = createInteractiveExplorerPanel()
+        tabbedPane.addTab("Interactive Explorer", interactivePanel)
+
+        add(tabbedPane, BorderLayout.CENTER)
+
+        // Listen for tab changes to load data when Interactive Explorer is selected
+        tabbedPane.addChangeListener { e ->
+            if (tabbedPane.selectedIndex == 1) {
+                // Interactive Explorer tab selected - refresh visualization
+                refreshInteractiveVisualization()
+            }
+        }
+    }
+
+    /**
+     * Creates the Video List panel (existing functionality).
+     */
+    private fun createVideoListPanel(): JPanel {
+        val panel = JBPanel<JBPanel<*>>(BorderLayout())
+        panel.border = JBUI.Borders.empty(10)
+
         // Top: Status and refresh button
         val topPanel = JBPanel<JBPanel<*>>(BorderLayout())
         topPanel.add(statusLabel, BorderLayout.WEST)
@@ -125,7 +223,7 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         refreshButton.addActionListener { scanForVideos() }
         topPanel.add(refreshButton, BorderLayout.EAST)
 
-        add(topPanel, BorderLayout.NORTH)
+        panel.add(topPanel, BorderLayout.NORTH)
 
         // Left: Video list
         videoList.selectionMode = ListSelectionModel.SINGLE_SELECTION
@@ -153,13 +251,270 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         // Split pane
         val splitPane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, listScrollPane, infoScrollPane)
         splitPane.resizeWeight = 0.4
-        add(splitPane, BorderLayout.CENTER)
+        panel.add(splitPane, BorderLayout.CENTER)
 
         // Bottom: Instructions
         val instructions = JBLabel("<html>Manim animations are generated every 5 seconds when trace data is received.<br>" +
                 "<b>Double-click</b> a video to play, or select and press 'Play' button.</html>")
         instructions.border = JBUI.Borders.empty(10, 0, 0, 0)
-        add(instructions, BorderLayout.SOUTH)
+        panel.add(instructions, BorderLayout.SOUTH)
+
+        return panel
+    }
+
+    /**
+     * Creates the Interactive Explorer panel with JCEF browser for Three.js visualization.
+     */
+    private fun createInteractiveExplorerPanel(): JPanel {
+        val panel = JBPanel<JBPanel<*>>(BorderLayout())
+        panel.border = JBUI.Borders.empty(5)
+
+        // Check if JCEF is supported
+        if (!JBCefApp.isSupported()) {
+            val errorLabel = JBLabel("<html><center>Interactive Explorer requires JCEF support.<br>" +
+                    "Please use a JetBrains Runtime with JCEF enabled.</center></html>")
+            errorLabel.horizontalAlignment = SwingConstants.CENTER
+            panel.add(errorLabel, BorderLayout.CENTER)
+            return panel
+        }
+
+        try {
+            // Create JCEF browser
+            interactiveBrowser = JBCefBrowser()
+
+            // Load the Three.js visualization HTML from resources
+            val htmlContent = loadInteractiveHtml()
+            interactiveBrowser?.loadHTML(htmlContent)
+
+            // Setup JS query for communication from JS to Kotlin
+            jsQuery = JBCefJSQuery.create(interactiveBrowser as JBCefBrowserBase)
+            jsQuery?.addHandler { request ->
+                handleJsCallback(request)
+                JBCefJSQuery.Response("ok")
+            }
+
+            // Top: Refresh button
+            val topPanel = JBPanel<JBPanel<*>>(BorderLayout())
+            val refreshBtn = JButton("Refresh Visualization")
+            refreshBtn.addActionListener { refreshInteractiveVisualization() }
+            topPanel.add(refreshBtn, BorderLayout.EAST)
+
+            val infoLabel = JBLabel("<html>Interactive 3D visualization of code execution. " +
+                    "<b>Red</b> = not executed, <b>Green</b> = executed. Click nodes for details.</html>")
+            topPanel.add(infoLabel, BorderLayout.WEST)
+            panel.add(topPanel, BorderLayout.NORTH)
+
+            // Browser component
+            panel.add(interactiveBrowser!!.component, BorderLayout.CENTER)
+
+        } catch (e: Exception) {
+            PluginLogger.error("Failed to create Interactive Explorer", e)
+            val errorLabel = JBLabel("<html><center>Failed to initialize Interactive Explorer:<br>${e.message}</center></html>")
+            errorLabel.horizontalAlignment = SwingConstants.CENTER
+            panel.add(errorLabel, BorderLayout.CENTER)
+        }
+
+        return panel
+    }
+
+    /**
+     * Loads the Three.js visualization HTML from resources.
+     */
+    private fun loadInteractiveHtml(): String {
+        return try {
+            val inputStream = javaClass.getResourceAsStream("/interactive_viz/interactive_flow_explorer.html")
+            inputStream?.bufferedReader()?.readText() ?: getDefaultInteractiveHtml()
+        } catch (e: Exception) {
+            PluginLogger.error("Failed to load interactive HTML from resources", e)
+            getDefaultInteractiveHtml()
+        }
+    }
+
+    /**
+     * Default HTML if resource loading fails.
+     */
+    private fun getDefaultInteractiveHtml(): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <style>
+                    body {
+                        font-family: sans-serif;
+                        background: #1a1a2e;
+                        color: #eee;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        height: 100vh;
+                        margin: 0;
+                    }
+                    .message { text-align: center; }
+                </style>
+            </head>
+            <body>
+                <div class="message">
+                    <h2>Interactive Explorer</h2>
+                    <p>Run your code to generate visualization data.</p>
+                    <p>The visualization will appear here showing executed and dead branches.</p>
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
+    /**
+     * Handles callbacks from JavaScript.
+     */
+    private fun handleJsCallback(request: String) {
+        try {
+            val json = gson.fromJson(request, JsonObject::class.java)
+            val action = json.get("action")?.asString
+
+            when (action) {
+                "navigate" -> {
+                    // Navigate to file:line in editor
+                    val file = json.get("file")?.asString
+                    val line = json.get("line")?.asInt ?: 0
+                    if (file != null) {
+                        navigateToSource(file, line)
+                    }
+                }
+                "log" -> {
+                    val message = json.get("message")?.asString
+                    PluginLogger.info("[InteractiveExplorer] $message")
+                }
+            }
+        } catch (e: Exception) {
+            PluginLogger.error("Failed to handle JS callback", e)
+        }
+    }
+
+    /**
+     * Navigate to source file at line.
+     */
+    private fun navigateToSource(filePath: String, line: Int) {
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                val virtualFile = LocalFileSystem.getInstance().findFileByPath(filePath)
+                if (virtualFile != null) {
+                    com.intellij.openapi.fileEditor.OpenFileDescriptor(
+                        project, virtualFile, line - 1, 0
+                    ).navigate(true)
+                }
+            } catch (e: Exception) {
+                PluginLogger.error("Failed to navigate to $filePath:$line", e)
+            }
+        }
+    }
+
+    /**
+     * Refreshes the interactive visualization with current data.
+     */
+    fun refreshInteractiveVisualization() {
+        if (interactiveBrowser == null) return
+
+        ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                // Build visualization data from current trace data
+                val data = buildVisualizationData()
+                val jsonData = gson.toJson(data)
+
+                // Inject data into the browser
+                ApplicationManager.getApplication().invokeLater {
+                    interactiveBrowser?.cefBrowser?.executeJavaScript(
+                        "if (typeof loadVisualizationData === 'function') { loadVisualizationData($jsonData); }",
+                        "", 0
+                    )
+                }
+            } catch (e: Exception) {
+                PluginLogger.error("Failed to refresh interactive visualization", e)
+            }
+        }
+    }
+
+    /**
+     * Builds visualization data from current trace and dead code analysis.
+     * This combines data from the Dead Code tab and Call Tree tab.
+     */
+    private fun buildVisualizationData(): Map<String, Any> {
+        // This will be populated by the EnhancedLearningFlowToolWindow
+        // For now, return demo data structure
+        return mapOf(
+            "functions" to emptyMap<String, Any>(),
+            "call_graph" to emptyMap<String, Any>(),
+            "covered_functions" to emptyList<String>(),
+            "dead_functions" to emptyList<String>(),
+            "why_not_covered" to emptyMap<String, Any>()
+        )
+    }
+
+    /**
+     * Updates the visualization with data from the main tool window.
+     * Called by EnhancedLearningFlowToolWindow when trace data changes.
+     */
+    fun updateVisualizationData(
+        allFunctions: Set<String>,
+        calledFunctions: Map<String, Int>,
+        callTree: Map<String, List<String>>,
+        functionDefinitions: Map<String, Pair<String, Int>>,  // func -> (file, line)
+        whyNotCovered: Map<String, WhyNotCoveredInfo>
+    ) {
+        val coveredFunctions = calledFunctions.keys.toList()
+        val deadFunctions = allFunctions.filter { it !in calledFunctions.keys }
+
+        val functions = allFunctions.associateWith { func ->
+            val (file, line) = functionDefinitions[func] ?: ("" to 0)
+            mapOf(
+                "name" to func,
+                "line" to line,
+                "file" to file,
+                "call_count" to (calledFunctions[func] ?: 0),
+                "branches" to emptyList<Any>()  // Will be populated by branch analyzer
+            )
+        }
+
+        val data = mapOf(
+            "functions" to functions,
+            "call_graph" to callTree,
+            "covered_functions" to coveredFunctions,
+            "dead_functions" to deadFunctions,
+            "why_not_covered" to whyNotCovered.mapValues { (_, info) ->
+                mapOf(
+                    "function" to info.function,
+                    "root_cause" to info.rootCause,
+                    "root_cause_detail" to (info.rootCauseDetail?.let { detail ->
+                        mapOf(
+                            "type" to detail.type,
+                            "caller" to detail.caller,
+                            "line" to detail.line,
+                            "branch_type" to detail.branchType,
+                            "branch_condition" to detail.branchCondition,
+                            "branch_line" to detail.branchLine
+                        )
+                    }),
+                    "reasons" to info.reasons.map { reason ->
+                        mapOf(
+                            "type" to reason.type,
+                            "caller" to reason.caller,
+                            "line" to reason.line,
+                            "branch_type" to reason.branchType,
+                            "branch_condition" to reason.branchCondition,
+                            "explanation" to reason.explanation
+                        )
+                    }
+                )
+            }
+        )
+
+        val jsonData = gson.toJson(data)
+
+        ApplicationManager.getApplication().invokeLater {
+            interactiveBrowser?.cefBrowser?.executeJavaScript(
+                "if (typeof loadVisualizationData === 'function') { loadVisualizationData($jsonData); }",
+                "", 0
+            )
+        }
     }
 
     private fun updateInfoPanel() {

@@ -1,6 +1,7 @@
 package com.crawl4ai.learningviz
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.wm.ToolWindow
@@ -10,8 +11,10 @@ import com.intellij.ui.content.ContentFactory
 /**
  * Factory for creating the enhanced learning flow tool window with PlantUML support,
  * dead code detection, and performance profiling.
+ *
+ * Implements DumbAware to remain available during IDE indexing operations.
  */
-class EnhancedLearningFlowToolWindowFactory : ToolWindowFactory {
+class EnhancedLearningFlowToolWindowFactory : ToolWindowFactory, DumbAware {
 
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
         try {

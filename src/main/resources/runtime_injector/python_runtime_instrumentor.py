@@ -514,6 +514,22 @@ class RuntimeInstrumentor(object):
                 # Note: This will only send if a client is already connected
                 # If no client yet, it will be sent when client connects
                 self._send_function_registry(scanner)
+
+                # Run branch analysis for "Why Not Covered" feature
+                try:
+                    from branch_coverage_analyzer import ProjectBranchAnalyzer
+                    self.logger.info("Running branch analysis for Why Not Covered...")
+                    branch_analyzer = ProjectBranchAnalyzer(os.getcwd())
+                    branch_analyzer.scan()
+                    self.branch_analyzer = branch_analyzer
+                    self._send_branch_registry(branch_analyzer)
+                    self.logger.info("Branch analysis complete: {0} branches, {1} call sites".format(
+                        sum(len(a.branches) for a in branch_analyzer.files.values()),
+                        sum(len(a.call_sites) for a in branch_analyzer.files.values())))
+                except Exception as branch_e:
+                    self.logger.warning("Branch analysis failed (non-critical): {0}".format(str(branch_e)))
+                    self.branch_analyzer = None
+
             except Exception as e:
                 self.logger.warning("Project scan failed: {0}".format(str(e)))
                 self.logger.info("Falling back to pattern-based filtering")
@@ -533,6 +549,11 @@ class RuntimeInstrumentor(object):
         if self.scanner_ready and self.project_scanner:
             self.logger.info("Client connected, sending function registry...")
             self._send_function_registry(self.project_scanner)
+
+        # Send branch registry if available
+        if hasattr(self, 'branch_analyzer') and self.branch_analyzer:
+            self.logger.info("Client connected, sending branch registry...")
+            self._send_branch_registry(self.branch_analyzer)
 
     def _send_function_registry(self, scanner):
         """Send function registry to plugin for dead code detection."""
@@ -583,6 +604,82 @@ class RuntimeInstrumentor(object):
 
         except Exception as e:
             self.logger.warning("Failed to send function registry: {0}".format(str(e)))
+
+    def _send_branch_registry(self, branch_analyzer):
+        """Send branch registry to plugin for Why Not Covered analysis.
+
+        This sends all call sites with their branch context, allowing the plugin
+        to show ACTUAL branch conditions (e.g., 'if config.enabled:') instead of
+        generic messages.
+        """
+        if not self.trace_server or not self.trace_server.clients:
+            self.logger.debug("No clients connected, branch registry not sent")
+            return
+
+        try:
+            # Build call site registry with branch conditions
+            call_sites = []
+            for filepath, analyzer in branch_analyzer.files.items():
+                module = self._filepath_to_module(filepath)
+                for call_site in analyzer.call_sites:
+                    call_site_data = {
+                        'callee': call_site.callee_name,
+                        'caller': call_site.caller_function,
+                        'caller_module': module,
+                        'file': filepath,
+                        'line': call_site.line,
+                        'in_branch': None
+                    }
+                    # If call is inside a branch, include the branch condition
+                    if call_site.in_branch:
+                        call_site_data['in_branch'] = {
+                            'type': call_site.in_branch.branch_type,
+                            'condition': call_site.in_branch.condition_text,
+                            'line': call_site.in_branch.line,
+                            'end_line': call_site.in_branch.end_line
+                        }
+                    call_sites.append(call_site_data)
+
+            # Build branch summary per function
+            function_branches = {}
+            for filepath, analyzer in branch_analyzer.files.items():
+                module = self._filepath_to_module(filepath)
+                for func_name, func_info in analyzer.functions.items():
+                    full_name = "{0}.{1}".format(module, func_name)
+                    function_branches[full_name] = {
+                        'file': filepath,
+                        'line': func_info['line'],
+                        'branches': func_info['branches']  # Already in dict format
+                    }
+
+            # Send branch registry event
+            branch_event = {
+                'type': 'branch_registry',
+                'timestamp': time.time(),
+                'call_id': 'branch_registry_event',
+                'module': '__branch_registry__',
+                'function': '__branch_registry__',
+                'file': '',
+                'line': 0,
+                'depth': 0,
+                'parent_id': None,
+                'session_id': self.session_id,
+                'process_id': self.process_id,
+                'correlation_id': None,
+                'learning_phase': None,
+                'trace_data': {
+                    'total_call_sites': len(call_sites),
+                    'call_sites': call_sites,
+                    'function_branches': function_branches
+                }
+            }
+
+            self.trace_server.stream_trace(branch_event)
+            self.logger.info("Sent branch registry: {0} call sites, {1} functions with branches".format(
+                len(call_sites), len(function_branches)))
+
+        except Exception as e:
+            self.logger.warning("Failed to send branch registry: {0}".format(str(e)))
 
     def _filepath_to_module(self, filepath):
         """Convert file path to module name.

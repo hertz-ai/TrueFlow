@@ -24,6 +24,9 @@ dependencies {
     // JSON serialization
     implementation("com.google.code.gson:gson:2.10.1")
 
+    // JavaParser for AST branch analysis
+    implementation("com.github.javaparser:javaparser-core:3.25.8")
+
     // Testing
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.0")
 }

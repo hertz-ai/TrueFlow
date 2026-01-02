@@ -221,22 +221,30 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
 
     // ==================== Public API ====================
 
+    private fun getCurrentTimestamp(): String {
+        val formatter = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")
+        return java.time.LocalTime.now().format(formatter)
+    }
+
     fun addUserMessage(content: String, imageBase64: String? = null) {
         val escapedContent = escapeJS(content)
+        val timestamp = getCurrentTimestamp()
         val imageHtml = if (imageBase64 != null) {
             "<img src='data:image/png;base64,$imageBase64' class='message-image' onclick='showImageModal(this.src)'/>"
         } else ""
-        executeJS("addMessage('user', `$escapedContent`, `$imageHtml`);")
+        executeJS("addMessage('user', `$escapedContent`, `$imageHtml`, '$timestamp');")
     }
 
     fun addAssistantMessage(content: String) {
         val escapedContent = escapeJS(content)
-        executeJS("addMessage('assistant', `$escapedContent`, '');")
+        val timestamp = getCurrentTimestamp()
+        executeJS("addMessage('assistant', `$escapedContent`, '', '$timestamp');")
     }
 
     fun addSystemMessage(content: String) {
         val escapedContent = escapeJS(content)
-        executeJS("addMessage('system', `$escapedContent`, '');")
+        val timestamp = getCurrentTimestamp()
+        executeJS("addMessage('system', `$escapedContent`, '', '$timestamp');")
     }
 
     fun setThinking(thinking: Boolean, message: String? = null) {
@@ -249,9 +257,9 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
         executeJS("updateStatus(`$escapedStatus`);")
     }
 
-    fun setServerRunning(running: Boolean, model: String = "") {
+    fun setServerRunning(running: Boolean, model: String = "", isExternal: Boolean = false) {
         val escapedModel = escapeJS(model)
-        executeJS("setServerRunning($running, `$escapedModel`);")
+        executeJS("setServerRunning($running, `$escapedModel`, $isExternal);")
     }
 
     fun setDownloadedModel(modelName: String?) {
@@ -392,6 +400,23 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
         }
 
         .status-indicator.connected { background: #4caf50; }
+        .status-indicator.external { background: #ff9800; }
+
+        .server-type-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin-left: 6px;
+            font-weight: 500;
+        }
+        .server-type-badge.managed {
+            background: rgba(76, 175, 80, 0.2);
+            color: #4caf50;
+        }
+        .server-type-badge.external {
+            background: rgba(255, 152, 0, 0.2);
+            color: #ff9800;
+        }
 
         .maximize-btn {
             background: transparent;
@@ -632,6 +657,24 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
         .message.system .message-bubble {
             background: var(--system-bubble);
             border: 1px solid var(--border-color);
+        }
+
+        .message-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+
+        .message-role {
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        .message-time {
+            color: var(--text-muted);
+            font-size: 10px;
         }
 
         .message-content {
@@ -1097,6 +1140,7 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
             <h2>
                 <span class="status-indicator" id="statusIndicator"></span>
                 TrueFlow AI
+                <span class="server-type-badge" id="serverTypeBadge" style="display: none;"></span>
             </h2>
             <button class="maximize-btn" onclick="maximize()">Maximize</button>
         </div>
@@ -1241,8 +1285,10 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
             removeImage();
         }
 
-        function addMessage(role, content, imageHtml) {
+        function addMessage(role, content, imageHtml, timestamp) {
             const avatarEmoji = role === 'user' ? '👤' : role === 'assistant' ? '🤖' : 'ℹ️';
+            const roleName = role === 'user' ? 'You' : role === 'assistant' ? 'AI' : 'System';
+            const timeStr = timestamp || new Date().toLocaleTimeString();
 
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message ' + role;
@@ -1250,6 +1296,7 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
                 '<div class="message-wrapper">' +
                     '<div class="message-avatar">' + avatarEmoji + '</div>' +
                     '<div class="message-bubble">' +
+                        '<div class="message-header"><span class="message-role">' + roleName + '</span><span class="message-time">' + timeStr + '</span></div>' +
                         '<div class="message-content">' + formatContent(content) + '</div>' +
                         imageHtml +
                     '</div>' +
@@ -1292,19 +1339,40 @@ class AIChatWebPanel(private val project: Project) : JPanel(BorderLayout()), Dis
 
         let downloadedModel = null;
         let runningModel = null;
+        let isExternalServer = false;
+        const serverTypeBadge = document.getElementById('serverTypeBadge');
 
-        function setServerRunning(running, model) {
+        function setServerRunning(running, model, isExternal) {
             serverRunning = running;
             runningModel = running ? model : null;
-            statusIndicator.classList.toggle('connected', running);
+            isExternalServer = isExternal || false;
+
+            // Update status indicator color
+            statusIndicator.classList.remove('connected', 'external');
+            if (running) {
+                statusIndicator.classList.add(isExternal ? 'external' : 'connected');
+            }
+
+            // Update server type badge
+            if (running) {
+                serverTypeBadge.textContent = isExternal ? 'External' : 'Managed';
+                serverTypeBadge.className = 'server-type-badge ' + (isExternal ? 'external' : 'managed');
+                serverTypeBadge.style.display = 'inline-block';
+                serverTypeBadge.title = isExternal ?
+                    'Server started externally (not managed by TrueFlow)' :
+                    'Server started and managed by TrueFlow';
+            } else {
+                serverTypeBadge.style.display = 'none';
+            }
 
             if (running) {
                 // Determine model name to show - use running model, fallback to downloaded
                 const displayModel = (model && model !== 'unknown') ? model : (downloadedModel || 'Server');
                 const shortModel = displayModel.length > 15 ? displayModel.substring(0, 12) + '...' : displayModel;
                 startBtn.style.display = 'none';
-                stopBtn.textContent = '⏹ ' + shortModel;
-                stopBtn.title = 'Stop: ' + displayModel;
+                // Show "Stop Ext" for external servers to keep it compact
+                stopBtn.textContent = isExternal ? '⏹ Stop Ext' : ('⏹ ' + shortModel);
+                stopBtn.title = (isExternal ? 'Stop external server (started outside TrueFlow)' : 'Stop: ' + displayModel);
                 stopBtn.style.display = 'inline-block';
             } else {
                 startBtn.style.display = 'inline-block';

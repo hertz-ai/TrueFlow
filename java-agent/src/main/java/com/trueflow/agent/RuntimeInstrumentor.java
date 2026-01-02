@@ -54,10 +54,41 @@ public class RuntimeInstrumentor {
     private volatile boolean enabled = true;
     private volatile boolean finalized = false;
 
+    // Branch analyzer for "Why Not Covered" feature
+    private JavaBranchAnalyzer branchAnalyzer;
+    private volatile boolean branchAnalysisComplete = false;
+
     public RuntimeInstrumentor(AgentConfig config) {
         this.config = config;
         this.sessionId = "session_" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
         LOGGER.info("[TrueFlow] Session ID: " + sessionId);
+
+        // Start branch analysis in background
+        startBranchAnalysis();
+    }
+
+    /**
+     * Start branch analysis in a background thread.
+     */
+    private void startBranchAnalysis() {
+        Thread analyzerThread = new Thread(() -> {
+            try {
+                // Get project root from working directory or source path
+                String workingDir = System.getProperty("user.dir");
+                java.nio.file.Path projectRoot = java.nio.file.Paths.get(workingDir);
+
+                LOGGER.info("[TrueFlow] Starting branch analysis from: " + projectRoot);
+                branchAnalyzer = new JavaBranchAnalyzer(projectRoot);
+                branchAnalyzer.scan();
+                branchAnalysisComplete = true;
+                LOGGER.info("[TrueFlow] Branch analysis complete");
+
+            } catch (Exception e) {
+                LOGGER.warning("[TrueFlow] Branch analysis failed (non-critical): " + e.getMessage());
+            }
+        }, "TrueFlow-BranchAnalyzer");
+        analyzerThread.setDaemon(true);
+        analyzerThread.start();
     }
 
     /**
@@ -305,6 +336,24 @@ public class RuntimeInstrumentor {
         } catch (IOException e) {
             LOGGER.severe("[TrueFlow] Failed to export trace: " + e.getMessage());
         }
+    }
+
+    /**
+     * Get the branch registry JSON for "Why Not Covered" analysis.
+     * Returns null if branch analysis is not complete yet.
+     */
+    public String getBranchRegistryJson() {
+        if (!branchAnalysisComplete || branchAnalyzer == null) {
+            return null;
+        }
+        return branchAnalyzer.toBranchRegistryJson(sessionId);
+    }
+
+    /**
+     * Check if branch analysis is complete.
+     */
+    public boolean isBranchAnalysisComplete() {
+        return branchAnalysisComplete;
     }
 
     // Getters

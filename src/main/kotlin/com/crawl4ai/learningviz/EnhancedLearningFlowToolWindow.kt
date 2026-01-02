@@ -227,6 +227,24 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private val socketAllDefinedFunctions = mutableSetOf<String>() // All functions found by static analysis
     private val socketFunctionDefinitions = mutableMapOf<String, Pair<String, Int>>() // funcKey -> (file, line)
 
+    // Branch registry for "Why Not Covered" analysis with ACTUAL branch conditions
+    data class CallSiteBranchInfo(
+        val branchType: String,      // "if", "elif", "else", "for", "while", "try", "except"
+        val condition: String,       // Actual condition text, e.g., "config.enabled and user.is_admin"
+        val line: Int,               // Line number of the branch
+        val endLine: Int             // End line of the branch block
+    )
+    data class CallSiteInfo(
+        val callee: String,          // Function being called
+        val caller: String,          // Function containing the call
+        val callerModule: String,    // Module of the caller
+        val file: String,            // File path
+        val line: Int,               // Line number of the call
+        val inBranch: CallSiteBranchInfo?  // Branch info if call is inside a branch (null if unconditional)
+    )
+    private val socketCallSites = mutableListOf<CallSiteInfo>()  // All call sites with branch context
+    private val socketFunctionBranches = mutableMapOf<String, List<Map<String, Any>>>()  // funcKey -> branches
+
     // UI update throttling (prevent freeze from too many events) - Thread-safe with atomic operations
     private val lastUIUpdateTime = AtomicLong(0)
     private val uiUpdateIntervalMs = 2000L // Update UI every 2 seconds max (was 500ms)
@@ -1298,6 +1316,11 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
                 handleFunctionRegistry(event)
                 return // Don't process further, this is a special event
             }
+            "branch_registry" -> {
+                // Receive branch registry for Why Not Covered analysis
+                handleBranchRegistry(event)
+                return // Don't process further, this is a special event
+            }
             "cycle_complete" -> {
                 // Pass to Manim for video generation (filtering happens inside ManimAutoRenderer)
                 manimAutoRenderer.onTraceEvent(event)
@@ -1668,6 +1691,76 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         }
     }
 
+    private fun handleBranchRegistry(event: TraceEvent) {
+        // Parse branch registry for "Why Not Covered" analysis with ACTUAL branch conditions
+        try {
+            val traceData = event.traceData ?: return
+            val callSitesArray = traceData.getAsJsonArray("call_sites") ?: return
+
+            socketCallSites.clear()
+            socketFunctionBranches.clear()
+
+            // Parse call sites with their branch context
+            for (siteElement in callSitesArray) {
+                val siteObj = siteElement.asJsonObject
+                val callee = siteObj.get("callee")?.asString ?: continue
+                val caller = siteObj.get("caller")?.asString ?: continue
+                val callerModule = siteObj.get("caller_module")?.asString ?: ""
+                val file = siteObj.get("file")?.asString ?: ""
+                val line = siteObj.get("line")?.asInt ?: 0
+
+                // Parse branch info if present
+                val branchInfo = siteObj.get("in_branch")?.let { branchEl ->
+                    if (branchEl.isJsonNull) null else {
+                        val branchObj = branchEl.asJsonObject
+                        CallSiteBranchInfo(
+                            branchType = branchObj.get("type")?.asString ?: "if",
+                            condition = branchObj.get("condition")?.asString ?: "unknown condition",
+                            line = branchObj.get("line")?.asInt ?: 0,
+                            endLine = branchObj.get("end_line")?.asInt ?: 0
+                        )
+                    }
+                }
+
+                socketCallSites.add(CallSiteInfo(
+                    callee = callee,
+                    caller = caller,
+                    callerModule = callerModule,
+                    file = file,
+                    line = line,
+                    inBranch = branchInfo
+                ))
+            }
+
+            // Parse function branches
+            val functionBranchesObj = traceData.getAsJsonObject("function_branches")
+            if (functionBranchesObj != null) {
+                for ((funcKey, branchesEl) in functionBranchesObj.entrySet()) {
+                    val funcObj = branchesEl.asJsonObject
+                    val branches = funcObj.getAsJsonArray("branches")?.map { br ->
+                        val brObj = br.asJsonObject
+                        mapOf<String, Any>(
+                            "type" to (brObj.get("type")?.asString ?: ""),
+                            "line" to (brObj.get("line")?.asInt ?: 0),
+                            "condition" to (brObj.get("condition")?.asString ?: "")
+                        )
+                    } ?: emptyList()
+                    socketFunctionBranches[funcKey] = branches
+                }
+            }
+
+            PluginLogger.info("[ToolWindow] Received branch registry: ${socketCallSites.size} call sites, ${socketFunctionBranches.size} functions with branches")
+
+            // Update Interactive Explorer with branch data
+            SwingUtilities.invokeLater {
+                updateInteractiveVisualization()
+            }
+
+        } catch (e: Exception) {
+            PluginLogger.error("[ToolWindow] Failed to parse branch registry: ${e.message}", e)
+        }
+    }
+
     private fun updateDeadCodeFromSocketTrace() {
         // Proper dead code detection using function registry
         // Both static analysis and runtime traces now use relative module paths (e.g., src.crawl4ai.foo.bar)
@@ -1739,6 +1832,194 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
                 "navigate" // Placeholder - renderer shows "Go to source" link
             ))
         }
+
+        // Update Interactive Explorer visualization with current data
+        updateInteractiveVisualization()
+    }
+
+    /**
+     * Updates the Interactive Explorer in the Manim tab with current trace data.
+     * Builds call graph from socketRootCalls and provides "why not covered" analysis.
+     *
+     * IMPORTANT: This implements proper ROOT CAUSE TRACING - it walks UP the call chain
+     * to find the TOPMOST executed function that blocked execution, not just the immediate caller.
+     */
+    private fun updateInteractiveVisualization() {
+        // Build call graph from call tree (caller -> list of callees)
+        val callGraph = mutableMapOf<String, MutableList<String>>()
+        fun traverseNode(node: CallTraceNode) {
+            val callerKey = "${node.module}.${node.function}"
+            if (callerKey !in callGraph) {
+                callGraph[callerKey] = mutableListOf()
+            }
+            for (child in node.children) {
+                val calleeKey = "${child.module}.${child.function}"
+                if (calleeKey !in callGraph[callerKey]!!) {
+                    callGraph[callerKey]!!.add(calleeKey)
+                }
+                traverseNode(child)
+            }
+        }
+        socketRootCalls.forEach { traverseNode(it) }
+
+        // Build reverse call graph (callee -> list of callers) from ALL defined functions
+        // This includes static analysis, not just runtime calls
+        val reverseCallGraph = mutableMapOf<String, MutableList<String>>()
+        for ((caller, callees) in callGraph) {
+            for (callee in callees) {
+                if (callee !in reverseCallGraph) {
+                    reverseCallGraph[callee] = mutableListOf()
+                }
+                if (caller !in reverseCallGraph[callee]!!) {
+                    reverseCallGraph[callee]!!.add(caller)
+                }
+            }
+        }
+
+        // Build "why not covered" analysis for dead functions with ROOT CAUSE TRACING
+        val whyNotCovered = mutableMapOf<String, ManimVideoPanel.WhyNotCoveredInfo>()
+        val deadFunctions = socketAllDefinedFunctions.filter { it !in socketTraceCalls }
+        val executedFunctions = socketTraceCalls.keys
+
+        /**
+         * Recursively trace up the call chain to find the ROOT CAUSE.
+         * Returns: Pair<rootCauseFunction, callChain> where rootCauseFunction is the
+         * FIRST EXECUTED function in the chain that blocked execution.
+         *
+         * @param func The dead function to analyze
+         * @param visited Set of already visited functions (to prevent cycles)
+         * @param chain The call chain built so far (from dead func upward)
+         * @return Triple of (rootCauseType, rootCauseFunction, fullChain) or null if no root found
+         */
+        fun traceToRootCause(
+            func: String,
+            visited: MutableSet<String>,
+            chain: MutableList<String>
+        ): Triple<String, String, List<String>>? {
+            if (func in visited) return null  // Cycle detected
+            visited.add(func)
+            chain.add(func)
+
+            val callers = reverseCallGraph[func] ?: emptyList()
+
+            if (callers.isEmpty()) {
+                // No callers found - this is a root with no call sites
+                return Triple("NO_CALL_SITES", func, chain.toList())
+            }
+
+            // Check each potential caller
+            for (caller in callers) {
+                if (caller in executedFunctions) {
+                    // FOUND ROOT CAUSE! This caller WAS executed but didn't call our function
+                    // The branch decision happened HERE
+                    return Triple("BRANCH_NOT_TAKEN", caller, chain.toList())
+                }
+            }
+
+            // All callers are also dead - recurse up to find the root
+            for (caller in callers) {
+                val result = traceToRootCause(caller, visited, chain)
+                if (result != null) {
+                    return result
+                }
+            }
+
+            // No executed function found in entire chain - unreachable from entry points
+            return Triple("UNREACHABLE_FROM_ENTRY", chain.last(), chain.toList())
+        }
+
+        for (deadFunc in deadFunctions) {
+            val (rootCauseType, rootCauseFunc, callChain) = traceToRootCause(
+                deadFunc,
+                mutableSetOf(),
+                mutableListOf()
+            ) ?: Triple("UNKNOWN", deadFunc, listOf(deadFunc))
+
+            val reasons = mutableListOf<ManimVideoPanel.WhyNotCoveredReason>()
+            val (rootFile, rootLine) = socketFunctionDefinitions[rootCauseFunc] ?: ("" to 0)
+
+            when (rootCauseType) {
+                "NO_CALL_SITES" -> {
+                    reasons.add(ManimVideoPanel.WhyNotCoveredReason(
+                        type = "NO_CALL_SITES",
+                        explanation = "No code in the project calls '$deadFunc'. It may be dead code or only called externally."
+                    ))
+                }
+                "BRANCH_NOT_TAKEN" -> {
+                    // Build explanation showing the full chain
+                    val chainStr = if (callChain.size > 1) {
+                        callChain.reversed().joinToString(" → ")
+                    } else {
+                        deadFunc
+                    }
+
+                    // Find ACTUAL branch condition from socketCallSites
+                    // Look for call site where: caller matches rootCauseFunc and callee is in the chain
+                    val firstDeadInChain = callChain.firstOrNull() ?: deadFunc
+                    val relevantCallSite = socketCallSites.find { site ->
+                        val fullCaller = "${site.callerModule}.${site.caller}"
+                        (fullCaller == rootCauseFunc || site.caller == rootCauseFunc) &&
+                        (site.callee == firstDeadInChain ||
+                         callChain.any { chainFunc -> site.callee == chainFunc || chainFunc.endsWith(".${site.callee}") })
+                    }
+
+                    val actualBranchType = relevantCallSite?.inBranch?.branchType ?: "if"
+                    val actualCondition = relevantCallSite?.inBranch?.condition ?: "condition was False"
+                    val actualBranchLine = relevantCallSite?.inBranch?.line ?: rootLine
+
+                    reasons.add(ManimVideoPanel.WhyNotCoveredReason(
+                        type = "BRANCH_NOT_TAKEN",
+                        caller = rootCauseFunc,
+                        line = actualBranchLine,
+                        branchType = actualBranchType,
+                        branchCondition = actualCondition,
+                        explanation = "Branch in '$rootCauseFunc' (line $actualBranchLine): $actualBranchType $actualCondition. Chain: $chainStr"
+                    ))
+                }
+                "UNREACHABLE_FROM_ENTRY" -> {
+                    val chainStr = callChain.reversed().joinToString(" → ")
+                    reasons.add(ManimVideoPanel.WhyNotCoveredReason(
+                        type = "UNREACHABLE_FROM_ENTRY",
+                        explanation = "Function '$deadFunc' is unreachable from any entry point. Orphaned call chain: $chainStr"
+                    ))
+                }
+                else -> {
+                    reasons.add(ManimVideoPanel.WhyNotCoveredReason(
+                        type = "UNKNOWN",
+                        explanation = "Could not determine why '$deadFunc' wasn't called"
+                    ))
+                }
+            }
+
+            val rootDetail = if (rootCauseType == "BRANCH_NOT_TAKEN") {
+                // Look up actual branch info from the first reason (which has the actual values)
+                val branchReason = reasons.firstOrNull { it.type == "BRANCH_NOT_TAKEN" }
+                ManimVideoPanel.WhyNotCoveredDetail(
+                    type = rootCauseType,
+                    caller = rootCauseFunc,
+                    line = branchReason?.line ?: rootLine,
+                    branchType = branchReason?.branchType ?: "if",
+                    branchCondition = branchReason?.branchCondition ?: "condition was False",
+                    branchLine = branchReason?.line ?: rootLine
+                )
+            } else null
+
+            whyNotCovered[deadFunc] = ManimVideoPanel.WhyNotCoveredInfo(
+                function = deadFunc,
+                rootCause = rootCauseType,
+                rootCauseDetail = rootDetail,
+                reasons = reasons
+            )
+        }
+
+        // Update the Manim panel's interactive visualization
+        manimVideoPanel.updateVisualizationData(
+            allFunctions = socketAllDefinedFunctions,
+            calledFunctions = socketTraceCalls,
+            callTree = callGraph.mapValues { it.value.toList() },
+            functionDefinitions = socketFunctionDefinitions,
+            whyNotCovered = whyNotCovered
+        )
     }
 
     private fun updateDistributedFromSocketTrace(event: TraceEvent) {

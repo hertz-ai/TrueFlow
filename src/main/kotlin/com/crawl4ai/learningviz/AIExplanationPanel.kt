@@ -55,12 +55,14 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         val sizeMB: Int,
         val description: String,
         val hasVision: Boolean,
-        val mmprojFile: String? = null  // Vision projector file for VL models
+        val mmprojFile: String? = null,  // Local filename for vision projector (unique per model)
+        val mmprojSourceFile: String? = null  // Source filename on HuggingFace (usually mmproj-F16.gguf)
     )
 
     private val modelPresets = listOf(
         // Qwen3-VL models - excellent for code analysis
-        // Note: mmproj file is required for vision - named mmproj-F16.gguf in each repo
+        // Note: mmproj files use unique LOCAL names to avoid conflicts when switching models
+        // mmprojSourceFile is the name on HuggingFace, mmprojFile is the local name
         ModelPreset(
             "Qwen3-VL-2B Instruct Q4_K_XL (Recommended)",
             "unsloth/Qwen3-VL-2B-Instruct-GGUF",
@@ -68,7 +70,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             1500,
             "Vision+text, best for code analysis with diagrams",
             hasVision = true,
-            mmprojFile = "mmproj-F16.gguf"
+            mmprojFile = "mmproj-Qwen3-VL-2B-F16.gguf",
+            mmprojSourceFile = "mmproj-F16.gguf"
         ),
         ModelPreset(
             "Qwen3-VL-2B Thinking Q4_K_XL",
@@ -77,7 +80,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             1500,
             "Vision+text with chain-of-thought reasoning",
             hasVision = true,
-            mmprojFile = "mmproj-F16.gguf"
+            mmprojFile = "mmproj-Qwen3-VL-2B-Thinking-F16.gguf",
+            mmprojSourceFile = "mmproj-F16.gguf"
         ),
         ModelPreset(
             "Qwen3-VL-4B Instruct Q4_K_XL",
@@ -86,7 +90,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             2800,
             "Larger model, better quality, needs ~6GB RAM",
             hasVision = true,
-            mmprojFile = "mmproj-F16.gguf"
+            mmprojFile = "mmproj-Qwen3-VL-4B-F16.gguf",
+            mmprojSourceFile = "mmproj-F16.gguf"
         ),
         // Gemma 3 models - Google's multimodal
         ModelPreset(
@@ -96,7 +101,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             2700,
             "Vision+text, Google Gemma 3, well-tested multimodal",
             hasVision = true,
-            mmprojFile = "mmproj-F16.gguf"
+            mmprojFile = "mmproj-Gemma-3-4B-F16.gguf",
+            mmprojSourceFile = "mmproj-F16.gguf"
         ),
         ModelPreset(
             "Gemma-3-1B IT Q4_K_M",
@@ -180,6 +186,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private var currentModelFile: String? = null
     private var pendingImage: String? = null  // Base64 encoded image waiting to be sent
     private var serverProcess: Process? = null
+    private var serverLogFile: File? = null  // Current llama.cpp server log file
+    private var serverLogWriter: java.io.PrintWriter? = null  // Writer for server logs
     private val apiBase = "http://127.0.0.1:8080/v1"
     private val modelsDir = File(System.getProperty("user.home"), ".trueflow/models")
     private val serverStatusFile = File(System.getProperty("user.home"), ".trueflow/server_status.json")
@@ -202,6 +210,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private var gpuAvailable: String = "none"  // "cuda", "metal", or "none"
     private var gpuMemoryMB: Int = 0  // GPU memory in MB (0 if unknown)
     private var useGpuAcceleration = false
+    private var llamaCppHasGpuSupport = false  // Whether llama.cpp binary was compiled with GPU support
     private var cpuTokensPerSecond: Double = 0.0
     private var gpuTokensPerSecond: Double = 0.0
     private var benchmarkCompleted = false
@@ -654,6 +663,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private var externalServerDetected = false
     // Track if port 8080 is occupied by a non-llama.cpp service
     private var portConflictDetected = false
+    // Flag to prevent polling from resetting UI during stop operation
+    private var stoppingServer = false
 
     /**
      * Check if AI server is already running on startup.
@@ -699,12 +710,13 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                                 externalServerDetected = false
                             } else {
                                 // Different project or external process started the server
-                                startServerButton.text = "External Server ($startedByDisplay)"
-                                startServerButton.isEnabled = false  // Can't control external server
-                                startServerButton.toolTipText = "llama.cpp server on port 8080 (started by $startedByDisplay). Stop it from there to use TrueFlow's built-in server."
+                                externalServerDetected = true
+                                startServerButton.text = "Stop External ($startedByDisplay)"
+                                startServerButton.isEnabled = true  // Allow stopping external server
+                                startServerButton.toolTipText = "Click to stop the external server (started by $startedByDisplay)"
                                 statusLabel.text = "Using external AI server - Ready to chat!"
                             }
-                            webChatPanel?.setServerRunning(true, model)
+                            webChatPanel?.setServerRunning(true, model, !isSameProject)
                             webChatPanel?.updateStatus("Server: $model")
                             PluginLogger.info("[TrueFlow] Detected llama.cpp server on startup (model: $model, started by: $startedByDisplay, same project: $isSameProject)")
 
@@ -796,11 +808,11 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 if (running && serverProcess == null) {
                     // Server started by another IDE - mark as external
                     externalServerDetected = true
-                    startServerButton.text = "External Server ($startedBy)"
-                    startServerButton.isEnabled = false
-                    startServerButton.toolTipText = "Server running at port 8080 (started by $startedBy). Stop it from $startedBy to use TrueFlow's built-in server."
+                    startServerButton.text = "Stop External ($startedBy)"
+                    startServerButton.isEnabled = true  // Allow stopping external server
+                    startServerButton.toolTipText = "Click to stop the external server (started by $startedBy)"
                     statusLabel.text = "Using external AI server - Ready to chat!"
-                    webChatPanel?.setServerRunning(true, model)
+                    webChatPanel?.setServerRunning(true, model, true)
                     webChatPanel?.updateStatus("External server ($startedBy): $model")
                 } else if (!running && externalServerDetected) {
                     // External server stopped - re-enable controls
@@ -1055,6 +1067,11 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
 
         statusCheckTimer = javax.swing.Timer(2000) {
+            // Skip polling if we're in the middle of stopping a server
+            if (stoppingServer) {
+                return@Timer
+            }
+
             // Check what's actually running on port 8080
             val serverCheck = checkLlamaCppServer()
             val status = readServerStatus()  // Optional metadata
@@ -1076,7 +1093,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                                 startServerButton.text = "Stop AI Server"
                                 startServerButton.isEnabled = true
                                 statusLabel.text = "AI Server running (started by this project) - Ready to chat!"
-                                webChatPanel?.setServerRunning(true, status?.model ?: "")
+                                webChatPanel?.setServerRunning(true, status?.model ?: "", false)
                             } else if (!isSameProject) {
                                 // Different project or external - mark as external
                                 if (!externalServerDetected) {
@@ -1084,10 +1101,11 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                                     PluginLogger.info("[TrueFlow] Detected external llama.cpp server via health check")
                                 }
                                 val startedByDisplay = buildStartedByDisplay(status)
-                                startServerButton.text = "External Server ($startedByDisplay)"
-                                startServerButton.isEnabled = false
+                                startServerButton.text = "Stop External ($startedByDisplay)"
+                                startServerButton.isEnabled = true  // Allow stopping external server
+                                startServerButton.toolTipText = "Click to stop the external server (started by $startedByDisplay)"
                                 statusLabel.text = "Using external AI server - Ready to chat!"
-                                webChatPanel?.setServerRunning(true, status?.model ?: "")
+                                webChatPanel?.setServerRunning(true, status?.model ?: "", true)
                                 webChatPanel?.updateStatus("External server: ${status?.model ?: "running"}")
                             }
                         }
@@ -1163,7 +1181,11 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
 
         webChatPanel?.onStopServer = {
-            stopServer()
+            if (externalServerDetected) {
+                stopExternalServer()
+            } else {
+                stopServer()
+            }
         }
 
         webChatPanel?.onDownloadModel = {
@@ -1301,8 +1323,14 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             downloadSelectedModel()
         }
         startServerButton.addActionListener {
-            toggleServer()
-            dialog.dispose()
+            // Only dispose dialog if not stopping external server (which shows its own confirmation)
+            if (externalServerDetected) {
+                stopExternalServer()
+                // Don't dispose - the confirmation dialog will handle it
+            } else {
+                toggleServer()
+                dialog.dispose()
+            }
         }
         startServerButton.isEnabled = false
         buttonPanel.add(downloadButton)
@@ -1347,7 +1375,13 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
 
         maximizedPanel.onStartServer = { toggleServer() }
-        maximizedPanel.onStopServer = { stopServer() }
+        maximizedPanel.onStopServer = {
+            if (externalServerDetected) {
+                stopExternalServer()
+            } else {
+                stopServer()
+            }
+        }
         maximizedPanel.onDownloadModel = { showModelDownloadDialog() }
         maximizedPanel.onAttachImage = { attachImageForPanel(maximizedPanel) }
         maximizedPanel.onPasteImage = { pasteImageForPanel(maximizedPanel) }
@@ -1549,7 +1583,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 "role" to "user",
                 "content" to listOf(
                     mapOf("type" to "text", "text" to sanitizedPrompt),
-                    mapOf("type" to "image_url", "image_url" to mapOf("url" to "data:image/png;base64,$imageBase64"))
+                    mapOf("type" to "image_url", "image_url" to mapOf("url" to "data:image/jpeg;base64,$imageBase64"))
                 )
             ))
         } else {
@@ -1569,7 +1603,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         conn.setRequestProperty("Content-Type", "application/json")
         conn.doOutput = true
         conn.connectTimeout = 30000
-        conn.readTimeout = 120000
+        conn.readTimeout = 180000  // 3 minutes for vision model processing
 
         OutputStreamWriter(conn.outputStream).use { it.write(requestBody) }
 
@@ -1805,8 +1839,26 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     private fun encodeImageToBase64(image: BufferedImage): String {
+        // Resize large images to max 512px for fast vision processing (~8s vs ~60s at 1024px)
+        val maxSize = 512
+        val resized = if (image.width > maxSize || image.height > maxSize) {
+            val scale = minOf(maxSize.toDouble() / image.width, maxSize.toDouble() / image.height)
+            val newWidth = (image.width * scale).toInt()
+            val newHeight = (image.height * scale).toInt()
+            val scaledImage = BufferedImage(newWidth, newHeight, BufferedImage.TYPE_INT_RGB)
+            val g2d = scaledImage.createGraphics()
+            g2d.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION, java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+            g2d.drawImage(image, 0, 0, newWidth, newHeight, null)
+            g2d.dispose()
+            PluginLogger.info("[TrueFlow] Resized image from ${image.width}x${image.height} to ${newWidth}x${newHeight}")
+            scaledImage
+        } else {
+            image
+        }
+
+        // Encode as JPEG for smaller size (PNG is lossless but large)
         val baos = ByteArrayOutputStream()
-        ImageIO.write(image, "png", baos)
+        ImageIO.write(resized, "jpg", baos)
         return Base64.getEncoder().encodeToString(baos.toByteArray())
     }
 
@@ -2026,7 +2078,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         conn.setRequestProperty("Content-Type", "application/json")
         conn.doOutput = true
         conn.connectTimeout = 30000
-        conn.readTimeout = 120000  // 2 minutes for generation
+        conn.readTimeout = 180000  // 3 minutes for vision model processing
 
         OutputStreamWriter(conn.outputStream).use { it.write(requestBody) }
 
@@ -2077,7 +2129,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             followUpConn.setRequestProperty("Content-Type", "application/json")
             followUpConn.doOutput = true
             followUpConn.connectTimeout = 30000
-            followUpConn.readTimeout = 120000
+            followUpConn.readTimeout = 180000  // 3 minutes for vision model processing
 
             OutputStreamWriter(followUpConn.outputStream).use { it.write(followUpBody) }
 
@@ -2614,7 +2666,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
                 // Download mmproj file if this is a vision model
                 if (preset?.mmprojFile != null && preset.hasVision) {
-                    val mmprojUrl = "https://huggingface.co/${preset.repoId}/resolve/main/${preset.mmprojFile}"
+                    // Use mmprojSourceFile for URL (the name on HuggingFace), mmprojFile for local storage
+                    val sourceFile = preset.mmprojSourceFile ?: preset.mmprojFile
+                    val mmprojUrl = "https://huggingface.co/${preset.repoId}/resolve/main/$sourceFile"
                     val mmprojDest = File(modelsDir, preset.mmprojFile)
 
                     if (!mmprojDest.exists()) {
@@ -2691,19 +2745,56 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
     }
 
+    // Flag to prevent double-clicking the download button
+    private var mmprojDownloadInProgress = false
+
     /**
      * Download only the mmproj file for a vision model (when model already exists but mmproj is missing).
      */
     private fun downloadMmprojOnly(preset: ModelPreset, displayName: String) {
-        val mmprojFile = preset.mmprojFile ?: return
-        val mmprojUrl = "https://huggingface.co/${preset.repoId}/resolve/main/$mmprojFile"
-        val mmprojDest = File(modelsDir, mmprojFile)
+        // Prevent double-clicking
+        if (mmprojDownloadInProgress) {
+            PluginLogger.info("mmproj download already in progress, ignoring duplicate request")
+            return
+        }
 
+        val mmprojFile = preset.mmprojFile ?: return
+        val sourceFile = preset.mmprojSourceFile ?: mmprojFile  // Use source name for URL
+        val mmprojUrl = "https://huggingface.co/${preset.repoId}/resolve/main/$sourceFile"
+        val mmprojDest = File(modelsDir, mmprojFile)  // Save with unique local name
+
+        // Check if already downloaded
+        if (mmprojDest.exists() && mmprojDest.length() > 1000) {
+            PluginLogger.info("mmproj already exists: ${mmprojDest.absolutePath}")
+            statusLabel.text = "Model ready: $displayName (vision enabled)"
+            downloadButton.text = "Change Model"
+            return
+        }
+
+        // Check if using external server - can't add mmproj to external server
+        val serverCheck = checkLlamaCppServer()
+        val isExternalServer = serverCheck == ServerCheckResult.LLAMA_CPP_RUNNING && serverProcess == null
+        if (isExternalServer) {
+            statusLabel.text = "External server detected - restart with mmproj manually"
+            PluginLogger.warn("Cannot add mmproj to external llama.cpp server. User must restart their server with --mmproj flag.")
+            Messages.showWarningDialog(
+                "An external llama.cpp server is running on port 8080.\n\n" +
+                "To enable vision support, you need to:\n" +
+                "1. Stop your external server\n" +
+                "2. Restart it with: --mmproj ${mmprojDest.absolutePath}\n\n" +
+                "Or let TrueFlow manage the server instead.",
+                "External Server Detected"
+            )
+            return
+        }
+
+        mmprojDownloadInProgress = true
+        downloadButton.isEnabled = false
         progressBar.isVisible = true
         progressBar.value = 0
         statusLabel.text = "Downloading vision projector..."
 
-        PluginLogger.info("Downloading mmproj from: $mmprojUrl")
+        PluginLogger.info("Downloading mmproj from: $mmprojUrl to ${mmprojDest.absolutePath}")
 
         CompletableFuture.runAsync {
             try {
@@ -2716,13 +2807,15 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         statusLabel.text = "Downloading vision projector... ${downloadedMB}MB / ${totalMB}MB ($pct%)"
                     }
                 }
-                // If server is running, restart it to pick up the new mmproj
+                // If server is running (our server, not external), restart it to pick up the new mmproj
                 val needsRestart = serverProcess != null && serverProcess!!.isAlive
 
                 SwingUtilities.invokeLater {
+                    mmprojDownloadInProgress = false
+                    downloadButton.isEnabled = true
                     progressBar.isVisible = false
                     downloadButton.text = "Change Model"
-                    PluginLogger.info("Downloaded mmproj file: $mmprojFile")
+                    PluginLogger.info("Downloaded mmproj file: $mmprojFile (${mmprojDest.length() / 1024 / 1024}MB)")
 
                     if (needsRestart) {
                         statusLabel.text = "Vision enabled! Restarting server..."
@@ -2742,6 +2835,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 }
             } catch (e: Exception) {
                 SwingUtilities.invokeLater {
+                    mmprojDownloadInProgress = false
+                    downloadButton.isEnabled = true
                     progressBar.isVisible = false
                     // Still allow using the model without vision
                     statusLabel.text = "Model ready (text-only, vision download failed: ${e.message?.take(50)})"
@@ -2755,6 +2850,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private fun toggleServer() {
         if (serverProcess != null && serverProcess!!.isAlive) {
             stopServer()
+        } else if (externalServerDetected) {
+            // External server running - offer to stop it
+            stopExternalServer()
         } else if (selectedHFModel != null) {
             startServerWithHF(selectedHFModel!!)
         } else {
@@ -2772,12 +2870,13 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 val existingStatus = readServerStatus()
                 val startedByDisplay = buildStartedByDisplay(existingStatus)
                 SwingUtilities.invokeLater {
-                    startServerButton.text = "Using External Server ($startedByDisplay)"
-                    startServerButton.isEnabled = false
-                    statusLabel.text = "AI Server already running (started by $startedByDisplay)"
-                    webChatPanel?.setServerRunning(true, existingStatus?.model ?: "")
-                    webChatPanel?.updateStatus("Connected via $startedByDisplay")
                     externalServerDetected = true
+                    startServerButton.text = "Stop External ($startedByDisplay)"
+                    startServerButton.isEnabled = true  // Allow stopping external server
+                    startServerButton.toolTipText = "Click to stop the external server (started by $startedByDisplay)"
+                    statusLabel.text = "AI Server already running (started by $startedByDisplay)"
+                    webChatPanel?.setServerRunning(true, existingStatus?.model ?: "", true)
+                    webChatPanel?.updateStatus("Connected via $startedByDisplay")
                 }
                 return
             }
@@ -2844,7 +2943,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     llamaServer,
                     "--model", modelFile,
                     "--port", "8080",
-                    "--ctx-size", "4096",
+                    "--ctx-size", "4096",  // Balanced for vision models (4096 too small, 8192 too slow)
                     "--threads", "${Runtime.getRuntime().availableProcessors()}",
                     "--host", "127.0.0.1",
                     "--jinja"  // Required for chat template support
@@ -2853,24 +2952,13 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 // Add vision model flags
                 if (isVisionModel) {
                     cmd.add("--kv-unified")
-                    // Only add --no-mmproj-offload if not using GPU
-                    if (!useGpuAcceleration || gpuAvailable == "none") {
+                    // Only add --no-mmproj-offload if not using GPU or llama.cpp doesn't support GPU
+                    if (!useGpuAcceleration || gpuAvailable == "none" || !llamaCppHasGpuSupport) {
                         cmd.add("--no-mmproj-offload")
                     }
                 }
 
-                // Add GPU acceleration flags if enabled and available
-                if (useGpuAcceleration && gpuAvailable != "none") {
-                    // Offload all layers to GPU
-                    cmd.addAll(listOf("--n-gpu-layers", "-1"))
-                    // Enable flash attention for CUDA (faster inference)
-                    if (gpuAvailable == "cuda") {
-                        cmd.add("--flash-attn")
-                    }
-                    PluginLogger.info("[TrueFlow] GPU acceleration enabled: $gpuAvailable")
-                }
-
-                // Add mmproj if available for vision models
+                // Add mmproj BEFORE GPU flags (to avoid --flash-attn parsing issues)
                 if (mmprojFile != null && mmprojFile.exists() && isVisionModel) {
                     cmd.addAll(listOf("--mmproj", mmprojFile.absolutePath))
                     PluginLogger.info("Using mmproj: ${mmprojFile.absolutePath}")
@@ -2884,9 +2972,76 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     }
                 }
 
+                // Add GPU acceleration flags LAST (--flash-attn must be at end to avoid arg parsing issues)
+                // Only add GPU flags if: 1) user wants GPU, 2) GPU is available, 3) llama.cpp supports GPU
+                if (useGpuAcceleration && gpuAvailable != "none" && llamaCppHasGpuSupport) {
+                    // Offload all layers to GPU
+                    cmd.addAll(listOf("--n-gpu-layers", "-1"))
+                    // Enable flash attention for CUDA (faster inference) - must be last flag
+                    if (gpuAvailable == "cuda") {
+                        cmd.addAll(listOf("--flash-attn", "on"))
+                    }
+                    PluginLogger.info("[TrueFlow] GPU acceleration enabled: $gpuAvailable")
+                } else if (useGpuAcceleration && gpuAvailable != "none" && !llamaCppHasGpuSupport) {
+                    PluginLogger.warn("[TrueFlow] GPU requested but llama.cpp is CPU-only build, skipping GPU flags")
+                }
+
+                // Create log file for llama.cpp server output (in project's .pycharm_plugin/logs)
+                val serverLogsDir = PluginPaths.getLogsDir(project)
+                val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format(java.util.Date())
+                serverLogFile = File(serverLogsDir, "llama_server_$timestamp.log")
+                serverLogWriter = java.io.PrintWriter(java.io.FileWriter(serverLogFile, true), true)
+
+                val logHeader = """
+                    |================================================================================
+                    |llama.cpp Server Log - Started at ${java.time.Instant.now()}
+                    |Model: $modelFile
+                    |Command: ${cmd.joinToString(" ")}
+                    |================================================================================
+                """.trimMargin()
+                serverLogWriter?.println(logHeader)
+                serverLogWriter?.flush()  // Ensure header is written immediately
+                PluginLogger.info("[TrueFlow] llama.cpp server log: ${serverLogFile?.absolutePath}")
+
                 serverProcess = ProcessBuilder(cmd)
                     .redirectErrorStream(true)
                     .start()
+
+                // Capture server output in background thread with explicit flush
+                val process = serverProcess
+                val logWriter = serverLogWriter
+                val logFile = serverLogFile
+                if (process != null && logWriter != null) {
+                    Thread {
+                        try {
+                            PluginLogger.info("[TrueFlow] Log capture started for: ${logFile?.absolutePath}")
+                            BufferedReader(InputStreamReader(process.inputStream, Charsets.UTF_8)).use { reader ->
+                                var line: String?
+                                while (reader.readLine().also { line = it } != null) {
+                                    val timestamp = java.time.LocalTime.now()
+                                    logWriter.println("[$timestamp] $line")
+                                    logWriter.flush()  // Explicit flush ensures logs are written immediately
+                                    println("[llama-server] $line")
+                                }
+                            }
+                            PluginLogger.info("[TrueFlow] Log capture ended (server stopped)")
+                        } catch (e: Exception) {
+                            if (e.message?.contains("Stream closed") != true) {
+                                PluginLogger.error("[TrueFlow] Log capture error: ${e.message}")
+                                try {
+                                    logWriter.println("[ERROR] Log capture failed: ${e.message}")
+                                    logWriter.flush()
+                                } catch (_: Exception) {}
+                            }
+                        }
+                    }.apply {
+                        isDaemon = true
+                        name = "llama-server-log-reader"
+                        start()
+                    }
+                } else {
+                    PluginLogger.warn("[TrueFlow] Cannot start log capture: process=${process != null}, logWriter=${logWriter != null}")
+                }
 
                 // Wait for server ready
                 var ready = false
@@ -2930,8 +3085,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         startServerButton.isEnabled = true
                         statusLabel.text = "AI Server running - Running benchmark..."
 
-                        // Update web panel
-                        webChatPanel?.setServerRunning(true, modelName)
+                        // Update web panel - managed (started by TrueFlow)
+                        webChatPanel?.setServerRunning(true, modelName, false)
                         webChatPanel?.updateStatus("Connected: $modelName")
 
                         // Run benchmark to measure CPU/GPU performance
@@ -2976,8 +3131,51 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     private fun stopServer() {
-        serverProcess?.destroyForcibly()
-        serverProcess = null
+        // Log server stop to the log file before closing
+        serverLogWriter?.println("\n[${java.time.LocalTime.now()}] ================================================================================")
+        serverLogWriter?.println("[${java.time.LocalTime.now()}] Server stopped at ${java.time.Instant.now()}")
+        serverLogWriter?.println("[${java.time.LocalTime.now()}] ================================================================================")
+        serverLogWriter?.flush()
+        serverLogWriter?.close()
+        serverLogWriter = null
+
+        val logPath = serverLogFile?.absolutePath
+        serverLogFile = null
+
+        // Properly terminate the server process
+        val process = serverProcess
+        serverProcess = null  // Clear immediately to prevent race conditions
+
+        if (process != null) {
+            // Do the heavy cleanup in background to avoid freezing UI
+            CompletableFuture.runAsync {
+                try {
+                    // Close process streams to allow log reader thread to exit
+                    process.inputStream?.close()
+                    process.errorStream?.close()
+                    process.outputStream?.close()
+                } catch (e: Exception) {
+                    PluginLogger.warn("[TrueFlow] Error closing process streams: ${e.message}")
+                }
+
+                // Destroy the process
+                process.destroyForcibly()
+
+                // Wait for process to actually terminate (up to 5 seconds)
+                try {
+                    val terminated = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+                    if (!terminated) {
+                        PluginLogger.warn("[TrueFlow] Server process did not terminate within 5 seconds")
+                    }
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+
+                if (logPath != null) {
+                    PluginLogger.info("[TrueFlow] Server log saved to: $logPath")
+                }
+            }
+        }
 
         // Clear shared status so other IDEs know server stopped (file-based fallback)
         writeServerStatus(null)
@@ -2994,6 +3192,130 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         webChatPanel?.updateStatus("Server stopped")
     }
 
+    /**
+     * Stop an external server (not started by this TrueFlow instance).
+     * Shows confirmation dialog and kills the process on port 8080.
+     */
+    private fun stopExternalServer() {
+        val status = readServerStatus()
+        val startedByDisplay = buildStartedByDisplay(status)
+
+        val result = Messages.showYesNoDialog(
+            project,
+            "This AI server was started by: $startedByDisplay\n\n" +
+            "Stopping it may affect other projects or applications using it.\n\n" +
+            "Are you sure you want to stop this server?",
+            "Stop External Server",
+            "Stop Server",
+            "Cancel",
+            Messages.getWarningIcon()
+        )
+
+        if (result != Messages.YES) {
+            return
+        }
+
+        // Set flag to prevent polling from resetting UI
+        stoppingServer = true
+        PluginLogger.info("[TrueFlow] User confirmed stopping external server (started by: $startedByDisplay)")
+
+        // Kill process on port 8080
+        CompletableFuture.runAsync {
+            try {
+                val isWindows = System.getProperty("os.name").lowercase().contains("windows")
+
+                if (isWindows) {
+                    // Windows: Find PID using netstat and kill with taskkill
+                    val findPid = ProcessBuilder("cmd", "/c", "netstat -ano | findstr :8080 | findstr LISTENING")
+                        .redirectErrorStream(true)
+                        .start()
+                    val output = findPid.inputStream.bufferedReader().readText()
+                    findPid.waitFor(5, TimeUnit.SECONDS)
+
+                    PluginLogger.info("[TrueFlow] netstat output: $output")
+
+                    // Parse PIDs from each line of netstat output (PID is last column)
+                    val pids = mutableSetOf<String>()
+                    output.trim().lines().forEach { line ->
+                        val parts = line.trim().split("\\s+".toRegex())
+                        if (parts.size >= 5) {
+                            val pid = parts.last()
+                            if (pid.isNotEmpty() && pid.all { it.isDigit() }) {
+                                pids.add(pid)
+                            }
+                        }
+                    }
+
+                    if (pids.isEmpty()) {
+                        PluginLogger.warn("[TrueFlow] No PIDs found on port 8080")
+                    } else {
+                        for (pid in pids) {
+                            PluginLogger.info("[TrueFlow] Killing process $pid on port 8080")
+                            val kill = ProcessBuilder("taskkill", "/F", "/PID", pid)
+                                .redirectErrorStream(true)
+                                .start()
+                            val killOutput = kill.inputStream.bufferedReader().readText()
+                            kill.waitFor(5, TimeUnit.SECONDS)
+                            PluginLogger.info("[TrueFlow] taskkill result: $killOutput")
+                        }
+                    }
+                } else {
+                    // Unix/Mac: Use lsof and kill
+                    val findPid = ProcessBuilder("sh", "-c", "lsof -ti:8080")
+                        .redirectErrorStream(true)
+                        .start()
+                    val output = findPid.inputStream.bufferedReader().readText().trim()
+                    findPid.waitFor(5, TimeUnit.SECONDS)
+
+                    PluginLogger.info("[TrueFlow] lsof output: $output")
+
+                    val pids = output.lines().filter { it.isNotBlank() }
+                    if (pids.isEmpty()) {
+                        PluginLogger.warn("[TrueFlow] No PIDs found on port 8080")
+                    } else {
+                        for (pid in pids) {
+                            PluginLogger.info("[TrueFlow] Killing process $pid on port 8080")
+                            val kill = ProcessBuilder("kill", "-9", pid)
+                                .redirectErrorStream(true)
+                                .start()
+                            kill.waitFor(5, TimeUnit.SECONDS)
+                        }
+                    }
+                }
+
+                // Clear status file
+                writeServerStatus(null)
+
+                // Wait for port to be fully released
+                Thread.sleep(1000)
+
+                SwingUtilities.invokeLater {
+                    externalServerDetected = false
+                    stoppingServer = false  // Allow polling to resume
+                    startServerButton.text = "Start AI Server"
+                    startServerButton.isEnabled = true
+                    startServerButton.toolTipText = "Start the local AI server"
+                    statusLabel.text = "External server stopped"
+                    webChatPanel?.setServerRunning(false)
+                    webChatPanel?.updateStatus("External server stopped")
+                    PluginLogger.info("[TrueFlow] External server stopped successfully")
+                }
+
+            } catch (e: Exception) {
+                PluginLogger.error("[TrueFlow] Failed to stop external server: ${e.message}")
+                SwingUtilities.invokeLater {
+                    stoppingServer = false  // Allow polling to resume even on error
+                    Messages.showErrorDialog(
+                        project,
+                        "Failed to stop the external server: ${e.message}\n\n" +
+                        "You may need to stop it manually.",
+                        "Error Stopping Server"
+                    )
+                }
+            }
+        }
+    }
+
     private fun startServerWithHF(hfModel: String) {
         // Check what's currently running on port 8080
         val serverCheck = checkLlamaCppServer()
@@ -3004,11 +3326,12 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                 val existingStatus = readServerStatus()
                 val startedByDisplay = buildStartedByDisplay(existingStatus)
                 SwingUtilities.invokeLater {
-                    startServerButton.text = "Using External Server ($startedByDisplay)"
-                    startServerButton.isEnabled = false
-                    statusLabel.text = "AI Server already running (started by $startedByDisplay)"
-                    webChatPanel?.setServerRunning(true, existingStatus?.model ?: "")
                     externalServerDetected = true
+                    startServerButton.text = "Stop External ($startedByDisplay)"
+                    startServerButton.isEnabled = true  // Allow stopping external server
+                    startServerButton.toolTipText = "Click to stop the external server (started by $startedByDisplay)"
+                    statusLabel.text = "AI Server already running (started by $startedByDisplay)"
+                    webChatPanel?.setServerRunning(true, existingStatus?.model ?: "", true)
                 }
                 return
             }
@@ -3055,7 +3378,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     llamaServer,
                     "-hf", hfModel,  // Direct HuggingFace loading
                     "--port", "8080",
-                    "--ctx-size", "4096",
+                    "--ctx-size", "4096",  // Balanced for vision models (4096 too small, 8192 too slow)
                     "--threads", "${Runtime.getRuntime().availableProcessors()}",
                     "--host", "127.0.0.1",
                     "--jinja"  // Required for chat template support
@@ -3071,25 +3394,81 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         PluginLogger.info("Using mmproj from HF repo: $mmprojName")
                     }
                     cmd.add("--kv-unified")  // Fix KV cache issues for vision models
-                    // Only add --no-mmproj-offload if not using GPU
-                    if (!useGpuAcceleration || gpuAvailable == "none") {
+                    // Only add --no-mmproj-offload if not using GPU or llama.cpp doesn't support GPU
+                    if (!useGpuAcceleration || gpuAvailable == "none" || !llamaCppHasGpuSupport) {
                         cmd.add("--no-mmproj-offload")
                     }
                 }
 
-                // Add GPU acceleration flags if enabled and available
-                if (useGpuAcceleration && gpuAvailable != "none") {
+                // Add GPU acceleration flags if enabled, available, AND llama.cpp supports GPU
+                if (useGpuAcceleration && gpuAvailable != "none" && llamaCppHasGpuSupport) {
                     cmd.addAll(listOf("--n-gpu-layers", "-1"))
                     if (gpuAvailable == "cuda") {
-                        cmd.add("--flash-attn")
+                        cmd.addAll(listOf("--flash-attn", "on"))
                     }
                     PluginLogger.info("[TrueFlow] GPU acceleration enabled for HF model: $gpuAvailable")
+                } else if (useGpuAcceleration && gpuAvailable != "none" && !llamaCppHasGpuSupport) {
+                    PluginLogger.warn("[TrueFlow] GPU requested but llama.cpp is CPU-only build, skipping GPU flags for HF model")
                 }
 
                 PluginLogger.info("Starting server with HF model: $hfModel")
+
+                // Create log file for llama.cpp server output (in project's .pycharm_plugin/logs)
+                val serverLogsDir = PluginPaths.getLogsDir(project)
+                val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format(java.util.Date())
+                serverLogFile = File(serverLogsDir, "llama_server_$timestamp.log")
+                serverLogWriter = java.io.PrintWriter(java.io.FileWriter(serverLogFile, true), true)
+
+                val logHeader = """
+                    |================================================================================
+                    |llama.cpp Server Log - Started at ${java.time.Instant.now()}
+                    |HuggingFace Model: $hfModel
+                    |Command: ${cmd.joinToString(" ")}
+                    |================================================================================
+                """.trimMargin()
+                serverLogWriter?.println(logHeader)
+                serverLogWriter?.flush()  // Ensure header is written immediately
+                PluginLogger.info("[TrueFlow] llama.cpp server log: ${serverLogFile?.absolutePath}")
+
                 serverProcess = ProcessBuilder(cmd)
                     .redirectErrorStream(true)
                     .start()
+
+                // Capture server output in background thread with explicit flush
+                val process = serverProcess
+                val logWriter = serverLogWriter
+                val logFile = serverLogFile
+                if (process != null && logWriter != null) {
+                    Thread {
+                        try {
+                            PluginLogger.info("[TrueFlow] Log capture started for HF model: ${logFile?.absolutePath}")
+                            BufferedReader(InputStreamReader(process.inputStream, Charsets.UTF_8)).use { reader ->
+                                var line: String?
+                                while (reader.readLine().also { line = it } != null) {
+                                    val timestamp = java.time.LocalTime.now()
+                                    logWriter.println("[$timestamp] $line")
+                                    logWriter.flush()  // Explicit flush ensures logs are written immediately
+                                    println("[llama-server] $line")
+                                }
+                            }
+                            PluginLogger.info("[TrueFlow] Log capture ended (server stopped)")
+                        } catch (e: Exception) {
+                            if (e.message?.contains("Stream closed") != true) {
+                                PluginLogger.error("[TrueFlow] Log capture error: ${e.message}")
+                                try {
+                                    logWriter.println("[ERROR] Log capture failed: ${e.message}")
+                                    logWriter.flush()
+                                } catch (_: Exception) {}
+                            }
+                        }
+                    }.apply {
+                        isDaemon = true
+                        name = "llama-server-log-reader"
+                        start()
+                    }
+                } else {
+                    PluginLogger.warn("[TrueFlow] Cannot start log capture: process=${process != null}, logWriter=${logWriter != null}")
+                }
 
                 // Wait for server ready (longer timeout for HF download)
                 var ready = false
@@ -3131,8 +3510,8 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         startServerButton.isEnabled = true
                         statusLabel.text = "AI Server running - Running benchmark..."
 
-                        // Update web panel
-                        webChatPanel?.setServerRunning(true, hfModel)
+                        // Update web panel - managed (started by TrueFlow)
+                        webChatPanel?.setServerRunning(true, hfModel, false)
                         webChatPanel?.updateStatus("Connected: $hfModel")
 
                         // Run benchmark to measure CPU/GPU performance
@@ -3533,13 +3912,49 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             "C:/llama.cpp/build/bin/llama-server.exe"
         )
         for (path in possiblePaths) {
-            if (File(path).exists()) return path
+            if (File(path).exists()) {
+                // Check if this llama.cpp binary has GPU support
+                checkLlamaCppGpuSupport(path)
+                return path
+            }
         }
         return try {
             val cmd = if (System.getProperty("os.name").lowercase().contains("win")) "where" else "which"
             val output = BufferedReader(InputStreamReader(ProcessBuilder(cmd, "llama-server").start().inputStream)).readLine()
-            if (output?.isNotEmpty() == true) output else null
+            if (output?.isNotEmpty() == true) {
+                checkLlamaCppGpuSupport(output)
+                output
+            } else null
         } catch (e: Exception) { null }
+    }
+
+    /**
+     * Check if llama.cpp binary was compiled with GPU (CUDA/Metal) support.
+     * Runs `llama-server --version` and checks for CUDA/Metal in the output.
+     */
+    private fun checkLlamaCppGpuSupport(llamaServerPath: String) {
+        try {
+            val process = ProcessBuilder(llamaServerPath, "--version")
+                .redirectErrorStream(true)
+                .start()
+            val completed = process.waitFor(5, TimeUnit.SECONDS)
+            if (completed) {
+                val output = process.inputStream.bufferedReader().readText().lowercase()
+                // Check for CUDA or Metal indicators in version/build info
+                llamaCppHasGpuSupport = output.contains("cuda") ||
+                                        output.contains("cublas") ||
+                                        output.contains("metal") ||
+                                        output.contains("gpu")
+                if (llamaCppHasGpuSupport) {
+                    PluginLogger.info("[TrueFlow] llama.cpp has GPU support")
+                } else {
+                    PluginLogger.info("[TrueFlow] llama.cpp is CPU-only (no CUDA/Metal in build)")
+                }
+            }
+        } catch (e: Exception) {
+            PluginLogger.debug("[TrueFlow] Could not check llama.cpp GPU support: ${e.message}")
+            llamaCppHasGpuSupport = false
+        }
     }
 
     private fun getResourcePath(): String {

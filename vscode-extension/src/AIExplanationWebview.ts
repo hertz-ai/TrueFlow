@@ -25,7 +25,8 @@ interface ModelPreset {
     hasVision: boolean;
     // Vision models require a multimodal projector (mmproj) file
     mmprojRepoId?: string;
-    mmprojFileName?: string;
+    mmprojFileName?: string;  // Source filename on HuggingFace
+    mmprojLocalFileName?: string;  // Unique local filename to avoid conflicts between models
     mmprojSizeMB?: number;
 }
 
@@ -48,6 +49,7 @@ const MODEL_PRESETS: ModelPreset[] = [
         hasVision: true,
         mmprojRepoId: "unsloth/Qwen3-VL-2B-Instruct-GGUF",
         mmprojFileName: "mmproj-F16.gguf",
+        mmprojLocalFileName: "mmproj-Qwen3-VL-2B-F16.gguf",
         mmprojSizeMB: 819
     },
     {
@@ -59,6 +61,7 @@ const MODEL_PRESETS: ModelPreset[] = [
         hasVision: true,
         mmprojRepoId: "unsloth/Qwen3-VL-2B-Thinking-GGUF",
         mmprojFileName: "mmproj-F16.gguf",
+        mmprojLocalFileName: "mmproj-Qwen3-VL-2B-Thinking-F16.gguf",
         mmprojSizeMB: 819
     },
     {
@@ -70,6 +73,7 @@ const MODEL_PRESETS: ModelPreset[] = [
         hasVision: true,
         mmprojRepoId: "unsloth/Qwen3-VL-4B-Instruct-GGUF",
         mmprojFileName: "mmproj-F16.gguf",
+        mmprojLocalFileName: "mmproj-Qwen3-VL-4B-F16.gguf",
         mmprojSizeMB: 819
     },
     // Gemma 3 models - Google's multimodal
@@ -82,6 +86,7 @@ const MODEL_PRESETS: ModelPreset[] = [
         hasVision: true,
         mmprojRepoId: "unsloth/gemma-3-4b-it-GGUF",
         mmprojFileName: "mmproj-F16.gguf",
+        mmprojLocalFileName: "mmproj-Gemma-3-4B-F16.gguf",
         mmprojSizeMB: 851
     },
     {
@@ -103,6 +108,7 @@ const MODEL_PRESETS: ModelPreset[] = [
         hasVision: true,
         mmprojRepoId: "ggml-org/SmolVLM-256M-Instruct-GGUF",
         mmprojFileName: "mmproj-SmolVLM-256M-Instruct-f16.gguf",
+        mmprojLocalFileName: "mmproj-SmolVLM-256M-F16.gguf",
         mmprojSizeMB: 50
     },
     // Text-only option
@@ -166,6 +172,23 @@ export class AIExplanationProvider {
     private ollamaEndpoint = 'http://127.0.0.1:11434';
     private totalTokensUsed = 0;
 
+    // llama.cpp server log capture
+    private serverLogFile: string | undefined;
+    private serverLogStream: fs.WriteStream | undefined;
+
+    /**
+     * Get the logs directory - uses workspace folder if available, falls back to home dir
+     */
+    private getServerLogsDir(): string {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (workspaceFolders && workspaceFolders.length > 0) {
+            // Use project-local .trueflow/logs (consistent with JetBrains plugin .pycharm_plugin/logs)
+            return path.join(workspaceFolders[0].uri.fsPath, '.trueflow', 'logs');
+        }
+        // Fallback to home directory
+        return path.join(process.env.HOME || process.env.USERPROFILE || '', '.trueflow', 'logs');
+    }
+
     // Benchmark results for CPU vs GPU comparison
     private cpuTokensPerSecond = 0;
     private gpuTokensPerSecond = 0;
@@ -176,6 +199,8 @@ export class AIExplanationProvider {
     private externalServerDetected = false;
     // Track if port 8080 is occupied by a non-llama.cpp service
     private portConflictDetected = false;
+    // Flag to prevent polling from resetting UI during stop operation
+    private stoppingServer = false;
     private gpuMemoryMB = 0;  // Total GPU memory
 
     private readonly modelsDir: string;
@@ -308,6 +333,11 @@ export class AIExplanationProvider {
         }
 
         this.statusCheckInterval = setInterval(async () => {
+            // Skip polling if we're in the middle of stopping a server
+            if (this.stoppingServer) {
+                return;
+            }
+
             const serverCheck = await this.checkLlamaCppServer();
             const status = this.readServerStatus();
             const currentProjectPath = this.getProjectPath();
@@ -734,6 +764,9 @@ export class AIExplanationProvider {
                 case 'stopServer':
                     this.stopServer();
                     break;
+                case 'stopExternalServer':
+                    await this.stopExternalServer();
+                    break;
                 case 'clearHistory':
                     this.conversationHistory = [];
                     this.postMessage({ command: 'historyCleared' });
@@ -963,7 +996,7 @@ export class AIExplanationProvider {
         const args = [
             '-hf', hfModel,  // Direct HuggingFace loading
             '--port', '8080',
-            '--ctx-size', '4096',
+            '--ctx-size', '4096',  // Balanced for vision (4096 too small, 8192 too slow)
             '--threads', String(cpuCount),
             '--host', '127.0.0.1',
             '--jinja'
@@ -983,18 +1016,53 @@ export class AIExplanationProvider {
 
         console.log(`[TrueFlow] Starting llama-server with HF: ${llamaServer} ${args.join(' ')}`);
 
+        // Create log file for llama.cpp server output (in project's .trueflow/logs)
+        const serverLogsDir = this.getServerLogsDir();
+        if (!fs.existsSync(serverLogsDir)) {
+            fs.mkdirSync(serverLogsDir, { recursive: true });
+        }
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+        this.serverLogFile = path.join(serverLogsDir, `llama_server_${timestamp}.log`);
+        this.serverLogStream = fs.createWriteStream(this.serverLogFile, { flags: 'a' });
+
+        const logHeader = `================================================================================
+llama.cpp Server Log - Started at ${new Date().toISOString()}
+HuggingFace Model: ${hfModel}
+Command: ${llamaServer} ${args.join(' ')}
+================================================================================\n`;
+        this.serverLogStream.write(logHeader);
+        console.log(`[TrueFlow] llama.cpp server log: ${this.serverLogFile}`);
+
         this.serverProcess = child_process.spawn(llamaServer, args);
         this.currentModelHasVision = isVisionModel;
 
         this.serverProcess.stdout?.on('data', (data) => {
-            console.log('[LLM Server]', data.toString());
+            const line = data.toString();
+            const ts = new Date().toLocaleTimeString();
+            // Write to log file
+            this.serverLogStream?.write(`[${ts}] ${line}`);
+            // Also print to console for debugging
+            console.log('[llama-server]', line);
         });
 
         this.serverProcess.stderr?.on('data', (data) => {
-            console.log('[LLM Server]', data.toString());
+            const line = data.toString();
+            const ts = new Date().toLocaleTimeString();
+            // Write to log file
+            this.serverLogStream?.write(`[${ts}] [STDERR] ${line}`);
+            // Also print to console for debugging
+            console.log('[llama-server]', line);
         });
 
         this.serverProcess.on('close', (code) => {
+            // Log server exit
+            const ts = new Date().toLocaleTimeString();
+            this.serverLogStream?.write(`\n[${ts}] ================================================================================\n`);
+            this.serverLogStream?.write(`[${ts}] Server exited with code ${code}\n`);
+            this.serverLogStream?.write(`[${ts}] ================================================================================\n`);
+            this.serverLogStream?.end();
+            this.serverLogStream = undefined;
+
             this.serverProcess = undefined;
             this.postMessage({ command: 'serverStopped' });
             if (code !== 0) {
@@ -1286,7 +1354,7 @@ export class AIExplanationProvider {
                 role: 'user',
                 content: [
                     { type: 'text', text: prompt },
-                    { type: 'image_url', image_url: { url: `data:image/png;base64,${imageBase64}` } }
+                    { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
                 ]
             });
         } else {
@@ -1462,7 +1530,7 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                 role: 'user',
                 content: [
                     { type: 'text', text: fullPrompt },
-                    { type: 'image_url', image_url: { url: `data:image/png;base64,${imageBase64}` } }
+                    { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
                 ]
             });
         } else {
@@ -1488,7 +1556,7 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                     'Content-Type': 'application/json',
                     'Content-Length': Buffer.byteLength(requestBody)
                 },
-                timeout: 120000
+                timeout: 180000  // 3 minutes for vision model processing
             }, (res) => {
                 // IMPORTANT: Set UTF-8 encoding to properly handle non-ASCII characters (Tamil, Chinese, etc.)
                 res.setEncoding('utf8');
@@ -1575,7 +1643,7 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                     'Content-Type': 'application/json',
                     'Content-Length': Buffer.byteLength(requestBody)
                 },
-                timeout: 120000
+                timeout: 180000  // 3 minutes for vision model processing
             }, (res) => {
                 // IMPORTANT: Set UTF-8 encoding to properly handle non-ASCII characters
                 res.setEncoding('utf8');
@@ -1754,7 +1822,7 @@ If context insufficient, use MCP tool. I'll execute & return results.`
                     'Content-Type': 'application/json',
                     'Content-Length': Buffer.byteLength(requestBody)
                 },
-                timeout: 120000
+                timeout: 180000  // 3 minutes for vision model processing
             }, (res) => {
                 // IMPORTANT: Set UTF-8 encoding to properly handle non-ASCII characters (Tamil, Chinese, etc.)
                 res.setEncoding('utf8');
@@ -1842,6 +1910,7 @@ If context insufficient, use MCP tool. I'll execute & return results.`
             fullyDownloadedModels,
             needsMmprojModels,
             serverRunning: !!this.serverProcess || externalRunning,
+            isExternalServer: externalRunning && !this.serverProcess,
             models: MODEL_PRESETS.map(m => ({
                 displayName: m.displayName,
                 sizeMB: m.sizeMB,
@@ -1922,7 +1991,9 @@ If context insufficient, use MCP tool. I'll execute & return results.`
             // Download mmproj file if this is a vision model
             if (preset.hasVision && preset.mmprojFileName && preset.mmprojRepoId) {
                 const mmprojUrl = `https://huggingface.co/${preset.mmprojRepoId}/resolve/main/${preset.mmprojFileName}`;
-                const mmprojDestPath = path.join(this.modelsDir, preset.mmprojFileName);
+                // Use unique local filename to avoid conflicts between different model sizes
+                const mmprojLocalName = preset.mmprojLocalFileName || preset.mmprojFileName;
+                const mmprojDestPath = path.join(this.modelsDir, mmprojLocalName);
 
                 // Check if mmproj already exists
                 if (!fs.existsSync(mmprojDestPath)) {
@@ -2013,7 +2084,8 @@ If context insufficient, use MCP tool. I'll execute & return results.`
 
         // For vision models, also check mmproj
         if (preset.hasVision && preset.mmprojFileName) {
-            const mmprojPath = path.join(this.modelsDir, preset.mmprojFileName);
+            const mmprojLocalName = preset.mmprojLocalFileName || preset.mmprojFileName;
+            const mmprojPath = path.join(this.modelsDir, mmprojLocalName);
             if (!fs.existsSync(mmprojPath)) {
                 return false;
             }
@@ -2029,7 +2101,9 @@ If context insufficient, use MCP tool. I'll execute & return results.`
         if (!preset.mmprojFileName || !preset.mmprojRepoId) return;
 
         const mmprojUrl = `https://huggingface.co/${preset.mmprojRepoId}/resolve/main/${preset.mmprojFileName}`;
-        const mmprojDestPath = path.join(this.modelsDir, preset.mmprojFileName);
+        // Use unique local filename to avoid conflicts between different model sizes
+        const mmprojLocalName = preset.mmprojLocalFileName || preset.mmprojFileName;
+        const mmprojDestPath = path.join(this.modelsDir, mmprojLocalName);
 
         this.postMessage({
             command: 'downloadProgress',
@@ -2139,7 +2213,7 @@ If context insufficient, use MCP tool. I'll execute & return results.`
         const args = [
             '--model', this.currentModelFile,
             '--port', '8080',
-            '--ctx-size', '4096',
+            '--ctx-size', '4096',  // Balanced for vision (4096 too small, 8192 too slow)
             '--threads', String(cpuCount),
             '--host', '127.0.0.1',
             '--jinja'  // Required for vision models chat template support
@@ -2148,13 +2222,15 @@ If context insufficient, use MCP tool. I'll execute & return results.`
         // Add vision model specific flags
         if (currentPreset?.hasVision && currentPreset?.mmprojFileName) {
             // Add mmproj (multimodal projector) file for vision capability
-            const mmprojPath = path.join(this.modelsDir, currentPreset.mmprojFileName);
+            // Use unique local filename to avoid conflicts between different model sizes
+            const mmprojLocalName = currentPreset.mmprojLocalFileName || currentPreset.mmprojFileName;
+            const mmprojPath = path.join(this.modelsDir, mmprojLocalName);
             if (fs.existsSync(mmprojPath)) {
                 args.push('--mmproj', mmprojPath);
                 console.log(`[TrueFlow] Using mmproj file: ${mmprojPath}`);
             } else {
                 vscode.window.showWarningMessage(
-                    `Vision projector file not found: ${currentPreset.mmprojFileName}. Vision features may not work. Try re-downloading the model.`
+                    `Vision projector file not found: ${mmprojLocalName}. Vision features may not work. Try re-downloading the model.`
                 );
             }
             // --kv-unified fixes KV cache issues on second+ multimodal requests for Qwen3-VL
@@ -2172,7 +2248,7 @@ If context insufficient, use MCP tool. I'll execute & return results.`
 
             // For CUDA, we can use flash attention for faster inference
             if (this.gpuAvailable === 'cuda') {
-                args.push('--flash-attn');
+                args.push('--flash-attn', 'on');
             }
 
             console.log(`[TrueFlow] GPU acceleration enabled: ${this.gpuAvailable}`);
@@ -2181,17 +2257,52 @@ If context insufficient, use MCP tool. I'll execute & return results.`
         // Log the full command for debugging
         console.log(`[TrueFlow] Starting llama-server: ${llamaServer} ${args.join(' ')}`);
 
+        // Create log file for llama.cpp server output (in project's .trueflow/logs)
+        const serverLogsDir = this.getServerLogsDir();
+        if (!fs.existsSync(serverLogsDir)) {
+            fs.mkdirSync(serverLogsDir, { recursive: true });
+        }
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+        this.serverLogFile = path.join(serverLogsDir, `llama_server_${timestamp}.log`);
+        this.serverLogStream = fs.createWriteStream(this.serverLogFile, { flags: 'a' });
+
+        const logHeader = `================================================================================
+llama.cpp Server Log - Started at ${new Date().toISOString()}
+Model: ${this.currentModelFile || 'unknown'}
+Command: ${llamaServer} ${args.join(' ')}
+================================================================================\n`;
+        this.serverLogStream.write(logHeader);
+        console.log(`[TrueFlow] llama.cpp server log: ${this.serverLogFile}`);
+
         this.serverProcess = child_process.spawn(llamaServer, args);
 
         this.serverProcess.stdout?.on('data', (data) => {
-            console.log('[LLM Server]', data.toString());
+            const line = data.toString();
+            const timestamp = new Date().toLocaleTimeString();
+            // Write to log file
+            this.serverLogStream?.write(`[${timestamp}] ${line}`);
+            // Also print to console for debugging
+            console.log('[llama-server]', line);
         });
 
         this.serverProcess.stderr?.on('data', (data) => {
-            console.log('[LLM Server]', data.toString());
+            const line = data.toString();
+            const timestamp = new Date().toLocaleTimeString();
+            // Write to log file
+            this.serverLogStream?.write(`[${timestamp}] [STDERR] ${line}`);
+            // Also print to console for debugging
+            console.log('[llama-server]', line);
         });
 
         this.serverProcess.on('close', (code) => {
+            // Log server exit
+            const timestamp = new Date().toLocaleTimeString();
+            this.serverLogStream?.write(`\n[${timestamp}] ================================================================================\n`);
+            this.serverLogStream?.write(`[${timestamp}] Server exited with code ${code}\n`);
+            this.serverLogStream?.write(`[${timestamp}] ================================================================================\n`);
+            this.serverLogStream?.end();
+            this.serverLogStream = undefined;
+
             this.serverProcess = undefined;
             this.postMessage({ command: 'serverStopped' });
             if (code !== 0) {
@@ -2520,7 +2631,33 @@ If context insufficient, use MCP tool. I'll execute & return results.`
 
     private stopServer(): void {
         if (this.serverProcess) {
-            this.serverProcess.kill();
+            // Close log file before killing the server
+            if (this.serverLogStream) {
+                const ts = new Date().toLocaleTimeString();
+                this.serverLogStream.write(`\n[${ts}] ================================================================================\n`);
+                this.serverLogStream.write(`[${ts}] Server stopped at ${new Date().toISOString()}\n`);
+                this.serverLogStream.write(`[${ts}] ================================================================================\n`);
+                this.serverLogStream.end();
+                this.serverLogStream = undefined;
+            }
+
+            const logPath = this.serverLogFile;
+            this.serverLogFile = undefined;
+
+            const proc = this.serverProcess;
+
+            // Close process streams
+            try {
+                proc.stdin?.end();
+                proc.stdout?.destroy();
+                proc.stderr?.destroy();
+            } catch (e) {
+                console.log('[TrueFlow] Error closing process streams:', e);
+            }
+
+            // Kill the process (SIGKILL on Unix, taskkill on Windows)
+            proc.kill('SIGKILL');
+
             this.serverProcess = undefined;
 
             // Clear shared status so other IDEs know server stopped (file-based fallback)
@@ -2531,6 +2668,158 @@ If context insufficient, use MCP tool. I'll execute & return results.`
 
             this.postMessage({ command: 'serverStopped' });
             vscode.window.showInformationMessage('AI server stopped');
+
+            if (logPath) {
+                console.log(`[TrueFlow] Server log saved to: ${logPath}`);
+            }
+
+            // Give OS time to release the port (especially on Windows)
+            // Note: This is async but we don't need to wait
+            setTimeout(() => {
+                console.log('[TrueFlow] Port should be released now');
+            }, 500);
+        }
+    }
+
+    /**
+     * Stop an externally-started llama.cpp server with user confirmation.
+     */
+    private async stopExternalServer(): Promise<void> {
+        // Read server status to get info about who started it
+        const status = this.readServerStatus();
+        let startedByDisplay = 'Unknown';
+
+        if (status?.startedBy) {
+            startedByDisplay = status.startedBy;
+            if (status.projectName) {
+                startedByDisplay = `${status.startedBy} (${status.projectName})`;
+            }
+        } else if (status?.projectName) {
+            startedByDisplay = status.projectName;
+        } else {
+            // Could be manually started from command line
+            startedByDisplay = 'External process (command line or another application)';
+        }
+
+        // Show confirmation dialog
+        const result = await vscode.window.showWarningMessage(
+            `This AI server was started by: ${startedByDisplay}\n\nStopping it may affect other projects or applications using it.`,
+            { modal: true },
+            'Stop Server',
+            'Cancel'
+        );
+
+        if (result !== 'Stop Server') {
+            return;
+        }
+
+        // Set flag to prevent polling from resetting UI
+        this.stoppingServer = true;
+        console.log(`[TrueFlow] User confirmed stopping external server`);
+
+        // Kill process on port 8080
+        const isWindows = process.platform === 'win32';
+        const { exec } = require('child_process');
+
+        try {
+            if (isWindows) {
+                // Windows: Use netstat to find PID, then taskkill
+                const findPidCmd = 'netstat -aon | findstr ":8080" | findstr "LISTENING"';
+                exec(findPidCmd, (err: any, stdout: string) => {
+                    console.log(`[TrueFlow] netstat output: ${stdout}`);
+                    if (err || !stdout) {
+                        console.warn('[TrueFlow] Could not find process on port 8080');
+                        this.stoppingServer = false;
+                        vscode.window.showErrorMessage('Could not find process on port 8080');
+                        return;
+                    }
+                    // Extract PID from netstat output (last column)
+                    const lines = stdout.trim().split('\n');
+                    const pids = new Set<string>();
+                    for (const line of lines) {
+                        const parts = line.trim().split(/\s+/);
+                        if (parts.length >= 5) {
+                            const pid = parts[parts.length - 1];
+                            if (/^\d+$/.test(pid)) {
+                                pids.add(pid);
+                            }
+                        }
+                    }
+
+                    if (pids.size === 0) {
+                        console.warn('[TrueFlow] No PIDs found on port 8080');
+                        this.stoppingServer = false;
+                        vscode.window.showErrorMessage('Could not find process on port 8080');
+                        return;
+                    }
+
+                    // Kill each PID
+                    let killCount = 0;
+                    const totalPids = pids.size;
+                    for (const pid of pids) {
+                        console.log(`[TrueFlow] Killing process ${pid} on port 8080`);
+                        exec(`taskkill /F /PID ${pid}`, (killErr: any, killStdout: string) => {
+                            console.log(`[TrueFlow] taskkill result for ${pid}: ${killStdout || killErr}`);
+                            killCount++;
+
+                            // After all kills complete, wait and update state
+                            if (killCount >= totalPids) {
+                                setTimeout(() => {
+                                    this.externalServerDetected = false;
+                                    this.stoppingServer = false;
+                                    this.postMessage({ command: 'serverStopped' });
+                                    vscode.window.showInformationMessage('External AI server stopped');
+                                }, 1000);
+                            }
+                        });
+                    }
+                });
+            } else {
+                // Unix: Use lsof to find PID
+                const findPidCmd = "lsof -i :8080 -t";
+                exec(findPidCmd, (err: any, stdout: string) => {
+                    console.log(`[TrueFlow] lsof output: ${stdout}`);
+                    if (err || !stdout) {
+                        console.warn('[TrueFlow] Could not find process on port 8080');
+                        this.stoppingServer = false;
+                        vscode.window.showErrorMessage('Could not find process on port 8080');
+                        return;
+                    }
+
+                    const pids = stdout.trim().split('\n').filter((p: string) => p);
+                    if (pids.length === 0) {
+                        console.warn('[TrueFlow] No PIDs found on port 8080');
+                        this.stoppingServer = false;
+                        vscode.window.showErrorMessage('Could not find process on port 8080');
+                        return;
+                    }
+
+                    let killCount = 0;
+                    for (const pid of pids) {
+                        console.log(`[TrueFlow] Killing process ${pid} on port 8080`);
+                        exec(`kill -9 ${pid}`, (killErr: any) => {
+                            if (!killErr) {
+                                console.log(`[TrueFlow] Killed external server process PID ${pid}`);
+                            }
+                            killCount++;
+
+                            // After all kills complete, wait and update state
+                            if (killCount >= pids.length) {
+                                setTimeout(() => {
+                                    this.externalServerDetected = false;
+                                    this.stoppingServer = false;
+                                    this.postMessage({ command: 'serverStopped' });
+                                    vscode.window.showInformationMessage('External AI server stopped');
+                                }, 1000);
+                            }
+                        });
+                    }
+                });
+            }
+        } catch (error) {
+            console.error('[TrueFlow] Error stopping external server:', error);
+            this.stoppingServer = false;
+            vscode.window.showErrorMessage(`Failed to stop external server: ${error}`);
         }
     }
 
@@ -3297,6 +3586,23 @@ ${methodCode}
         }
 
         .status-indicator.connected { background: #4caf50; }
+        .status-indicator.external { background: #ff9800; }
+
+        .server-type-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin-left: 6px;
+            font-weight: 500;
+        }
+        .server-type-badge.managed {
+            background: rgba(76, 175, 80, 0.2);
+            color: #4caf50;
+        }
+        .server-type-badge.external {
+            background: rgba(255, 152, 0, 0.2);
+            color: #ff9800;
+        }
 
         .controls {
             display: flex;
@@ -4065,6 +4371,7 @@ ${methodCode}
         <div class="header-title">
             <h2>TrueFlow AI Assistant</h2>
             <div class="status-indicator" id="statusIndicator"></div>
+            <span class="server-type-badge" id="serverTypeBadge" style="display: none;"></span>
         </div>
         <div class="tabs">
             <button class="tab-btn active" id="tabPresets">Preset Models</button>
@@ -4194,6 +4501,8 @@ ${methodCode}
         const vscode = acquireVsCodeApi();
         let pendingImageBase64 = null;
         let serverRunning = false;
+        let isExternalServer = false;
+        let externalServerStartedBy = '';
         let downloadedModels = [];
 
         // Elements
@@ -4203,6 +4512,7 @@ ${methodCode}
         const clearBtn = document.getElementById('clearBtn');
         const status = document.getElementById('status');
         const statusIndicator = document.getElementById('statusIndicator');
+        const serverTypeBadge = document.getElementById('serverTypeBadge');
         const progressBar = document.getElementById('progressBar');
         const progressFill = document.getElementById('progressFill');
         const chatContainer = document.getElementById('chatContainer');
@@ -4335,7 +4645,10 @@ ${methodCode}
         });
 
         serverBtn.addEventListener('click', () => {
-            if (serverRunning) {
+            if (serverRunning && isExternalServer) {
+                // External server - use stopExternalServer with confirmation
+                vscode.postMessage({ command: 'stopExternalServer' });
+            } else if (serverRunning) {
                 vscode.postMessage({ command: 'stopServer' });
             } else if (selectedHFModel) {
                 // Start with HuggingFace model
@@ -4451,28 +4764,51 @@ ${methodCode}
             clearImage();
         });
 
-        function handleImageFile(file) {
+        // Resize large images to max 512px and convert to JPEG for fast processing (~8s vs ~60s at 1024px)
+        function resizeAndEncodeImage(file, callback, name) {
             const reader = new FileReader();
             reader.onload = () => {
-                pendingImageBase64 = reader.result.split(',')[1];
-                imagePreview.src = reader.result;
-                imageInfo.textContent = file.name + ' (' + formatFileSize(file.size) + ')';
-                imagePreviewContainer.classList.add('active');
-                status.textContent = 'Image attached';
+                const img = new Image();
+                img.onload = () => {
+                    const maxSize = 512;
+                    let width = img.width;
+                    let height = img.height;
+
+                    // Resize if larger than maxSize
+                    if (width > maxSize || height > maxSize) {
+                        const scale = Math.min(maxSize / width, maxSize / height);
+                        width = Math.round(width * scale);
+                        height = Math.round(height * scale);
+                        console.log('[TrueFlow] Resized image from ' + img.width + 'x' + img.height + ' to ' + width + 'x' + height);
+                    }
+
+                    // Draw to canvas and convert to JPEG
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, width, height);
+
+                    // Get as JPEG (smaller than PNG)
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+                    pendingImageBase64 = dataUrl.split(',')[1];
+                    imagePreview.src = dataUrl;
+                    imageInfo.textContent = (name || file.name) + ' (' + width + 'x' + height + ')';
+                    imagePreviewContainer.classList.add('active');
+                    status.textContent = 'Image attached';
+                    if (callback) callback();
+                };
+                img.src = reader.result;
             };
             reader.readAsDataURL(file);
         }
 
+        function handleImageFile(file) {
+            resizeAndEncodeImage(file, null, file.name);
+        }
+
         function handleImageBlob(blob, name) {
-            const reader = new FileReader();
-            reader.onload = () => {
-                pendingImageBase64 = reader.result.split(',')[1];
-                imagePreview.src = reader.result;
-                imageInfo.textContent = name;
-                imagePreviewContainer.classList.add('active');
-                status.textContent = 'Image attached';
-            };
-            reader.readAsDataURL(blob);
+            resizeAndEncodeImage(blob, null, name);
         }
 
         function clearImage() {
@@ -4570,9 +4906,22 @@ ${methodCode}
                     });
                     serverBtn.disabled = downloadedModels.length === 0;
                     serverRunning = msg.serverRunning;
+                    isExternalServer = msg.isExternalServer || false;
                     serverBtn.textContent = serverRunning ? 'Stop Server' : 'Start Server';
                     serverBtn.className = serverRunning ? 'danger' : 'secondary';
-                    statusIndicator.className = 'status-indicator' + (serverRunning ? ' connected' : '');
+                    // Update status indicator with proper class
+                    if (serverRunning) {
+                        statusIndicator.className = 'status-indicator ' + (isExternalServer ? 'external' : 'connected');
+                        serverTypeBadge.textContent = isExternalServer ? 'External' : 'Managed';
+                        serverTypeBadge.className = 'server-type-badge ' + (isExternalServer ? 'external' : 'managed');
+                        serverTypeBadge.style.display = 'inline-block';
+                        serverTypeBadge.title = isExternalServer ?
+                            'Server started externally (not managed by TrueFlow)' :
+                            'Server started and managed by TrueFlow';
+                    } else {
+                        statusIndicator.className = 'status-indicator';
+                        serverTypeBadge.style.display = 'none';
+                    }
                     status.textContent = serverRunning ? 'AI Server running - Ready!' :
                         (downloadedModels.length > 0 ? 'Model ready. Start server to chat.' : 'Download a model to begin.');
                     // Reset download button state
@@ -4668,10 +5017,18 @@ ${methodCode}
 
                 case 'serverStarted':
                     serverRunning = true;
+                    isExternalServer = false;
                     serverBtn.textContent = 'Stop Server';
                     serverBtn.className = 'danger';
                     serverBtn.disabled = false;
+                    // Update status indicator (green for managed)
+                    statusIndicator.classList.remove('external');
                     statusIndicator.classList.add('connected');
+                    // Show managed badge
+                    serverTypeBadge.textContent = 'Managed';
+                    serverTypeBadge.className = 'server-type-badge managed';
+                    serverTypeBadge.style.display = 'inline-block';
+                    serverTypeBadge.title = 'Server started and managed by TrueFlow';
                     // Show current mode (CPU/GPU)
                     const mode = msg.currentMode || 'CPU';
                     status.textContent = 'AI Server running on ' + mode + ' - Ready to chat!';
@@ -4685,11 +5042,15 @@ ${methodCode}
 
                 case 'serverStopped':
                     serverRunning = false;
+                    isExternalServer = false;
+                    externalServerStartedBy = '';
                     serverBtn.textContent = 'Start Server';
                     serverBtn.className = 'secondary';
                     serverBtn.disabled = false;
                     serverBtn.title = 'Start the local AI server';
-                    statusIndicator.classList.remove('connected');
+                    statusIndicator.classList.remove('connected', 'external');
+                    // Hide badge when stopped
+                    serverTypeBadge.style.display = 'none';
                     status.textContent = 'AI Server stopped';
                     // Clear benchmark info
                     const benchmarkInfoStop = document.getElementById('benchmarkInfo');
@@ -4743,11 +5104,15 @@ ${methodCode}
 
                 case 'imageSelected':
                     if (msg.imageBase64) {
-                        pendingImageBase64 = msg.imageBase64;
-                        imagePreview.src = 'data:image/png;base64,' + msg.imageBase64;
-                        imageInfo.textContent = msg.fileName || 'Selected image';
-                        imagePreviewContainer.classList.add('active');
-                        status.textContent = 'Image selected';
+                        // Convert base64 to blob and resize
+                        const byteString = atob(msg.imageBase64);
+                        const ab = new ArrayBuffer(byteString.length);
+                        const ia = new Uint8Array(ab);
+                        for (let i = 0; i < byteString.length; i++) {
+                            ia[i] = byteString.charCodeAt(i);
+                        }
+                        const blob = new Blob([ab], { type: 'image/png' });
+                        resizeAndEncodeImage(blob, null, msg.fileName || 'Selected image');
                     }
                     break;
 
@@ -4760,14 +5125,23 @@ ${methodCode}
                     break;
 
                 case 'externalServerRunning':
-                    // Server is running from another IDE (PyCharm, etc.) - disable controls
+                    // Server is running from another IDE (PyCharm, etc.) - allow stopping
                     serverRunning = true;
-                    serverBtn.textContent = 'External Server (' + (msg.startedBy || 'external') + ')';
+                    isExternalServer = true;
+                    externalServerStartedBy = msg.startedBy || 'external';
+                    serverBtn.textContent = 'Stop External (' + externalServerStartedBy + ')';
                     serverBtn.className = 'secondary';
-                    serverBtn.disabled = true;
-                    serverBtn.title = 'Server running at port 8080 (started externally). Stop it manually to use VS Code\\'s built-in server.';
+                    serverBtn.disabled = false;  // Enable to allow stopping external server
+                    serverBtn.title = 'Click to stop the external server (started by ' + externalServerStartedBy + ')';
                     sendBtn.disabled = false;
-                    statusIndicator.classList.add('connected');
+                    // Update status indicator (orange for external)
+                    statusIndicator.classList.remove('connected');
+                    statusIndicator.classList.add('external');
+                    // Show external badge
+                    serverTypeBadge.textContent = 'External';
+                    serverTypeBadge.className = 'server-type-badge external';
+                    serverTypeBadge.style.display = 'inline-block';
+                    serverTypeBadge.title = 'Server started externally (not managed by TrueFlow)';
                     status.textContent = 'Using external AI server - Ready to chat!';
                     // Disable GPU checkbox for external server (we don't control it)
                     const gpuCheckboxExt = document.getElementById('gpuCheckbox') as HTMLInputElement;

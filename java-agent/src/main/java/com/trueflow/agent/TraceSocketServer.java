@@ -146,6 +146,9 @@ public class TraceSocketServer {
                 // Send function registry when client connects
                 send(instrumentor.getFunctionRegistryJson());
 
+                // Send branch registry if available (for "Why Not Covered" analysis)
+                sendBranchRegistryWhenReady();
+
                 // Listen for commands from client
                 while (connected && running) {
                     String line = reader.readLine();
@@ -168,6 +171,41 @@ public class TraceSocketServer {
         }
 
         /**
+         * Send branch registry to client when analysis is complete.
+         * Waits up to 5 seconds for analysis to complete.
+         */
+        private void sendBranchRegistryWhenReady() {
+            // Try to send immediately if ready
+            String branchRegistry = instrumentor.getBranchRegistryJson();
+            if (branchRegistry != null) {
+                send(branchRegistry);
+                LOGGER.info("[TrueFlow] Sent branch registry to client");
+                return;
+            }
+
+            // Wait for analysis to complete (up to 5 seconds)
+            Thread waiter = new Thread(() -> {
+                int attempts = 0;
+                while (connected && running && attempts < 50) {
+                    try {
+                        Thread.sleep(100);
+                        String registry = instrumentor.getBranchRegistryJson();
+                        if (registry != null) {
+                            send(registry);
+                            LOGGER.info("[TrueFlow] Sent branch registry to client (after wait)");
+                            return;
+                        }
+                        attempts++;
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+            }, "TrueFlow-BranchRegistrySender");
+            waiter.setDaemon(true);
+            waiter.start();
+        }
+
+        /**
          * Handle commands received from the IDE.
          */
         private void handleCommand(String command) {
@@ -182,6 +220,11 @@ public class TraceSocketServer {
                         LOGGER.info("[TrueFlow] Tracing resumed by client");
                     } else if (command.contains("\"get_registry\"")) {
                         send(instrumentor.getFunctionRegistryJson());
+                    } else if (command.contains("\"get_branch_registry\"")) {
+                        String branchRegistry = instrumentor.getBranchRegistryJson();
+                        if (branchRegistry != null) {
+                            send(branchRegistry);
+                        }
                     } else if (command.contains("\"finalize\"")) {
                         instrumentor.finalize("./.trueflow/traces");
                     }

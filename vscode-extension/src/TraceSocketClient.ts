@@ -11,7 +11,7 @@ import { EventEmitter } from 'events';
  *  "file":"/path","line":10,"depth":2,"correlation_id":"cycle_001"}
  */
 export interface TraceEvent {
-    type: 'call' | 'return' | 'exception';
+    type: 'call' | 'return' | 'exception' | 'function_registry' | 'branch_registry';
     timestamp: number;
     call_id: string;
     module: string;
@@ -24,6 +24,24 @@ export interface TraceEvent {
     return_value?: any;
     exception?: string;
     duration_ms?: number;
+    trace_data?: any;  // For registry events
+}
+
+// Branch info for "Why Not Covered" analysis
+export interface CallSiteBranchInfo {
+    type: string;        // "if", "elif", "else", "for", "while", "try", "except"
+    condition: string;   // Actual condition text
+    line: number;        // Line number of the branch
+    end_line: number;    // End line of the branch block
+}
+
+export interface CallSiteInfo {
+    callee: string;
+    caller: string;
+    caller_module: string;
+    file: string;
+    line: number;
+    in_branch: CallSiteBranchInfo | null;
 }
 
 export interface PerformanceData {
@@ -148,10 +166,28 @@ export class TraceSocketClient extends EventEmitter {
         }
     }
 
+    // Storage for registry data
+    private functionRegistry: Map<string, { file: string; line: number }> = new Map();
+    private callSites: CallSiteInfo[] = [];
+    private functionBranches: Map<string, any[]> = new Map();
+
     /**
      * Handle a single trace event
      */
     private handleEvent(event: TraceEvent): void {
+        // Handle special registry events (never sampled)
+        if (event.type === 'function_registry') {
+            this.handleFunctionRegistry(event);
+            this.emit('functionRegistry', event);
+            return;
+        }
+
+        if (event.type === 'branch_registry') {
+            this.handleBranchRegistry(event);
+            this.emit('branchRegistry', event);
+            return;
+        }
+
         // Apply sampling for high-frequency events
         this.eventCounter++;
         if (this.eventCounter % this.sampleRate !== 0) {
@@ -188,6 +224,72 @@ export class TraceSocketClient extends EventEmitter {
         if (this.eventCounter % 100 === 0) {
             this.emit('batch', this.eventBuffer.slice(-100));
         }
+    }
+
+    /**
+     * Handle function registry event
+     */
+    private handleFunctionRegistry(event: TraceEvent): void {
+        if (!event.trace_data?.functions) return;
+
+        this.functionRegistry.clear();
+        for (const func of event.trace_data.functions) {
+            const key = `${func.module}.${func.function}`;
+            this.functionRegistry.set(key, { file: func.file, line: func.line });
+        }
+        console.log(`[TraceSocketClient] Received function registry: ${this.functionRegistry.size} functions`);
+    }
+
+    /**
+     * Handle branch registry event for "Why Not Covered" analysis
+     */
+    private handleBranchRegistry(event: TraceEvent): void {
+        if (!event.trace_data) return;
+
+        // Parse call sites with branch info
+        this.callSites = (event.trace_data.call_sites || []).map((site: any) => ({
+            callee: site.callee,
+            caller: site.caller,
+            caller_module: site.caller_module,
+            file: site.file,
+            line: site.line,
+            in_branch: site.in_branch ? {
+                type: site.in_branch.type,
+                condition: site.in_branch.condition,
+                line: site.in_branch.line,
+                end_line: site.in_branch.end_line
+            } : null
+        }));
+
+        // Parse function branches
+        this.functionBranches.clear();
+        const funcBranches = event.trace_data.function_branches || {};
+        for (const [funcKey, data] of Object.entries(funcBranches as Record<string, any>)) {
+            this.functionBranches.set(funcKey, data.branches || []);
+        }
+
+        console.log(`[TraceSocketClient] Received branch registry: ${this.callSites.length} call sites, ${this.functionBranches.size} functions`);
+    }
+
+    /**
+     * Get all defined functions from registry
+     */
+    getFunctionRegistry(): Map<string, { file: string; line: number }> {
+        return this.functionRegistry;
+    }
+
+    /**
+     * Get call sites with branch info for "Why Not Covered"
+     */
+    getCallSites(): CallSiteInfo[] {
+        return this.callSites;
+    }
+
+    /**
+     * Get function branches
+     */
+    getFunctionBranches(): Map<string, any[]> {
+        return this.functionBranches;
     }
 
     /**

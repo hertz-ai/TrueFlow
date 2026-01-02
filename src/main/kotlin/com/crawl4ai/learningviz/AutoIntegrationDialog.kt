@@ -17,17 +17,29 @@ import java.io.File
 import javax.swing.*
 
 /**
- * Dialog for automatically integrating auto-instrumentation into any Python repository.
+ * Dialog for automatically integrating auto-instrumentation into any Python or Java repository.
  *
  * IMPORTANT: NEVER modifies user code! All integration via:
  * - Environment variables in run configurations
+ * - VM options (-javaagent) for Java
  * - .env file (optional)
- * - PyCharm settings
+ * - IDE settings
  *
- * User just selects the main entry point (e.g., main.py, app.py, manage.py)
- * and the dialog handles the rest - NO CODE CHANGES!
+ * User just selects the main entry point and the dialog handles the rest - NO CODE CHANGES!
+ *
+ * For Python: Uses PYTHONPATH + sitecustomize.py
+ * For Java: Uses -javaagent VM option with bundled TrueFlow agent JAR
  */
 class AutoIntegrationDialog(private val project: Project) : DialogWrapper(project) {
+
+    // Project type detection
+    private enum class ProjectType { PYTHON, JAVA, MIXED, UNKNOWN }
+    private var detectedProjectType: ProjectType = ProjectType.UNKNOWN
+
+    private val projectTypeCombo = JComboBox(arrayOf(
+        "Python (sitecustomize.py injection)",
+        "Java (javaagent injection)"
+    ))
 
     private val entryPointField = JBTextField(40)
     private val entryPointButton = JButton("Browse...")
@@ -35,14 +47,18 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
     private val traceDirButton = JButton("Browse...")
 
     private val integrationMethodCombo = JComboBox(arrayOf(
-        "PyCharm Run Configuration (Recommended - Zero code changes)",
+        "IDE Run Configuration (Recommended - Zero code changes)",
         "Environment Variable File (.env - No code changes)"
     ))
 
     private val modulesToTraceField = JBTextField(40)
     private val excludeModulesField = JBTextField(40)
 
-    private val createRunConfigCheckbox = JCheckBox("Create PyCharm run configuration", true)
+    // Java-specific options
+    private val javaPackagesField = JBTextField(40)
+    private val javaExcludeField = JBTextField(40)
+
+    private val createRunConfigCheckbox = JCheckBox("Create IDE run configuration", true)
     private val openTraceDirCheckbox = JCheckBox("Open trace directory after integration", true)
 
     private var selectedEntryPoint: VirtualFile? = null
@@ -52,6 +68,19 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
         title = "Auto-Integrate Tracing into Repository"
         init()
 
+        // Detect project type automatically
+        detectedProjectType = detectProjectType()
+        when (detectedProjectType) {
+            ProjectType.JAVA -> projectTypeCombo.selectedIndex = 1
+            ProjectType.PYTHON -> projectTypeCombo.selectedIndex = 0
+            ProjectType.MIXED -> projectTypeCombo.selectedIndex = 0  // Default to Python for mixed
+            ProjectType.UNKNOWN -> projectTypeCombo.selectedIndex = 0
+        }
+
+        // Only show project type selector for mixed projects
+        // For pure Python or pure Java projects, auto-detect and hide the combo
+        projectTypeCombo.isVisible = (detectedProjectType == ProjectType.MIXED)
+
         entryPointButton.addActionListener {
             selectEntryPoint()
         }
@@ -60,8 +89,48 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
             selectTraceDirectory()
         }
 
-        // Set default trace directory to .pycharm_plugin/traces
-        traceDirectoryField.text = "${project.basePath}/.pycharm_plugin/traces"
+        // Set default trace directory
+        traceDirectoryField.text = "${project.basePath}/.trueflow/traces"
+
+        // Update UI when project type changes
+        projectTypeCombo.addActionListener {
+            updateUIForProjectType()
+        }
+        updateUIForProjectType()
+    }
+
+    private fun detectProjectType(): ProjectType {
+        val basePath = project.basePath ?: return ProjectType.UNKNOWN
+        val baseDir = File(basePath)
+
+        val hasPython = baseDir.walkTopDown().maxDepth(3).any { it.extension == "py" }
+        val hasJava = baseDir.walkTopDown().maxDepth(3).any { it.extension == "java" } ||
+                File(baseDir, "pom.xml").exists() ||
+                File(baseDir, "build.gradle").exists() ||
+                File(baseDir, "build.gradle.kts").exists()
+
+        return when {
+            hasPython && hasJava -> ProjectType.MIXED
+            hasJava -> ProjectType.JAVA
+            hasPython -> ProjectType.PYTHON
+            else -> ProjectType.UNKNOWN
+        }
+    }
+
+    private fun updateUIForProjectType() {
+        val isJava = projectTypeCombo.selectedIndex == 1
+        // Update field labels and defaults based on project type
+        if (isJava) {
+            modulesToTraceField.toolTipText = "Java packages to trace (e.g., com.myapp,com.mylib). Leave empty to trace all."
+            excludeModulesField.text = "org.springframework,org.hibernate"
+            excludeModulesField.toolTipText = "Packages to exclude from tracing"
+            entryPointField.toolTipText = "Main class with main() method, or any .java file"
+        } else {
+            modulesToTraceField.toolTipText = "Comma-separated list (e.g., myapp,mylib). Leave empty to trace all."
+            excludeModulesField.text = "test,tests,pytest,unittest"
+            excludeModulesField.toolTipText = "Comma-separated list of modules to exclude"
+            entryPointField.toolTipText = "Entry point: .py, .bat, .sh, .ps1, docker-compose.yml, Dockerfile"
+        }
     }
 
     override fun createCenterPanel(): JComponent {
@@ -72,12 +141,30 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
         gbc.anchor = GridBagConstraints.WEST
         gbc.insets = java.awt.Insets(5, 5, 5, 5)
 
-        // Title
-        val titleLabel = JBLabel("<html><h2>Auto-Integrate Tracing</h2><p>Select your Python entry point and configure tracing</p></html>")
+        // Title - customize based on detected project type
+        val projectTypeDisplay = when (detectedProjectType) {
+            ProjectType.JAVA -> "Java/Kotlin"
+            ProjectType.PYTHON -> "Python"
+            ProjectType.MIXED -> "Python or Java/Kotlin"
+            ProjectType.UNKNOWN -> "Python or Java/Kotlin"
+        }
+        val titleLabel = JBLabel("<html><h2>Auto-Integrate Tracing</h2><p>Detected: <b>$projectTypeDisplay</b> project - Select entry point to configure tracing</p></html>")
         gbc.gridwidth = 3
         panel.add(titleLabel, gbc)
 
+        // Project type selection - only shown for mixed projects
+        if (detectedProjectType == ProjectType.MIXED || detectedProjectType == ProjectType.UNKNOWN) {
+            gbc.gridy++
+            gbc.gridwidth = 1
+            panel.add(JBLabel("Project Type:"), gbc)
+            gbc.gridx = 1
+            gbc.gridwidth = 2
+            projectTypeCombo.toolTipText = "Auto-detected as mixed project - select which language to trace"
+            panel.add(projectTypeCombo, gbc)
+        }
+
         gbc.gridy++
+        gbc.gridx = 0
         gbc.gridwidth = 1
 
         // Entry point selection
@@ -163,13 +250,22 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
     }
 
     private fun selectEntryPoint() {
+        val isJava = projectTypeCombo.selectedIndex == 1
+
         val descriptor = FileChooserDescriptor(true, false, false, false, false, false)
             .withTitle("Select Entry Point")
-            .withDescription("Select entry point: .py, .bat, .sh, .ps1, docker-compose.yml, Dockerfile, etc.")
+            .withDescription(if (isJava)
+                "Select Java/Kotlin main class (.java, .kt) or build file (pom.xml, build.gradle)"
+                else "Select entry point: .py, .bat, .sh, .ps1, docker-compose.yml, Dockerfile, etc.")
             .withFileFilter { file ->
                 val ext = file.extension?.lowercase()
-                ext in listOf("py", "bat", "sh", "ps1", "cmd", "yml", "yaml") ||
-                file.name.lowercase() in listOf("dockerfile", "docker-compose.yml", "docker-compose.yaml")
+                if (isJava) {
+                    ext in listOf("java", "kt", "kts", "xml", "gradle") ||
+                    file.name in listOf("pom.xml", "build.gradle", "build.gradle.kts")
+                } else {
+                    ext in listOf("py", "bat", "sh", "ps1", "cmd", "yml", "yaml") ||
+                    file.name.lowercase() in listOf("dockerfile", "docker-compose.yml", "docker-compose.yaml")
+                }
             }
 
         val file = FileChooser.chooseFile(descriptor, project, project.baseDir)
@@ -192,8 +288,11 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
     }
 
     override fun doOKAction() {
+        val isJava = projectTypeCombo.selectedIndex == 1
+        val entryType = if (isJava) "Java/Kotlin" else "Python"
+
         if (selectedEntryPoint == null) {
-            Messages.showErrorDialog(project, "Please select a Python entry point", "Error")
+            Messages.showErrorDialog(project, "Please select a $entryType entry point", "Error")
             return
         }
 
@@ -211,6 +310,7 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
         val integrationMethod = integrationMethodCombo.selectedIndex
         val modulesToTrace = modulesToTraceField.text.split(",").map { it.trim() }.filter { it.isNotEmpty() }
         val excludeModules = excludeModulesField.text.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        val isJava = projectTypeCombo.selectedIndex == 1
 
         // Create trace directory
         val traceDirFile = File(traceDir)
@@ -218,14 +318,20 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
             traceDirFile.mkdirs()
         }
 
-        // IMPORTANT: NEVER modify user code - always use environment variables!
-        when (integrationMethod) {
-            0 -> integrateViaRunConfiguration(entryPoint, traceDir, modulesToTrace, excludeModules)
-            1 -> integrateViaEnvFile(entryPoint, traceDir, modulesToTrace, excludeModules)
-        }
+        if (isJava) {
+            // Java/Kotlin integration
+            performJavaIntegration(entryPoint, traceDir, modulesToTrace, excludeModules)
+        } else {
+            // Python integration
+            // IMPORTANT: NEVER modify user code - always use environment variables!
+            when (integrationMethod) {
+                0 -> integrateViaRunConfiguration(entryPoint, traceDir, modulesToTrace, excludeModules)
+                1 -> integrateViaEnvFile(entryPoint, traceDir, modulesToTrace, excludeModules)
+            }
 
-        // Create run configuration (always - this is the main integration method)
-        createRunConfiguration(entryPoint, traceDir, modulesToTrace, excludeModules)
+            // Create run configuration (always - this is the main integration method)
+            createRunConfiguration(entryPoint, traceDir, modulesToTrace, excludeModules)
+        }
 
         // Open trace directory if requested
         if (openTraceDirCheckbox.isSelected) {
@@ -234,21 +340,296 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
         }
 
         // Show success message
-        val method = if (integrationMethod == 0) "PyCharm Run Configuration" else "Environment File (.env)"
+        val language = if (isJava) "Java/Kotlin" else "Python"
+        val method = if (isJava) "-javaagent VM option" else
+            (if (integrationMethod == 0) "IDE Run Configuration" else "Environment File (.env)")
         val message = """
-            Integration complete! NO CODE CHANGES MADE.
+            $language Integration complete! NO CODE CHANGES MADE.
 
             Entry point: ${entryPoint.name}
             Trace directory: $traceDir
             Method: $method
 
             Next steps:
-            1. Run "${entryPoint.nameWithoutExtension}" configuration (green play button)
-            2. Open "Learning Flow Visualizer" tool window
+            1. Run your application using the created configuration
+            2. Open "TrueFlow" tool window
             3. View traces in real-time!
         """.trimIndent()
 
         Messages.showInfoMessage(project, message, "Integration Successful")
+    }
+
+    /**
+     * Perform Java/Kotlin integration:
+     * 1. Extract bundled Java agent JAR to .trueflow/java-agent/
+     * 2. Create/modify run configuration with -javaagent VM option
+     */
+    private fun performJavaIntegration(
+        entryPoint: VirtualFile,
+        traceDir: String,
+        packagesToTrace: List<String>,
+        excludePackages: List<String>
+    ) {
+        // Extract Java agent JAR
+        val agentPath = extractJavaAgent()
+        if (agentPath == null) {
+            Messages.showErrorDialog(
+                project,
+                "Failed to extract Java agent. Please check plugin installation.",
+                "Java Agent Error"
+            )
+            return
+        }
+
+        // Create Java run configuration
+        createJavaRunConfiguration(entryPoint, traceDir, packagesToTrace, excludePackages, agentPath)
+    }
+
+    /**
+     * Extract the bundled Java agent JAR to ~/.trueflow/java-agent/
+     * Returns the path to the extracted JAR, or null on failure.
+     */
+    private fun extractJavaAgent(): String? {
+        val trueflowDir = File(System.getProperty("user.home"), ".trueflow")
+        val javaAgentDir = File(trueflowDir, "java-agent")
+        javaAgentDir.mkdirs()
+
+        val agentJar = File(javaAgentDir, "trueflow-agent.jar")
+
+        // Check if already extracted
+        if (agentJar.exists()) {
+            PluginLogger.info("[TrueFlow] Java agent already exists: ${agentJar.absolutePath}")
+            return agentJar.absolutePath
+        }
+
+        try {
+            // Extract from plugin resources
+            val resourceStream = javaClass.getResourceAsStream("/java-agent/trueflow-agent.jar")
+
+            if (resourceStream != null) {
+                resourceStream.use { input ->
+                    agentJar.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                PluginLogger.info("[TrueFlow] Extracted Java agent to: ${agentJar.absolutePath}")
+                return agentJar.absolutePath
+            } else {
+                // Try development fallback
+                val devJar = File("${project.basePath}/java-agent/build/libs/trueflow-agent.jar")
+                if (devJar.exists()) {
+                    devJar.copyTo(agentJar, overwrite = true)
+                    PluginLogger.info("[TrueFlow] Copied Java agent from dev build: ${agentJar.absolutePath}")
+                    return agentJar.absolutePath
+                }
+
+                // Try alternative location
+                val altJar = File("java-agent/build/libs/trueflow-agent-0.1.0.jar")
+                if (altJar.exists()) {
+                    altJar.copyTo(agentJar, overwrite = true)
+                    PluginLogger.info("[TrueFlow] Copied Java agent from alt location: ${agentJar.absolutePath}")
+                    return agentJar.absolutePath
+                }
+
+                PluginLogger.error("[TrueFlow] Java agent JAR not found in resources or dev locations")
+                return null
+            }
+        } catch (e: Exception) {
+            PluginLogger.error("[TrueFlow] Failed to extract Java agent: ${e.message}")
+            return null
+        }
+    }
+
+    /**
+     * Create a Java/Kotlin run configuration with -javaagent VM option.
+     */
+    private fun createJavaRunConfiguration(
+        entryPoint: VirtualFile,
+        traceDir: String,
+        packagesToTrace: List<String>,
+        excludePackages: List<String>,
+        agentPath: String
+    ) {
+        val configName = "Trace: ${entryPoint.nameWithoutExtension}"
+
+        // Build agent arguments
+        val agentArgs = buildList {
+            add("enabled=true")
+            add("port=5679")  // Java uses port 5679
+            if (packagesToTrace.isNotEmpty()) {
+                add("includes=${packagesToTrace.joinToString(";")}")
+            }
+            if (excludePackages.isNotEmpty()) {
+                add("excludes=${excludePackages.joinToString(";")}")
+            }
+            add("traceDir=$traceDir")
+        }.joinToString(",")
+
+        val javaAgentVmOption = "-javaagent:$agentPath=$agentArgs"
+
+        try {
+            val runManager = RunManager.getInstance(project)
+            val allConfigTypes = ConfigurationType.CONFIGURATION_TYPE_EP.extensionList
+
+            // Find Java or Application configuration type
+            val configType = allConfigTypes.find {
+                it.displayName.contains("Application", ignoreCase = true) ||
+                it.displayName.contains("Java", ignoreCase = true) ||
+                it.displayName.contains("Kotlin", ignoreCase = true)
+            }
+
+            if (configType == null) {
+                // Show manual instructions
+                Messages.showInfoMessage(
+                    project,
+                    """
+                    Java Application plugin not found. Please manually configure:
+
+                    1. Create a Run Configuration for your main class
+                    2. Add VM options:
+                       $javaAgentVmOption
+
+                    3. Add environment variable:
+                       TRUEFLOW_ENABLED=1
+
+                    Or run from command line:
+                       java $javaAgentVmOption -jar your-app.jar
+                    """.trimIndent(),
+                    "Manual Configuration Required"
+                )
+                return
+            }
+
+            val factory = configType.configurationFactories.firstOrNull()
+            if (factory == null) {
+                Messages.showWarningDialog(project, "Could not find configuration factory", "Error")
+                return
+            }
+
+            // Create run configuration
+            val runConfigSettings = runManager.createConfiguration(configName, factory)
+            val runConfig = runConfigSettings.configuration
+
+            try {
+                // Set main class if it's a Java file
+                if (entryPoint.extension == "java" || entryPoint.extension == "kt") {
+                    // Try to extract class name from file
+                    val className = extractMainClassName(entryPoint)
+                    if (className != null) {
+                        try {
+                            val setMainClassMethod = runConfig.javaClass.getMethod("setMainClassName", String::class.java)
+                            setMainClassMethod.invoke(runConfig, className)
+                        } catch (e: NoSuchMethodException) {
+                            // Try alternative method name
+                            try {
+                                val setMainMethod = runConfig.javaClass.getMethod("setMainClass", String::class.java)
+                                setMainMethod.invoke(runConfig, className)
+                            } catch (e2: Exception) {
+                                PluginLogger.warn("[TrueFlow] Could not set main class: ${e2.message}")
+                            }
+                        }
+                    }
+                }
+
+                // Set VM options with -javaagent
+                try {
+                    val setVmOptionsMethod = runConfig.javaClass.getMethod("setVMParameters", String::class.java)
+                    setVmOptionsMethod.invoke(runConfig, javaAgentVmOption)
+                } catch (e: NoSuchMethodException) {
+                    try {
+                        val setVmMethod = runConfig.javaClass.getMethod("setVmParameters", String::class.java)
+                        setVmMethod.invoke(runConfig, javaAgentVmOption)
+                    } catch (e2: Exception) {
+                        PluginLogger.warn("[TrueFlow] Could not set VM options: ${e2.message}")
+                    }
+                }
+
+                // Set environment variables
+                val envVars = mutableMapOf<String, String>()
+                envVars["TRUEFLOW_ENABLED"] = "1"
+                envVars["TRUEFLOW_PORT"] = "5679"
+                envVars["TRUEFLOW_TRACE_DIR"] = traceDir
+                if (packagesToTrace.isNotEmpty()) {
+                    envVars["TRUEFLOW_INCLUDES"] = packagesToTrace.joinToString(",")
+                }
+
+                try {
+                    val setEnvMethod = runConfig.javaClass.getMethod("setEnvs", Map::class.java)
+                    setEnvMethod.invoke(runConfig, envVars)
+                } catch (e: Exception) {
+                    PluginLogger.warn("[TrueFlow] Could not set environment variables: ${e.message}")
+                }
+
+            } catch (e: Exception) {
+                PluginLogger.warn("[TrueFlow] Warning configuring Java run config: ${e.message}")
+            }
+
+            // Add configuration
+            runManager.addConfiguration(runConfigSettings)
+            runManager.selectedConfiguration = runConfigSettings
+
+            Messages.showInfoMessage(
+                project,
+                """
+                Java/Kotlin run configuration created: "$configName"
+
+                VM Options:
+                  $javaAgentVmOption
+
+                Environment:
+                  TRUEFLOW_ENABLED=1
+                  TRUEFLOW_PORT=5679
+
+                Agent JAR: $agentPath
+                Trace output: $traceDir
+
+                To run:
+                1. Click the green play button next to "$configName"
+                2. Or select from Run menu
+                3. Traces stream to TrueFlow on port 5679
+                """.trimIndent(),
+                "Java Run Configuration Created"
+            )
+
+        } catch (e: Exception) {
+            Messages.showErrorDialog(
+                project,
+                """
+                Failed to create run configuration: ${e.message}
+
+                Manual setup:
+                1. Edit your run configuration
+                2. Add VM option: $javaAgentVmOption
+                3. Set TRUEFLOW_ENABLED=1 environment variable
+                """.trimIndent(),
+                "Configuration Error"
+            )
+        }
+    }
+
+    /**
+     * Extract main class name from a Java/Kotlin file.
+     */
+    private fun extractMainClassName(file: VirtualFile): String? {
+        return try {
+            val content = String(file.contentsToByteArray())
+
+            // Extract package
+            val packageMatch = Regex("""package\s+([a-zA-Z0-9_.]+)""").find(content)
+            val packageName = packageMatch?.groupValues?.get(1)
+
+            // Extract class name (simple heuristic - look for public class or class with main)
+            val classMatch = Regex("""(?:public\s+)?class\s+(\w+)""").find(content)
+            val className = classMatch?.groupValues?.get(1) ?: file.nameWithoutExtension
+
+            if (packageName != null) {
+                "$packageName.$className"
+            } else {
+                className
+            }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun integrateViaRunConfiguration(

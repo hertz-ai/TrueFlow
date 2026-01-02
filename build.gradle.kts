@@ -273,9 +273,24 @@ tasks {
         into("src/main/resources/runtime_injector")
     }
 
-    // Make processResources depend on version file generation and Python resource copying
+    // Copy Java agent JAR into plugin resources for auto-integration
+    val copyJavaAgent by registering(Copy::class) {
+        from("java-agent/build/libs") {
+            include("trueflow-agent*.jar")
+            // Rename to consistent name for easier extraction
+            rename("trueflow-agent.*\\.jar", "trueflow-agent.jar")
+        }
+        into("src/main/resources/java-agent")
+
+        doFirst {
+            // Ensure target directory exists
+            file("src/main/resources/java-agent").mkdirs()
+        }
+    }
+
+    // Make processResources depend on version file generation, Python resources, and Java agent
     processResources {
-        dependsOn(generateVersionFile, copyPythonResources)
+        dependsOn(generateVersionFile, copyPythonResources, copyJavaAgent)
     }
 
     // Set the JVM compatibility versions

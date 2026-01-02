@@ -291,6 +291,26 @@ function setupSocketClientHandlers(): void {
             aiProvider.saveSnapshot();
         }
     });
+
+    // Handle function registry for dead code detection
+    traceSocketClient.on('functionRegistry', (event: TraceEvent) => {
+        if (traceViewerPanel) {
+            traceViewerPanel.webview.postMessage({
+                type: 'functionRegistry',
+                data: event.trace_data
+            });
+        }
+    });
+
+    // Handle branch registry for "Why Not Covered" with actual branch conditions
+    traceSocketClient.on('branchRegistry', (event: TraceEvent) => {
+        if (traceViewerPanel) {
+            traceViewerPanel.webview.postMessage({
+                type: 'branchRegistry',
+                data: event.trace_data
+            });
+        }
+    });
 }
 
 async function connectToSocket(): Promise<void> {
@@ -1372,6 +1392,128 @@ function getTraceViewerHtml(initialTab?: string): string {
             padding: 40px;
         }
 
+        /* Sub-tabs for nested navigation (e.g., Manim tab) */
+        .sub-tab-container {
+            display: flex;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            margin-bottom: 10px;
+            gap: 2px;
+        }
+        .sub-tab {
+            padding: 6px 12px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+        }
+        .sub-tab:hover {
+            background-color: var(--vscode-list-hoverBackground);
+            color: var(--vscode-editor-foreground);
+        }
+        .sub-tab.active {
+            border-bottom-color: var(--vscode-focusBorder);
+            color: var(--vscode-editor-foreground);
+        }
+        .sub-content {
+            display: none;
+        }
+        .sub-content.active {
+            display: block;
+        }
+
+        /* Interactive Explorer styles */
+        .explorer-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 10px;
+            padding: 8px;
+            background: var(--vscode-editor-lineHighlightBackground);
+            border-radius: 4px;
+        }
+        .explorer-toolbar button {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            padding: 4px 12px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        .explorer-toolbar button:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        .explorer-stats {
+            font-size: 12px;
+            color: var(--vscode-descriptionForeground);
+        }
+        #explorer-canvas {
+            position: relative;
+        }
+        .explorer-node {
+            position: absolute;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            white-space: nowrap;
+            max-width: 150px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .explorer-node:hover {
+            transform: scale(1.05);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 10;
+        }
+        .explorer-node.alive {
+            background: #166534;
+            border: 1px solid #4ade80;
+            color: #fff;
+        }
+        .explorer-node.dead {
+            background: #7f1d1d;
+            border: 1px solid #f87171;
+            color: #fca5a5;
+        }
+        .explorer-node.selected {
+            box-shadow: 0 0 0 2px #7dd3fc;
+        }
+        .explorer-edge {
+            position: absolute;
+            pointer-events: none;
+        }
+        .why-not-covered {
+            margin-top: 12px;
+            padding: 10px;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            border-radius: 6px;
+        }
+        .why-not-covered h5 {
+            color: #f87171;
+            font-size: 12px;
+            margin-bottom: 6px;
+        }
+        .why-not-covered .reason {
+            font-size: 11px;
+            color: #fca5a5;
+            margin-bottom: 4px;
+            padding-left: 8px;
+            border-left: 2px solid #f87171;
+        }
+        .why-not-covered .condition {
+            font-family: monospace;
+            background: rgba(0,0,0,0.3);
+            padding: 3px 6px;
+            border-radius: 3px;
+            margin-top: 4px;
+            font-size: 10px;
+            color: #fde68a;
+        }
+
         /* Diagram Tab */
         .diagram-container {
             display: flex;
@@ -1734,13 +1876,49 @@ function getTraceViewerHtml(initialTab?: string): string {
         </div>
     </div>
 
-    <!-- Manim Video Tab -->
+    <!-- Manim Video Tab with Sub-tabs -->
     <div class="content${activeTab === 'manim' ? ' active' : ''}" id="manim-content">
-        <h3>Manim Video</h3>
-        <p>Use "TrueFlow: Generate Manim Video" command to create visualizations.</p>
-        <div id="video-container">
-            <div class="placeholder">
-                <p>Generated execution flow videos will appear here.</p>
+        <div class="sub-tab-container">
+            <div class="sub-tab active" data-subtab="video-list">Video List</div>
+            <div class="sub-tab" data-subtab="interactive-explorer">Interactive Explorer</div>
+        </div>
+
+        <!-- Video List Sub-tab -->
+        <div class="sub-content active" id="video-list-subcontent">
+            <p style="margin-bottom: 10px;">Use "TrueFlow: Generate Manim Video" command to create visualizations.</p>
+            <div id="video-container">
+                <div class="placeholder">
+                    <p>Generated execution flow videos will appear here.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Interactive Explorer Sub-tab -->
+        <div class="sub-content" id="interactive-explorer-subcontent">
+            <div class="explorer-toolbar">
+                <button onclick="refreshInteractiveExplorer()">Refresh Visualization</button>
+                <span class="explorer-stats">
+                    Functions: <span id="explorer-total">0</span> |
+                    Covered: <span id="explorer-covered" style="color: #4ade80;">0</span> |
+                    Dead: <span id="explorer-dead" style="color: #f87171;">0</span>
+                </span>
+            </div>
+            <div id="interactive-explorer-container">
+                <div id="explorer-canvas" style="width: 100%; height: calc(100vh - 250px); background: #1a1a2e; border-radius: 8px; position: relative;">
+                    <div id="explorer-loading" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #888;">
+                        Run your code to generate visualization data
+                    </div>
+                    <canvas id="explorer-3d-canvas" style="width: 100%; height: 100%;"></canvas>
+                </div>
+                <div id="explorer-info-panel" style="display: none; position: absolute; top: 10px; right: 10px; width: 300px; max-height: 400px; background: rgba(26, 26, 46, 0.95); border: 1px solid #4a4a6a; border-radius: 8px; padding: 15px; overflow-y: auto; z-index: 100;">
+                    <h4 id="explorer-info-title" style="color: #7dd3fc; margin-bottom: 10px; font-size: 14px;">Select a node</h4>
+                    <div id="explorer-info-content"></div>
+                </div>
+            </div>
+            <div class="explorer-legend" style="margin-top: 10px; display: flex; gap: 20px; font-size: 11px; color: #888;">
+                <span><span style="display: inline-block; width: 12px; height: 12px; background: #4ade80; border-radius: 2px; margin-right: 5px;"></span>Executed</span>
+                <span><span style="display: inline-block; width: 12px; height: 12px; background: #f87171; border-radius: 2px; margin-right: 5px;"></span>Not Executed (Dead)</span>
+                <span><span style="display: inline-block; width: 12px; height: 12px; background: #60a5fa; border-radius: 2px; margin-right: 5px;"></span>Branch Point</span>
             </div>
         </div>
     </div>
@@ -1802,8 +1980,438 @@ function getTraceViewerHtml(initialTab?: string): string {
 
                 // Show zoom controls only for diagram tab
                 document.getElementById('zoom-controls').classList.toggle('visible', tabName === 'diagram');
+
+                // Refresh Interactive Explorer when Manim tab is opened
+                if (tabName === 'manim') {
+                    refreshInteractiveExplorer();
+                }
             });
         });
+
+        // Sub-tab switching (for Manim tab)
+        document.querySelectorAll('.sub-tab').forEach(subtab => {
+            subtab.addEventListener('click', () => {
+                const subtabName = subtab.dataset.subtab;
+                const container = subtab.closest('.content');
+                container.querySelectorAll('.sub-tab').forEach(t => t.classList.remove('active'));
+                subtab.classList.add('active');
+                container.querySelectorAll('.sub-content').forEach(c => c.classList.remove('active'));
+                document.getElementById(subtabName + '-subcontent').classList.add('active');
+
+                // Initialize explorer when switching to it
+                if (subtabName === 'interactive-explorer') {
+                    refreshInteractiveExplorer();
+                }
+            });
+        });
+
+        // Interactive Explorer data and state
+        let explorerData = {
+            functions: {},
+            callGraph: {},
+            coveredFunctions: [],
+            deadFunctions: [],
+            whyNotCovered: {}
+        };
+        let selectedExplorerNode = null;
+
+        // Registry data for "Why Not Covered" with actual branch conditions
+        let functionRegistryData = new Map(); // funcKey -> {file, line}
+        let callSitesData = []; // Call sites with branch info
+        let functionBranchesData = new Map(); // funcKey -> branches[]
+
+        // Build Interactive Explorer data from trace
+        function buildExplorerData() {
+            const functions = {};
+            const callGraph = {};
+            const coveredFunctions = [];
+            const deadFunctions = [];
+            const whyNotCovered = {};
+
+            // Build from performance data and call trace
+            performanceData.forEach(p => {
+                const funcKey = p.module + '.' + p.function;
+                functions[funcKey] = {
+                    name: p.function,
+                    module: p.module,
+                    line: p.line || 0,
+                    file: p.file || '',
+                    callCount: p.calls || 0,
+                    branches: []
+                };
+                coveredFunctions.push(funcKey);
+                if (!callGraph[funcKey]) {
+                    callGraph[funcKey] = [];
+                }
+            });
+
+            // Add call relationships from trace
+            callTrace.forEach(event => {
+                if (event.type === 'call' && event.parent_id) {
+                    const parentKey = event.parent_module + '.' + event.parent_function;
+                    const childKey = event.module + '.' + event.function;
+                    if (callGraph[parentKey] && !callGraph[parentKey].includes(childKey)) {
+                        callGraph[parentKey].push(childKey);
+                    }
+                }
+            });
+
+            // Build reverse call graph (callee -> callers) for root cause tracing
+            const reverseCallGraph = {};
+            Object.entries(callGraph).forEach(([caller, callees]) => {
+                callees.forEach(callee => {
+                    if (!reverseCallGraph[callee]) {
+                        reverseCallGraph[callee] = [];
+                    }
+                    if (!reverseCallGraph[callee].includes(caller)) {
+                        reverseCallGraph[callee].push(caller);
+                    }
+                });
+            });
+
+            /**
+             * ROOT CAUSE TRACING: Recursively trace up the call chain to find
+             * the TOPMOST executed function that blocked execution.
+             * @param func - The dead function to analyze
+             * @param visited - Set of visited functions (prevent cycles)
+             * @param chain - Call chain built so far (from dead func upward)
+             * @returns {type, rootFunc, chain} or null
+             */
+            function traceToRootCause(func, visited, chain) {
+                if (visited.has(func)) return null; // Cycle detected
+                visited.add(func);
+                chain.push(func);
+
+                const callers = reverseCallGraph[func] || [];
+
+                if (callers.length === 0) {
+                    // No callers - this function has no call sites
+                    return { type: 'NO_CALL_SITES', rootFunc: func, chain: [...chain] };
+                }
+
+                // Check each caller - if ANY is executed, that's our root cause
+                for (const caller of callers) {
+                    if (coveredFunctions.includes(caller)) {
+                        // FOUND ROOT CAUSE! Caller was executed but didn't call this function
+                        return { type: 'BRANCH_NOT_TAKEN', rootFunc: caller, chain: [...chain] };
+                    }
+                }
+
+                // All callers are also dead - recurse up to find root
+                for (const caller of callers) {
+                    const result = traceToRootCause(caller, visited, chain);
+                    if (result) return result;
+                }
+
+                // No executed function found - unreachable from entry points
+                return { type: 'UNREACHABLE_FROM_ENTRY', rootFunc: chain[chain.length - 1], chain: [...chain] };
+            }
+
+            // Find dead functions with ROOT CAUSE TRACING
+            allDefinedFunctions.forEach(func => {
+                if (!coveredFunctions.includes(func)) {
+                    deadFunctions.push(func);
+                    functions[func] = functions[func] || {
+                        name: func.split('.').pop(),
+                        module: func.split('.').slice(0, -1).join('.'),
+                        line: 0,
+                        file: '',
+                        callCount: 0,
+                        branches: []
+                    };
+
+                    // Trace to ROOT CAUSE (not just immediate caller)
+                    const rootCauseResult = traceToRootCause(func, new Set(), []);
+                    const { type: rootCauseType, rootFunc, chain: callChain } = rootCauseResult ||
+                        { type: 'UNKNOWN', rootFunc: func, chain: [func] };
+
+                    const chainStr = callChain.length > 1
+                        ? callChain.slice().reverse().join(' → ')
+                        : func;
+
+                    let reason;
+                    switch (rootCauseType) {
+                        case 'NO_CALL_SITES':
+                            reason = {
+                                type: 'NO_CALL_SITES',
+                                explanation: "No code in the project calls '" + func + "'. May be dead code or only called externally."
+                            };
+                            break;
+                        case 'BRANCH_NOT_TAKEN':
+                            // Find ACTUAL branch condition from callSitesData
+                            const firstDeadInChain = callChain[0] || func;
+                            const relevantCallSite = callSitesData.find(site => {
+                                const fullCaller = site.callerModule + '.' + site.caller;
+                                return (fullCaller === rootFunc || site.caller === rootFunc) &&
+                                    (site.callee === firstDeadInChain ||
+                                     callChain.some(chainFunc => site.callee === chainFunc || chainFunc.endsWith('.' + site.callee)));
+                            });
+
+                            const actualBranchType = relevantCallSite?.inBranch?.type || 'if';
+                            const actualCondition = relevantCallSite?.inBranch?.condition || 'condition was False';
+                            const actualBranchLine = relevantCallSite?.inBranch?.line || 0;
+
+                            reason = {
+                                type: 'BRANCH_NOT_TAKEN',
+                                caller: rootFunc,
+                                branchType: actualBranchType,
+                                branchCondition: actualCondition,
+                                branchLine: actualBranchLine,
+                                explanation: "Branch in '" + rootFunc + "' (line " + actualBranchLine + "): " + actualBranchType + " " + actualCondition + ". Chain: " + chainStr
+                            };
+                            break;
+                        case 'UNREACHABLE_FROM_ENTRY':
+                            reason = {
+                                type: 'UNREACHABLE_FROM_ENTRY',
+                                explanation: "Function '" + func + "' is unreachable from any entry point. Orphaned chain: " + chainStr
+                            };
+                            break;
+                        default:
+                            reason = {
+                                type: 'UNKNOWN',
+                                explanation: "Could not determine why '" + func + "' wasn't called"
+                            };
+                    }
+
+                    whyNotCovered[func] = {
+                        function: func,
+                        rootCause: rootCauseType,
+                        rootCauseDetail: rootCauseType === 'BRANCH_NOT_TAKEN' ? {
+                            type: rootCauseType,
+                            caller: rootFunc,
+                            branchType: reason.branchType || 'if',
+                            branchCondition: reason.branchCondition || 'condition was False',
+                            branchLine: reason.branchLine || 0
+                        } : null,
+                        callChain: callChain,
+                        reasons: [reason]
+                    };
+                }
+            });
+
+            explorerData = { functions, callGraph, coveredFunctions, deadFunctions, whyNotCovered };
+            return explorerData;
+        }
+
+        // Refresh Interactive Explorer visualization
+        function refreshInteractiveExplorer() {
+            buildExplorerData();
+            renderExplorerVisualization();
+            updateExplorerStats();
+        }
+
+        // Update stats display
+        function updateExplorerStats() {
+            const total = Object.keys(explorerData.functions).length;
+            const covered = explorerData.coveredFunctions.length;
+            const dead = explorerData.deadFunctions.length;
+            document.getElementById('explorer-total').textContent = total;
+            document.getElementById('explorer-covered').textContent = covered;
+            document.getElementById('explorer-dead').textContent = dead;
+        }
+
+        // Render 2D visualization (simpler than Three.js for webview compatibility)
+        function renderExplorerVisualization() {
+            const canvas = document.getElementById('explorer-canvas');
+            const loading = document.getElementById('explorer-loading');
+
+            // Clear previous nodes
+            canvas.querySelectorAll('.explorer-node, .explorer-edge').forEach(el => el.remove());
+
+            const functions = explorerData.functions;
+            const funcNames = Object.keys(functions);
+
+            if (funcNames.length === 0) {
+                loading.style.display = 'block';
+                loading.textContent = 'Run your code to generate visualization data';
+                return;
+            }
+
+            loading.style.display = 'none';
+
+            // Layout: hierarchical based on call depth
+            const levels = {};
+            const callGraph = explorerData.callGraph;
+            const allCallees = new Set();
+            Object.values(callGraph).forEach(callees => callees.forEach(c => allCallees.add(c)));
+
+            // Find roots (functions not called by anyone)
+            const roots = funcNames.filter(f => !allCallees.has(f));
+            const processed = new Set();
+            const queue = roots.map(r => ({ name: r, level: 0 }));
+            roots.forEach(r => { levels[r] = 0; processed.add(r); });
+
+            while (queue.length > 0) {
+                const { name, level } = queue.shift();
+                const callees = callGraph[name] || [];
+                callees.forEach(callee => {
+                    if (!processed.has(callee)) {
+                        levels[callee] = level + 1;
+                        processed.add(callee);
+                        queue.push({ name: callee, level: level + 1 });
+                    }
+                });
+            }
+
+            // Assign unprocessed
+            funcNames.forEach(f => { if (!processed.has(f)) levels[f] = 0; });
+
+            // Group by level
+            const levelGroups = {};
+            Object.entries(levels).forEach(([name, level]) => {
+                if (!levelGroups[level]) levelGroups[level] = [];
+                levelGroups[level].push(name);
+            });
+
+            // Calculate positions
+            const canvasRect = canvas.getBoundingClientRect();
+            const levelHeight = 80;
+            const nodeWidth = 140;
+            const nodeHeight = 30;
+            const positions = {};
+
+            Object.entries(levelGroups).forEach(([level, funcs]) => {
+                const y = 20 + parseInt(level) * levelHeight;
+                const startX = (canvasRect.width - funcs.length * nodeWidth) / 2;
+                funcs.forEach((name, i) => {
+                    positions[name] = { x: startX + i * nodeWidth + 20, y };
+                });
+            });
+
+            // Draw edges first
+            Object.entries(callGraph).forEach(([caller, callees]) => {
+                const callerPos = positions[caller];
+                if (!callerPos) return;
+                callees.forEach(callee => {
+                    const calleePos = positions[callee];
+                    if (!calleePos) return;
+
+                    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                    svg.classList.add('explorer-edge');
+                    svg.style.position = 'absolute';
+                    svg.style.left = '0';
+                    svg.style.top = '0';
+                    svg.style.width = '100%';
+                    svg.style.height = '100%';
+                    svg.style.pointerEvents = 'none';
+
+                    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                    line.setAttribute('x1', callerPos.x + nodeWidth/2 - 20);
+                    line.setAttribute('y1', callerPos.y + nodeHeight);
+                    line.setAttribute('x2', calleePos.x + nodeWidth/2 - 20);
+                    line.setAttribute('y2', calleePos.y);
+                    line.setAttribute('stroke', '#4a4a6a');
+                    line.setAttribute('stroke-width', '1');
+
+                    svg.appendChild(line);
+                    canvas.appendChild(svg);
+                });
+            });
+
+            // Draw nodes
+            funcNames.forEach(name => {
+                const pos = positions[name];
+                if (!pos) return;
+
+                const func = functions[name];
+                const isAlive = explorerData.coveredFunctions.includes(name);
+
+                const node = document.createElement('div');
+                node.className = 'explorer-node ' + (isAlive ? 'alive' : 'dead');
+                node.style.left = pos.x + 'px';
+                node.style.top = pos.y + 'px';
+                node.textContent = func.name || name.split('.').pop();
+                node.title = name;
+                node.dataset.funcName = name;
+
+                node.addEventListener('click', () => selectExplorerNode(name));
+
+                canvas.appendChild(node);
+            });
+        }
+
+        // Select a node and show info panel
+        function selectExplorerNode(funcName) {
+            // Deselect previous
+            document.querySelectorAll('.explorer-node.selected').forEach(n => n.classList.remove('selected'));
+
+            // Select new
+            const node = document.querySelector('.explorer-node[data-func-name="' + funcName + '"]');
+            if (node) node.classList.add('selected');
+            selectedExplorerNode = funcName;
+
+            // Show info panel
+            const panel = document.getElementById('explorer-info-panel');
+            const title = document.getElementById('explorer-info-title');
+            const content = document.getElementById('explorer-info-content');
+
+            const func = explorerData.functions[funcName];
+            const isAlive = explorerData.coveredFunctions.includes(funcName);
+            const why = explorerData.whyNotCovered[funcName];
+
+            title.textContent = funcName;
+
+            let html = '<div style="font-size: 12px; margin-bottom: 8px;">';
+            html += '<div><span style="color: #888; width: 60px; display: inline-block;">Status:</span>';
+            html += '<span style="color: ' + (isAlive ? '#4ade80' : '#f87171') + ';">' + (isAlive ? 'ALIVE' : 'DEAD') + '</span></div>';
+            if (func) {
+                html += '<div><span style="color: #888; width: 60px; display: inline-block;">Calls:</span>' + (func.callCount || 0) + '</div>';
+                if (func.line) html += '<div><span style="color: #888; width: 60px; display: inline-block;">Line:</span>' + func.line + '</div>';
+            }
+            html += '</div>';
+
+            if (!isAlive && why) {
+                html += '<div class="why-not-covered">';
+                html += '<h5>Why Not Covered?</h5>';
+                if (why.rootCause === 'NO_CALL_SITES') {
+                    html += '<div class="reason" style="color: #fbbf24;">&#9888; No call sites found</div>';
+                    html += '<div style="color: #888; font-size: 11px; margin-top: 4px;">This function is never called anywhere in the codebase. It may be dead code or only called externally.</div>';
+                } else if (why.rootCause === 'UNREACHABLE_FROM_ENTRY') {
+                    html += '<div class="reason" style="color: #f87171;">&#10060; Unreachable from entry points</div>';
+                    html += '<div style="color: #888; font-size: 11px; margin-top: 4px;">The entire call chain is orphaned - no executed function leads to this code.</div>';
+                } else if (why.rootCause === 'BRANCH_NOT_TAKEN') {
+                    const detail = why.rootCauseDetail;
+                    html += '<div class="reason" style="color: #60a5fa;">&#128279; Root Cause Found</div>';
+                    html += '<div style="margin: 8px 0; padding: 8px; background: rgba(96, 165, 250, 0.1); border-radius: 4px;">';
+                    html += '<div style="font-weight: bold; color: #60a5fa;">Branch in: ' + (detail?.caller || 'unknown') + '</div>';
+                    if (detail?.branchCondition && detail.branchCondition !== 'condition was False') {
+                        html += '<div style="font-family: monospace; font-size: 11px; margin: 6px 0; padding: 6px; background: rgba(0,0,0,0.2); border-radius: 4px; color: #fde68a;">';
+                        html += detail.branchType + ' ' + detail.branchCondition;
+                        html += '</div>';
+                    }
+                    if (detail?.branchLine) {
+                        html += '<div style="color: #888; font-size: 11px;">Line ' + detail.branchLine + ' - branch condition not satisfied</div>';
+                    } else {
+                        html += '<div style="color: #888; font-size: 11px;">A conditional branch in this executed function prevented the call.</div>';
+                    }
+                    html += '</div>';
+                }
+
+                // Show call chain if available
+                if (why.callChain && why.callChain.length > 1) {
+                    html += '<div style="margin-top: 12px; padding-top: 8px; border-top: 1px solid #333;">';
+                    html += '<div style="color: #888; font-size: 11px; margin-bottom: 6px;">Call Chain (dead functions blocked by root):</div>';
+                    html += '<div style="font-family: monospace; font-size: 11px; color: #e5e7eb; background: #1f2937; padding: 8px; border-radius: 4px; overflow-x: auto;">';
+                    // Show chain from root to dead function
+                    const chainReversed = why.callChain.slice().reverse();
+                    chainReversed.forEach((fn, i) => {
+                        const isRoot = i === 0 && why.rootCause === 'BRANCH_NOT_TAKEN';
+                        const isTarget = i === chainReversed.length - 1;
+                        const color = isRoot ? '#60a5fa' : (isTarget ? '#f87171' : '#888');
+                        const label = isRoot ? ' (ROOT)' : (isTarget ? ' (DEAD)' : '');
+                        html += '<span style="color: ' + color + ';">' + fn + label + '</span>';
+                        if (i < chainReversed.length - 1) {
+                            html += ' <span style="color: #666;">→</span> ';
+                        }
+                    });
+                    html += '</div></div>';
+                }
+                html += '</div>';
+            }
+
+            content.innerHTML = html;
+            panel.style.display = 'block';
+        }
 
         // Diagram functions
         function updateDiagramType() {
@@ -2159,6 +2767,46 @@ function getTraceViewerHtml(initialTab?: string): string {
 
                 case 'newTrace':
                     document.getElementById('diagram-status').textContent = 'New trace: ' + message.path;
+                    break;
+
+                case 'functionRegistry':
+                    // Receive function registry for dead code detection
+                    if (message.data && message.data.functions) {
+                        functionRegistryData.clear();
+                        message.data.functions.forEach(func => {
+                            const key = func.module + '.' + func.function;
+                            functionRegistryData.set(key, { file: func.file, line: func.line });
+                            allDefinedFunctions.add(key);
+                        });
+                        console.log('[TrueFlow] Received function registry:', functionRegistryData.size, 'functions');
+                        refreshInteractiveExplorer();
+                    }
+                    break;
+
+                case 'branchRegistry':
+                    // Receive branch registry for "Why Not Covered" with actual conditions
+                    if (message.data) {
+                        callSitesData = (message.data.call_sites || []).map(site => ({
+                            callee: site.callee,
+                            caller: site.caller,
+                            callerModule: site.caller_module,
+                            file: site.file,
+                            line: site.line,
+                            inBranch: site.in_branch ? {
+                                type: site.in_branch.type,
+                                condition: site.in_branch.condition,
+                                line: site.in_branch.line,
+                                endLine: site.in_branch.end_line
+                            } : null
+                        }));
+                        functionBranchesData.clear();
+                        const funcBranches = message.data.function_branches || {};
+                        for (const [funcKey, data] of Object.entries(funcBranches)) {
+                            functionBranchesData.set(funcKey, data.branches || []);
+                        }
+                        console.log('[TrueFlow] Received branch registry:', callSitesData.length, 'call sites');
+                        refreshInteractiveExplorer();
+                    }
                     break;
 
                 case 'selectTab':
