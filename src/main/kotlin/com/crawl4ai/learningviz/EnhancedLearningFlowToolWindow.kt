@@ -244,6 +244,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     )
     private val socketCallSites = mutableListOf<CallSiteInfo>()  // All call sites with branch context
     private val socketFunctionBranches = mutableMapOf<String, List<Map<String, Any>>>()  // funcKey -> branches
+    private val socketResolvedCallGraph = mutableMapOf<String, List<String>>()  // Static call graph for cross-class connections
 
     // UI update throttling (prevent freeze from too many events) - Thread-safe with atomic operations
     private val lastUIUpdateTime = AtomicLong(0)
@@ -1699,6 +1700,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
             socketCallSites.clear()
             socketFunctionBranches.clear()
+            socketResolvedCallGraph.clear()
 
             // Parse call sites with their branch context
             for (siteElement in callSitesArray) {
@@ -1749,7 +1751,16 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
                 }
             }
 
-            PluginLogger.info("[ToolWindow] Received branch registry: ${socketCallSites.size} call sites, ${socketFunctionBranches.size} functions with branches")
+            // Parse resolved call graph for cross-class static connections
+            val resolvedCallGraphObj = traceData.getAsJsonObject("resolved_call_graph")
+            if (resolvedCallGraphObj != null) {
+                for ((caller, calleesEl) in resolvedCallGraphObj.entrySet()) {
+                    val callees = calleesEl.asJsonArray.map { it.asString }
+                    socketResolvedCallGraph[caller] = callees
+                }
+            }
+
+            PluginLogger.info("[ToolWindow] Received branch registry: ${socketCallSites.size} call sites, ${socketFunctionBranches.size} functions with branches, ${socketResolvedCallGraph.size} resolved call graph entries")
 
             // Update Interactive Explorer with branch data
             SwingUtilities.invokeLater {
@@ -1845,7 +1856,20 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
      * to find the TOPMOST executed function that blocked execution, not just the immediate caller.
      */
     private fun updateInteractiveVisualization() {
-        // Build call graph from call tree (caller -> list of callees)
+        // Skip update if no data available yet - don't overwrite demo/existing data with empty
+        if (socketAllDefinedFunctions.isEmpty() && socketTraceCalls.isEmpty()) {
+            PluginLogger.debug("[ToolWindow] Skipping Interactive Explorer update - no data yet")
+            return
+        }
+
+        // Helper to check if a function should be excluded based on global filters
+        // Uses the SAME logic as Dead Code tab: only check file path exclusion
+        fun shouldExcludeFunction(funcName: String): Boolean {
+            val filePath = socketFunctionDefinitions[funcName]?.first ?: ""
+            return traceFilter.shouldExclude(filePath)
+        }
+
+        // Build FULL call graph from call tree (caller -> list of callees) - no filtering during traversal
         val callGraph = mutableMapOf<String, MutableList<String>>()
         fun traverseNode(node: CallTraceNode) {
             val callerKey = "${node.module}.${node.function}"
@@ -1876,10 +1900,25 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             }
         }
 
+        // Apply global filter to all data sources - exclude functions matching filter patterns
+        val filteredAllFunctions = socketAllDefinedFunctions.filter { !shouldExcludeFunction(it) }
+        val filteredTraceCalls = socketTraceCalls.filterKeys { !shouldExcludeFunction(it) }
+        val filteredFunctionDefinitions = socketFunctionDefinitions.filterKeys { !shouldExcludeFunction(it) }
+        val filteredResolvedCallGraph = socketResolvedCallGraph
+            .filterKeys { !shouldExcludeFunction(it) }
+            .mapValues { entry -> entry.value.filter { !shouldExcludeFunction(it) } }
+            .filterValues { it.isNotEmpty() }
+
+        // Also filter the call graph built from runtime traces
+        val filteredCallGraph = callGraph
+            .filterKeys { !shouldExcludeFunction(it) }
+            .mapValues { entry -> entry.value.filter { !shouldExcludeFunction(it) } }
+            .filterValues { it.isNotEmpty() }
+
         // Build "why not covered" analysis for dead functions with ROOT CAUSE TRACING
         val whyNotCovered = mutableMapOf<String, ManimVideoPanel.WhyNotCoveredInfo>()
-        val deadFunctions = socketAllDefinedFunctions.filter { it !in socketTraceCalls }
-        val executedFunctions = socketTraceCalls.keys
+        val deadFunctions = filteredAllFunctions.filter { it !in filteredTraceCalls }
+        val executedFunctions = filteredTraceCalls.keys
 
         /**
          * Recursively trace up the call chain to find the ROOT CAUSE.
@@ -2012,14 +2051,169 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             )
         }
 
-        // Update the Manim panel's interactive visualization
+        // Log data before sending to Interactive Explorer
+        PluginLogger.info("[InteractiveExplorer] Sending data:")
+        PluginLogger.info("[InteractiveExplorer]   ORIGINAL socketAllDefinedFunctions: ${socketAllDefinedFunctions.size}")
+        PluginLogger.info("[InteractiveExplorer]   ORIGINAL socketTraceCalls: ${socketTraceCalls.size}")
+        PluginLogger.info("[InteractiveExplorer]   ORIGINAL socketFunctionDefinitions: ${socketFunctionDefinitions.size}")
+        PluginLogger.info("[InteractiveExplorer]   ORIGINAL callGraph: ${callGraph.size}")
+        PluginLogger.info("[InteractiveExplorer]   ORIGINAL socketResolvedCallGraph: ${socketResolvedCallGraph.size}")
+        PluginLogger.info("[InteractiveExplorer]   FILTERED allFunctions: ${filteredAllFunctions.size}")
+        PluginLogger.info("[InteractiveExplorer]   FILTERED traceCalls: ${filteredTraceCalls.size}")
+        PluginLogger.info("[InteractiveExplorer]   FILTERED callGraph: ${filteredCallGraph.size}")
+        PluginLogger.info("[InteractiveExplorer]   FILTERED resolvedCallGraph: ${filteredResolvedCallGraph.size}")
+        PluginLogger.info("[InteractiveExplorer]   whyNotCovered: ${whyNotCovered.size}")
+        if (filteredAllFunctions.isNotEmpty()) {
+            PluginLogger.info("[InteractiveExplorer]   Sample functions: ${filteredAllFunctions.take(5)}")
+        }
+        if (filteredTraceCalls.isNotEmpty()) {
+            PluginLogger.info("[InteractiveExplorer]   Sample called: ${filteredTraceCalls.keys.take(5)}")
+        }
+
+        // Update the Manim panel's interactive visualization with FILTERED data
         manimVideoPanel.updateVisualizationData(
-            allFunctions = socketAllDefinedFunctions,
-            calledFunctions = socketTraceCalls,
-            callTree = callGraph.mapValues { it.value.toList() },
-            functionDefinitions = socketFunctionDefinitions,
-            whyNotCovered = whyNotCovered
+            allFunctions = filteredAllFunctions.toSet(),
+            calledFunctions = filteredTraceCalls,
+            callTree = filteredCallGraph.mapValues { it.value.toList() },
+            functionDefinitions = filteredFunctionDefinitions,
+            whyNotCovered = whyNotCovered,
+            resolvedCallGraph = filteredResolvedCallGraph
         )
+    }
+
+    /**
+     * Refresh Interactive Explorer with filtered data.
+     * Called when global filters change to update the visualization.
+     */
+    private fun refreshInteractiveVisualizationWithFilters() {
+        // Skip update if no data available yet - don't overwrite demo/existing data with empty
+        if (socketAllDefinedFunctions.isEmpty() && socketTraceCalls.isEmpty()) {
+            PluginLogger.debug("[ToolWindow] Skipping Interactive Explorer filter refresh - no data yet")
+            return
+        }
+
+        // Helper to check if a function should be excluded based on global filters
+        // Uses the SAME logic as Dead Code tab: only check file path exclusion
+        fun shouldExcludeFunction(funcName: String): Boolean {
+            val filePath = socketFunctionDefinitions[funcName]?.first ?: ""
+            return traceFilter.shouldExclude(filePath)
+        }
+
+        // Build FULL call graph from socketRootCalls
+        val callGraph = mutableMapOf<String, MutableList<String>>()
+        fun traverseNode(node: CallTraceNode) {
+            val callerKey = "${node.module}.${node.function}"
+            if (callerKey !in callGraph) {
+                callGraph[callerKey] = mutableListOf()
+            }
+            for (child in node.children) {
+                val calleeKey = "${child.module}.${child.function}"
+                if (calleeKey !in callGraph[callerKey]!!) {
+                    callGraph[callerKey]!!.add(calleeKey)
+                }
+                traverseNode(child)
+            }
+        }
+        socketRootCalls.forEach { traverseNode(it) }
+
+        // Filter all data sources - exclude functions matching filter patterns
+        val filteredFunctions = socketAllDefinedFunctions.filter { !shouldExcludeFunction(it) }.toSet()
+        val filteredTraceCalls = socketTraceCalls.filterKeys { !shouldExcludeFunction(it) }
+        val filteredFunctionDefinitions = socketFunctionDefinitions.filterKeys { !shouldExcludeFunction(it) }
+
+        // Filter call graph - only include edges where both caller and callee pass the filter
+        val filteredCallGraph = callGraph
+            .filterKeys { !shouldExcludeFunction(it) }
+            .mapValues { entry -> entry.value.filter { !shouldExcludeFunction(it) } }
+            .filterValues { it.isNotEmpty() }
+
+        // Filter resolved call graph similarly
+        val filteredResolvedCallGraph = socketResolvedCallGraph
+            .filterKeys { !shouldExcludeFunction(it) }
+            .mapValues { entry -> entry.value.filter { !shouldExcludeFunction(it) } }
+            .filterValues { it.isNotEmpty() }
+
+        // Recompute whyNotCovered for filtered functions (simplified version)
+        val filteredWhyNotCovered = computeWhyNotCoveredForFilteredFunctions(
+            filteredFunctions,
+            filteredTraceCalls.keys,
+            filteredCallGraph
+        )
+
+        // Update the Manim panel with filtered data
+        manimVideoPanel.updateVisualizationData(
+            allFunctions = filteredFunctions,
+            calledFunctions = filteredTraceCalls,
+            callTree = filteredCallGraph.mapValues { it.value.toList() },
+            functionDefinitions = filteredFunctionDefinitions,
+            whyNotCovered = filteredWhyNotCovered,
+            resolvedCallGraph = filteredResolvedCallGraph
+        )
+
+        PluginLogger.info("[ToolWindow] Refreshed Interactive Explorer with ${filteredFunctions.size} filtered functions")
+    }
+
+    /**
+     * Compute WhyNotCovered info for filtered functions.
+     * Simplified version used when refreshing with filters.
+     */
+    private fun computeWhyNotCoveredForFilteredFunctions(
+        allFunctions: Set<String>,
+        calledFunctions: Set<String>,
+        callGraph: Map<String, List<String>>
+    ): Map<String, ManimVideoPanel.WhyNotCoveredInfo> {
+        val whyNotCovered = mutableMapOf<String, ManimVideoPanel.WhyNotCoveredInfo>()
+        val deadFunctions = allFunctions - calledFunctions
+
+        // Build reverse call graph
+        val reverseCallGraph = mutableMapOf<String, MutableList<String>>()
+        callGraph.forEach { (caller, callees) ->
+            callees.forEach { callee ->
+                reverseCallGraph.getOrPut(callee) { mutableListOf() }.add(caller)
+            }
+        }
+
+        for (func in deadFunctions) {
+            val potentialCallers = reverseCallGraph[func] ?: emptyList()
+            val reasons = mutableListOf<ManimVideoPanel.WhyNotCoveredReason>()
+            var rootCauseType = "CALLER_NOT_EXECUTED"
+
+            if (potentialCallers.isEmpty()) {
+                // Orphan - no one calls this function
+                rootCauseType = "NO_CALL_SITES"
+            } else {
+                // Check if callers are covered
+                val coveredCallers = potentialCallers.filter { calledFunctions.contains(it) }
+                val deadCallers = potentialCallers.filter { deadFunctions.contains(it) }
+
+                if (coveredCallers.isNotEmpty()) {
+                    // Has covered callers but wasn't called - likely a dead branch
+                    rootCauseType = "BRANCH_NOT_TAKEN"
+                    reasons.add(ManimVideoPanel.WhyNotCoveredReason(
+                        type = "dead_branch",
+                        caller = coveredCallers.first(),
+                        explanation = "Caller ${coveredCallers.first()} is covered but doesn't call this function"
+                    ))
+                } else if (deadCallers.isNotEmpty()) {
+                    // All callers are also dead - cascading effect
+                    rootCauseType = "CALLER_NOT_EXECUTED"
+                    reasons.add(ManimVideoPanel.WhyNotCoveredReason(
+                        type = "cascading",
+                        caller = deadCallers.first(),
+                        explanation = "Caller ${deadCallers.first()} is also not covered"
+                    ))
+                }
+            }
+
+            whyNotCovered[func] = ManimVideoPanel.WhyNotCoveredInfo(
+                function = func,
+                rootCause = rootCauseType,
+                rootCauseDetail = null,
+                reasons = reasons
+            )
+        }
+
+        return whyNotCovered
     }
 
     private fun updateDistributedFromSocketTrace(event: TraceEvent) {
@@ -3236,6 +3430,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
                     // Rebuild dead code table (full refresh)
                     updateDeadCodeFromSocketTrace()
+
+                    // Refresh Interactive Explorer with filtered data
+                    refreshInteractiveVisualizationWithFilters()
 
                     // Call trace tree is incrementally built, already filtered at entry point
                     // Flamegraph and other panels are also incrementally updated

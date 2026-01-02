@@ -74,6 +74,83 @@
             word-break: break-all;
         }
 
+        /* Node Navigation Bar - compact buttons */
+        .nav-bar {
+            display: flex;
+            gap: 4px;
+            margin: 10px 0;
+            padding: 8px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 6px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .nav-btn {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 6px 10px;
+            background: rgba(74, 74, 106, 0.6);
+            border: 1px solid #5a5a7a;
+            border-radius: 4px;
+            color: #ccc;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .nav-btn:hover {
+            background: rgba(99, 102, 241, 0.4);
+            border-color: #818cf8;
+            color: #fff;
+        }
+
+        .nav-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .nav-btn.active {
+            background: rgba(99, 102, 241, 0.6);
+            border-color: #a5b4fc;
+            color: #fff;
+        }
+
+        .nav-btn svg {
+            width: 14px;
+            height: 14px;
+            fill: currentColor;
+        }
+
+        /* Path highlight legend in panel */
+        .path-legend {
+            display: flex;
+            gap: 12px;
+            margin-top: 8px;
+            padding: 6px 8px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+            font-size: 10px;
+        }
+
+        .path-legend-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .path-legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+
+        .path-legend-dot.upstream { background: #fbbf24; }
+        .path-legend-dot.downstream { background: #60a5fa; }
+        .path-legend-dot.selected { background: #22d3ee; box-shadow: 0 0 8px #22d3ee; }
+
         /* Why Not Covered Section */
         .why-section {
             margin-top: 15px;
@@ -521,6 +598,10 @@
             }
 
             loadData(data, forceRecreate = false) {
+                // Clear cached data that depends on call graph
+                this.reverseCallGraph = null;  // Will be rebuilt on demand
+                this.currentHighlight = null;  // Clear any path highlighting
+
                 // Create separate signatures for structure vs coverage
                 const structureSignature = JSON.stringify({
                     functions: Object.keys(data.functions || {}).sort(),
@@ -1724,13 +1805,32 @@
             }
 
             selectNode(node) {
+                // Clear previous selection
                 if (this.selectedNode) {
                     this.selectedNode.material.emissive.setHex(0x000000);
                 }
 
-                this.selectedNode = node;
-                node.material.emissive.setHex(0x333333);
+                // Clear any existing path highlighting
+                this.clearPathHighlight();
 
+                this.selectedNode = node;
+                const funcName = node.userData.name;
+
+                // Find upstream and downstream paths
+                const upstreamNodes = new Set(this.findUpstreamPath(funcName));
+                const downstreamNodes = new Set(this.findDownstreamPath(funcName));
+
+                // Store current highlight info
+                this.currentHighlight = {
+                    selected: funcName,
+                    upstream: upstreamNodes,
+                    downstream: downstreamNodes
+                };
+
+                // Apply path highlighting
+                this.highlightPath(upstreamNodes, downstreamNodes, funcName, true);
+
+                // Show info panel with navigation
                 this.showInfoPanel(node.userData);
             }
 
@@ -1739,6 +1839,12 @@
                     this.selectedNode.material.emissive.setHex(0x000000);
                     this.selectedNode = null;
                 }
+
+                // Clear path highlighting
+                this.clearPathHighlight();
+
+                // Stop any ongoing animation
+                this.stopDataFlowAnimation();
 
                 document.getElementById('info-panel').classList.remove('visible');
             }
@@ -1789,6 +1895,53 @@
                 title.textContent = data.name;
 
                 let html = '';
+
+                // === NAVIGATION BAR - Compact buttons at top ===
+                const funcName = data.name;
+                const hasParent = this.findImmediateParent(funcName) !== null;
+                const hasDownstream = this.findFirstDownstream(funcName) !== null;
+                const rootName = this.findRootCaller(funcName);
+                const isRoot = rootName === funcName;
+                const upstreamCount = this.currentHighlight?.upstream?.size || 0;
+                const downstreamCount = this.currentHighlight?.downstream?.size || 0;
+
+                html += '<div class="nav-bar">';
+
+                // Jump to Root button (disabled if already at root)
+                html += `<button class="nav-btn${isRoot ? '' : ''}" ${isRoot ? 'disabled title="Already at root"' : 'onclick="explorer.navigateToRoot()" title="Jump to root entry point"'}>`;
+                html += '<svg viewBox="0 0 24 24"><path d="M12 2L2 12h3v8h14v-8h3L12 2zm0 2.8L19 12h-2v7H7v-7H5l7-7.2z"/></svg>';
+                html += 'Root</button>';
+
+                // Jump to Parent button (disabled if no parent)
+                html += `<button class="nav-btn" ${hasParent ? 'onclick="explorer.navigateToParent()" title="Jump to immediate caller"' : 'disabled title="No parent caller"'}>`;
+                html += '<svg viewBox="0 0 24 24"><path d="M7 14l5-5 5 5H7z"/></svg>';
+                html += 'Parent</button>';
+
+                // Jump to Downstream button (disabled if no children)
+                html += `<button class="nav-btn" ${hasDownstream ? 'onclick="explorer.navigateToDownstream()" title="Jump to first callee"' : 'disabled title="No callees"'}>`;
+                html += '<svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5H7z"/></svg>';
+                html += 'Child</button>';
+
+                // Animate Flow button
+                const hasFlow = upstreamCount > 0 || downstreamCount > 0;
+                html += `<button class="nav-btn${this.isAnimatingFlow ? ' active' : ''}" ${hasFlow ? 'onclick="explorer.isAnimatingFlow ? explorer.stopDataFlowAnimation() : explorer.animateDataFlow()" title="Animate camera along data flow"' : 'disabled title="No data flow to animate"'}>`;
+                html += '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7L8 5z"/></svg>';
+                html += this.isAnimatingFlow ? 'Stop' : 'Flow</button>';
+
+                html += '</div>';
+
+                // === PATH LEGEND - Shows highlighted path colors ===
+                if (upstreamCount > 0 || downstreamCount > 0) {
+                    html += '<div class="path-legend">';
+                    html += '<div class="path-legend-item"><div class="path-legend-dot selected"></div>Selected</div>';
+                    if (upstreamCount > 0) {
+                        html += `<div class="path-legend-item"><div class="path-legend-dot upstream"></div>Callers (${upstreamCount})</div>`;
+                    }
+                    if (downstreamCount > 0) {
+                        html += `<div class="path-legend-item"><div class="path-legend-dot downstream"></div>Callees (${downstreamCount})</div>`;
+                    }
+                    html += '</div>';
+                }
 
                 // Basic info - determine status (partial = alive + has branches)
                 const hasBranches = data.info && (data.info.branches || []).length > 0;
@@ -1959,6 +2112,379 @@
             // Force a render (call when scene changes)
             requestRender() {
                 this.needsRender = true;
+            }
+
+            // === PATH TRACING METHODS ===
+
+            /**
+             * Build reverse call graph (callee -> callers)
+             */
+            buildReverseCallGraph() {
+                if (this.reverseCallGraph) return this.reverseCallGraph;
+
+                this.reverseCallGraph = {};
+                const callGraph = this.data?.call_graph || {};
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    callees.forEach(callee => {
+                        if (!this.reverseCallGraph[callee]) {
+                            this.reverseCallGraph[callee] = [];
+                        }
+                        this.reverseCallGraph[callee].push(caller);
+                    });
+                });
+                return this.reverseCallGraph;
+            }
+
+            /**
+             * Find all upstream nodes (callers) recursively
+             * Returns array of function names from selected node to root
+             */
+            findUpstreamPath(funcName, visited = new Set()) {
+                if (visited.has(funcName)) return [];
+                visited.add(funcName);
+
+                const reverseGraph = this.buildReverseCallGraph();
+                const callers = reverseGraph[funcName] || [];
+                const upstream = [];
+
+                callers.forEach(caller => {
+                    upstream.push(caller);
+                    upstream.push(...this.findUpstreamPath(caller, visited));
+                });
+
+                return [...new Set(upstream)];
+            }
+
+            /**
+             * Find all downstream nodes (callees) recursively
+             * Returns array of function names from selected node to leaves
+             */
+            findDownstreamPath(funcName, visited = new Set()) {
+                if (visited.has(funcName)) return [];
+                visited.add(funcName);
+
+                const callGraph = this.data?.call_graph || {};
+                const callees = callGraph[funcName] || [];
+                const downstream = [];
+
+                callees.forEach(callee => {
+                    downstream.push(callee);
+                    downstream.push(...this.findDownstreamPath(callee, visited));
+                });
+
+                return [...new Set(downstream)];
+            }
+
+            /**
+             * Find the root caller (entry point) for a function
+             * Returns the topmost caller in the chain
+             */
+            findRootCaller(funcName) {
+                const reverseGraph = this.buildReverseCallGraph();
+                let current = funcName;
+                const visited = new Set();
+
+                while (true) {
+                    if (visited.has(current)) break;
+                    visited.add(current);
+
+                    const callers = reverseGraph[current] || [];
+                    if (callers.length === 0) {
+                        return current; // No callers - this is the root
+                    }
+                    // Follow the first caller (primary path)
+                    current = callers[0];
+                }
+
+                return current;
+            }
+
+            /**
+             * Find the immediate parent (caller) of a function
+             */
+            findImmediateParent(funcName) {
+                const reverseGraph = this.buildReverseCallGraph();
+                const callers = reverseGraph[funcName] || [];
+                return callers.length > 0 ? callers[0] : null;
+            }
+
+            /**
+             * Find the first downstream callee of a function
+             */
+            findFirstDownstream(funcName) {
+                const callGraph = this.data?.call_graph || {};
+                const callees = callGraph[funcName] || [];
+                return callees.length > 0 ? callees[0] : null;
+            }
+
+            /**
+             * Get the complete data flow path from root to all leaves through selected node
+             */
+            getDataFlowPath(funcName) {
+                const root = this.findRootCaller(funcName);
+                const path = [root];
+                const visited = new Set([root]);
+                const callGraph = this.data?.call_graph || {};
+
+                // BFS to build ordered path through selected node
+                const queue = [root];
+                while (queue.length > 0) {
+                    const current = queue.shift();
+                    const callees = callGraph[current] || [];
+
+                    callees.forEach(callee => {
+                        if (!visited.has(callee)) {
+                            visited.add(callee);
+                            path.push(callee);
+                            queue.push(callee);
+                        }
+                    });
+                }
+
+                return path;
+            }
+
+            // === PATH HIGHLIGHTING ===
+
+            /**
+             * Highlight or unhighlight a path of nodes and their edges
+             * @param {Set} upstreamNodes - nodes upstream of selection (callers)
+             * @param {Set} downstreamNodes - nodes downstream of selection (callees)
+             * @param {string} selectedName - the selected node name
+             * @param {boolean} highlight - true to highlight, false to reset
+             */
+            highlightPath(upstreamNodes, downstreamNodes, selectedName, highlight) {
+                const upstreamColor = 0xfbbf24;  // Amber for callers
+                const downstreamColor = 0x60a5fa;  // Blue for callees
+                const selectedColor = 0x22d3ee;  // Cyan for selected
+                const defaultNodeOpacity = 0.3;  // Dim non-highlighted nodes
+                const highlightOpacity = 1.0;
+
+                // Update node appearances
+                this.nodes.forEach((node, name) => {
+                    const material = node.material;
+                    const originalColor = node.userData.originalColor || material.color.getHex();
+
+                    // Store original color if not already stored
+                    if (!node.userData.originalColor) {
+                        node.userData.originalColor = material.color.getHex();
+                        node.userData.originalOpacity = material.opacity;
+                    }
+
+                    if (highlight) {
+                        if (name === selectedName) {
+                            material.color.setHex(selectedColor);
+                            material.opacity = highlightOpacity;
+                            material.emissive.setHex(0x115555);
+                        } else if (upstreamNodes.has(name)) {
+                            material.color.setHex(upstreamColor);
+                            material.opacity = highlightOpacity;
+                            material.emissive.setHex(0x332200);
+                        } else if (downstreamNodes.has(name)) {
+                            material.color.setHex(downstreamColor);
+                            material.opacity = highlightOpacity;
+                            material.emissive.setHex(0x112233);
+                        } else {
+                            // Dim other nodes
+                            material.opacity = defaultNodeOpacity;
+                            material.emissive.setHex(0x000000);
+                        }
+                    } else {
+                        // Restore original appearance
+                        material.color.setHex(node.userData.originalColor);
+                        material.opacity = node.userData.originalOpacity || 1.0;
+                        material.emissive.setHex(0x000000);
+                    }
+                    material.needsUpdate = true;
+                });
+
+                // Update edge appearances
+                const callGraph = this.data?.call_graph || {};
+                let edgeIndex = 0;
+                const allHighlighted = new Set([selectedName, ...upstreamNodes, ...downstreamNodes]);
+
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    callees.forEach(callee => {
+                        if (edgeIndex >= this.edges.length) return;
+                        const edge = this.edges[edgeIndex];
+
+                        // Store original color
+                        if (!edge.userData) edge.userData = {};
+                        if (!edge.userData.originalColor) {
+                            edge.userData.originalColor = edge.material.color.getHex();
+                            edge.userData.originalOpacity = edge.material.opacity;
+                        }
+
+                        if (highlight) {
+                            // Check if edge is part of highlighted path
+                            const isUpstreamEdge = upstreamNodes.has(caller) &&
+                                (upstreamNodes.has(callee) || callee === selectedName);
+                            const isDownstreamEdge = (caller === selectedName || downstreamNodes.has(caller)) &&
+                                downstreamNodes.has(callee);
+                            const isDirectConnection = caller === selectedName || callee === selectedName;
+
+                            if (isUpstreamEdge) {
+                                edge.material.color.setHex(upstreamColor);
+                                edge.material.opacity = 0.9;
+                                edge.material.linewidth = 3;
+                            } else if (isDownstreamEdge || isDirectConnection) {
+                                edge.material.color.setHex(downstreamColor);
+                                edge.material.opacity = 0.9;
+                                edge.material.linewidth = 3;
+                            } else {
+                                // Dim other edges
+                                edge.material.opacity = 0.1;
+                            }
+                        } else {
+                            // Restore original
+                            edge.material.color.setHex(edge.userData.originalColor);
+                            edge.material.opacity = edge.userData.originalOpacity;
+                        }
+                        edge.material.needsUpdate = true;
+                        edgeIndex++;
+                    });
+                });
+
+                this.needsRender = true;
+            }
+
+            /**
+             * Clear all path highlighting
+             */
+            clearPathHighlight() {
+                if (this.currentHighlight) {
+                    this.highlightPath(new Set(), new Set(), '', false);
+                    this.currentHighlight = null;
+                }
+            }
+
+            // === NAVIGATION METHODS ===
+
+            /**
+             * Navigate to root caller of current selection
+             */
+            navigateToRoot() {
+                if (!this.selectedNode) return;
+                const rootName = this.findRootCaller(this.selectedNode.userData.name);
+                const rootNode = this.nodes.get(rootName);
+                if (rootNode && rootNode !== this.selectedNode) {
+                    this.selectNode(rootNode);
+                    this.focusOnNode(rootNode);
+                }
+            }
+
+            /**
+             * Navigate to immediate parent (caller)
+             */
+            navigateToParent() {
+                if (!this.selectedNode) return;
+                const parentName = this.findImmediateParent(this.selectedNode.userData.name);
+                if (parentName) {
+                    const parentNode = this.nodes.get(parentName);
+                    if (parentNode) {
+                        this.selectNode(parentNode);
+                        this.focusOnNode(parentNode);
+                    }
+                }
+            }
+
+            /**
+             * Navigate to first downstream callee
+             */
+            navigateToDownstream() {
+                if (!this.selectedNode) return;
+                const downstreamName = this.findFirstDownstream(this.selectedNode.userData.name);
+                if (downstreamName) {
+                    const downstreamNode = this.nodes.get(downstreamName);
+                    if (downstreamNode) {
+                        this.selectNode(downstreamNode);
+                        this.focusOnNode(downstreamNode);
+                    }
+                }
+            }
+
+            /**
+             * Animate camera along the entire data flow path
+             */
+            animateDataFlow() {
+                if (!this.selectedNode) return;
+
+                const path = this.getDataFlowPath(this.selectedNode.userData.name);
+                if (path.length === 0) return;
+
+                // Get nodes along the path
+                const pathNodes = path.map(name => this.nodes.get(name)).filter(n => n);
+                if (pathNodes.length === 0) return;
+
+                // Disable user controls during animation
+                this.controls.enabled = false;
+                this.isAnimatingFlow = true;
+
+                let currentIndex = 0;
+                const animationSpeed = 1500; // ms per node
+
+                const animateToNext = () => {
+                    if (currentIndex >= pathNodes.length || !this.isAnimatingFlow) {
+                        this.controls.enabled = true;
+                        this.isAnimatingFlow = false;
+                        return;
+                    }
+
+                    const node = pathNodes[currentIndex];
+                    const targetPosition = node.position.clone();
+                    targetPosition.z += 12; // Further back for better view
+
+                    const startPos = this.camera.position.clone();
+                    const startTarget = this.controls.target.clone();
+                    const endTarget = node.position.clone();
+
+                    let t = 0;
+                    const animate = () => {
+                        if (!this.isAnimatingFlow) {
+                            this.controls.enabled = true;
+                            return;
+                        }
+
+                        t += 0.02; // Slower animation
+                        if (t >= 1) t = 1;
+
+                        const easeT = t < 0.5
+                            ? 2 * t * t
+                            : 1 - Math.pow(-2 * t + 2, 2) / 2; // Ease in-out
+
+                        this.camera.position.lerpVectors(startPos, targetPosition, easeT);
+                        this.controls.target.lerpVectors(startTarget, endTarget, easeT);
+                        this.controls.update();
+                        this.needsRender = true;
+
+                        if (t < 1) {
+                            requestAnimationFrame(animate);
+                        } else {
+                            // Brief pause at each node
+                            currentIndex++;
+                            setTimeout(animateToNext, 300);
+                        }
+                    };
+
+                    // Highlight current node briefly
+                    node.material.emissive.setHex(0x444444);
+                    setTimeout(() => {
+                        if (node.material) node.material.emissive.setHex(0x000000);
+                    }, animationSpeed);
+
+                    animate();
+                };
+
+                // Start animation
+                animateToNext();
+            }
+
+            /**
+             * Stop any ongoing data flow animation
+             */
+            stopDataFlowAnimation() {
+                this.isAnimatingFlow = false;
+                this.controls.enabled = true;
             }
         }
 

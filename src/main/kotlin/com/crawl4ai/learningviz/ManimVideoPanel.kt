@@ -21,6 +21,7 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import java.awt.BorderLayout
 import java.awt.Desktop
+import java.awt.FlowLayout
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.io.File
@@ -53,8 +54,17 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     private var jsQuery: JBCefJSQuery? = null
     private val gson = Gson()
 
+    // View mode toggle (Flow Explorer vs Watch Architecture)
+    private enum class ViewMode { FLOW_EXPLORER, WATCH_ARCHITECTURE }
+    private var currentViewMode = ViewMode.FLOW_EXPLORER
+    private var viewToggleButton: JButton? = null
+
     // Data for interactive visualization
     private var visualizationData: InteractiveVisualizationData? = null
+
+    // Track if the browser page is loaded and ready
+    private var browserPageReady = false
+    private var pendingDataRefresh = false
 
     // Manim output directory (use PluginPaths for single source of truth)
     private val manimOutputDir = PluginPaths.getVideosDir(project)
@@ -83,6 +93,7 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     data class InteractiveVisualizationData(
         val functions: Map<String, FunctionInfo>,
         val callGraph: Map<String, List<String>>,
+        val resolvedCallGraph: Map<String, List<String>>,  // Static call graph for cross-class connections
         val coveredFunctions: List<String>,
         val deadFunctions: List<String>,
         val whyNotCovered: Map<String, WhyNotCoveredInfo>
@@ -282,6 +293,35 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             // Create JCEF browser
             interactiveBrowser = JBCefBrowser()
 
+            // Add load handler to detect when page is ready
+            val cefBrowser = interactiveBrowser?.cefBrowser
+            if (cefBrowser != null) {
+                interactiveBrowser?.jbCefClient?.addLoadHandler(object : org.cef.handler.CefLoadHandlerAdapter() {
+                    override fun onLoadEnd(browser: org.cef.browser.CefBrowser?, frame: org.cef.browser.CefFrame?, httpStatusCode: Int) {
+                        if (frame?.isMain == true) {
+                            browserPageReady = true
+                            PluginLogger.info("Interactive Explorer page loaded, ready for data (mode: $currentViewMode)")
+                            // If we have pending data, send it now based on current view mode
+                            if (pendingDataRefresh || visualizationData != null) {
+                                pendingDataRefresh = false
+                                ApplicationManager.getApplication().invokeLater {
+                                    when (currentViewMode) {
+                                        ViewMode.FLOW_EXPLORER -> refreshInteractiveVisualization()
+                                        ViewMode.WATCH_ARCHITECTURE -> sendDataToWatchArchitecture()
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    override fun onLoadStart(browser: org.cef.browser.CefBrowser?, frame: org.cef.browser.CefFrame?, transitionType: org.cef.network.CefRequest.TransitionType?) {
+                        if (frame?.isMain == true) {
+                            browserPageReady = false
+                        }
+                    }
+                }, cefBrowser)
+            }
+
             // Load the Three.js visualization HTML from resources
             val htmlContent = loadInteractiveHtml()
             interactiveBrowser?.loadHTML(htmlContent)
@@ -293,14 +333,31 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                 JBCefJSQuery.Response("ok")
             }
 
-            // Top: Refresh button
+            // Top: Toolbar with buttons
             val topPanel = JBPanel<JBPanel<*>>(BorderLayout())
-            val refreshBtn = JButton("Refresh Visualization")
+
+            // Right side: buttons
+            val buttonsPanel = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.RIGHT, 5, 0))
+
+            // View toggle button (Flow Explorer ↔ Watch Architecture)
+            viewToggleButton = JButton("📹 Watch Architecture")
+            viewToggleButton?.toolTipText = "Switch to Watch Architecture view for real-time data flow visualization"
+            viewToggleButton?.addActionListener { toggleViewMode() }
+            buttonsPanel.add(viewToggleButton)
+
+            val refreshBtn = JButton("🔄 Refresh")
             refreshBtn.addActionListener { refreshInteractiveVisualization() }
-            topPanel.add(refreshBtn, BorderLayout.EAST)
+            buttonsPanel.add(refreshBtn)
+
+            val openInBrowserBtn = JButton("🌐 Open in Browser")
+            openInBrowserBtn.toolTipText = "Open the interactive 3D visualization in external browser"
+            openInBrowserBtn.addActionListener { openExplorerInBrowser() }
+            buttonsPanel.add(openInBrowserBtn)
+
+            topPanel.add(buttonsPanel, BorderLayout.EAST)
 
             val infoLabel = JBLabel("<html>Interactive 3D visualization of code execution. " +
-                    "<b>Red</b> = not executed, <b>Green</b> = executed. Click nodes for details.</html>")
+                    "<b>Red</b> = not executed, <b>Green</b> = executed, <b>Yellow</b> = partial. Click nodes for details.</html>")
             topPanel.add(infoLabel, BorderLayout.WEST)
             panel.add(topPanel, BorderLayout.NORTH)
 
@@ -327,6 +384,216 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         } catch (e: Exception) {
             PluginLogger.error("Failed to load interactive HTML from resources", e)
             getDefaultInteractiveHtml()
+        }
+    }
+
+    /**
+     * Loads the Watch Architecture HTML from resources.
+     */
+    private fun loadWatchArchitectureHtml(): String {
+        return try {
+            val inputStream = javaClass.getResourceAsStream("/interactive_viz/watch_architecture.html")
+            inputStream?.bufferedReader()?.readText() ?: "<html><body>Watch Architecture not found</body></html>"
+        } catch (e: Exception) {
+            PluginLogger.error("Failed to load Watch Architecture HTML from resources", e)
+            "<html><body>Failed to load Watch Architecture</body></html>"
+        }
+    }
+
+    /**
+     * Toggles between Flow Explorer and Watch Architecture views.
+     */
+    private fun toggleViewMode() {
+        currentViewMode = when (currentViewMode) {
+            ViewMode.FLOW_EXPLORER -> ViewMode.WATCH_ARCHITECTURE
+            ViewMode.WATCH_ARCHITECTURE -> ViewMode.FLOW_EXPLORER
+        }
+
+        // Update button text
+        viewToggleButton?.text = when (currentViewMode) {
+            ViewMode.FLOW_EXPLORER -> "📹 Watch Architecture"
+            ViewMode.WATCH_ARCHITECTURE -> "🔍 Flow Explorer"
+        }
+
+        // Load the appropriate HTML
+        val htmlContent = when (currentViewMode) {
+            ViewMode.FLOW_EXPLORER -> loadInteractiveHtml()
+            ViewMode.WATCH_ARCHITECTURE -> loadWatchArchitectureHtml()
+        }
+
+        // Mark page as not ready - the load handler will refresh when ready
+        browserPageReady = false
+        pendingDataRefresh = true  // Flag to send data when page loads
+
+        interactiveBrowser?.loadHTML(htmlContent)
+
+        // The load handler (onLoadEnd) will automatically:
+        // - For Flow Explorer: call refreshInteractiveVisualization() when page is ready
+        // - For Watch Architecture: we still need to send data after load
+        if (currentViewMode == ViewMode.WATCH_ARCHITECTURE) {
+            // Use a slight delay to ensure the page is loaded
+            ApplicationManager.getApplication().invokeLater {
+                Thread.sleep(500)
+                sendDataToWatchArchitecture()
+            }
+        }
+        // For Flow Explorer, the onLoadEnd handler will call refreshInteractiveVisualization()
+    }
+
+    /**
+     * Sends visualization data to Watch Architecture view.
+     * Uses resolvedCallGraph for complete static analysis including cross-class connections.
+     */
+    private fun sendDataToWatchArchitecture() {
+        if (interactiveBrowser == null || visualizationData == null) return
+
+        try {
+            // Use resolved call graph for complete picture, fallback to runtime call graph
+            val completeCallGraph = if (visualizationData!!.resolvedCallGraph.isNotEmpty()) {
+                visualizationData!!.resolvedCallGraph
+            } else {
+                visualizationData!!.callGraph
+            }
+
+            val jsonData = gson.toJson(mapOf(
+                "functions" to visualizationData!!.functions.mapValues { (funcName, info) ->
+                    mapOf(
+                        "name" to funcName,
+                        "line" to info.line,
+                        "file" to info.file,
+                        "call_count" to info.callCount,
+                        "branches" to info.branches.map { branch ->
+                            mapOf("type" to branch.type, "condition" to branch.condition)
+                        }
+                    )
+                },
+                "call_graph" to completeCallGraph,
+                "resolved_call_graph" to visualizationData!!.resolvedCallGraph,
+                "runtime_call_graph" to visualizationData!!.callGraph,
+                "covered_functions" to visualizationData!!.coveredFunctions,
+                "dead_functions" to visualizationData!!.deadFunctions,
+                // Build complete data flows from resolved call graph (static analysis)
+                "data_flows" to completeCallGraph.flatMap { (caller, callees) ->
+                    callees.map { callee ->
+                        val isExecuted = visualizationData!!.coveredFunctions.contains(caller) &&
+                                        visualizationData!!.coveredFunctions.contains(callee)
+                        mapOf(
+                            "from" to caller,
+                            "to" to callee,
+                            "type" to if (isExecuted) "executed_call" else "potential_call",
+                            "executed" to isExecuted
+                        )
+                    }
+                },
+                // Add why_not_covered for dead code explanation
+                "why_not_covered" to visualizationData!!.whyNotCovered.mapValues { (_, info) ->
+                    mapOf(
+                        "function" to info.function,
+                        "root_cause" to info.rootCause
+                    )
+                }
+            ))
+
+            ApplicationManager.getApplication().invokeLater {
+                interactiveBrowser?.cefBrowser?.executeJavaScript(
+                    "if (typeof loadWatchData === 'function') { loadWatchData($jsonData); }",
+                    "", 0
+                )
+            }
+        } catch (e: Exception) {
+            PluginLogger.error("Failed to send data to Watch Architecture", e)
+        }
+    }
+
+    /**
+     * Opens the interactive flow explorer in the default external browser.
+     */
+    private fun openExplorerInBrowser() {
+        try {
+            // Load the HTML template
+            val htmlTemplate = loadInteractiveHtml()
+
+            // Build data JSON with full data for re-rendering
+            val data = if (visualizationData != null) {
+                mapOf(
+                    "functions" to visualizationData!!.functions.mapValues { (_, info) ->
+                        mapOf(
+                            "name" to info.name,
+                            "line" to info.line,
+                            "file" to info.file,
+                            "call_count" to info.callCount,
+                            "branches" to info.branches.map { branch ->
+                                mapOf(
+                                    "type" to branch.type,
+                                    "line" to branch.line,
+                                    "condition" to branch.condition
+                                )
+                            }
+                        )
+                    },
+                    "call_graph" to visualizationData!!.callGraph,
+                    "resolved_call_graph" to visualizationData!!.resolvedCallGraph,
+                    "covered_functions" to visualizationData!!.coveredFunctions,
+                    "dead_functions" to visualizationData!!.deadFunctions,
+                    "why_not_covered" to visualizationData!!.whyNotCovered.mapValues { (_, info) ->
+                        mapOf(
+                            "function" to info.function,
+                            "root_cause" to info.rootCause,
+                            "root_cause_detail" to (info.rootCauseDetail?.let { detail ->
+                                mapOf(
+                                    "type" to detail.type,
+                                    "caller" to detail.caller,
+                                    "line" to detail.line,
+                                    "branch_type" to detail.branchType,
+                                    "branch_condition" to detail.branchCondition,
+                                    "branch_line" to detail.branchLine
+                                )
+                            }),
+                            "reasons" to info.reasons.map { reason ->
+                                mapOf(
+                                    "type" to reason.type,
+                                    "caller" to reason.caller,
+                                    "line" to reason.line,
+                                    "branch_type" to reason.branchType,
+                                    "branch_condition" to reason.branchCondition,
+                                    "explanation" to reason.explanation
+                                )
+                            },
+                            "call_chain" to emptyList<String>()  // Will be populated by client
+                        )
+                    }
+                )
+            } else {
+                emptyMap<String, Any>()
+            }
+
+            val jsonData = gson.toJson(data)
+
+            // Inject data and auto-load script
+            val dataScript = "<script>window.TRUEFLOW_DATA = $jsonData;</script>"
+            val autoLoadScript = """<script>
+                document.addEventListener('DOMContentLoaded', function() {
+                    if (window.TRUEFLOW_DATA && typeof loadVisualizationData === 'function') {
+                        setTimeout(function() { loadVisualizationData(window.TRUEFLOW_DATA); }, 500);
+                    }
+                });
+            </script>"""
+
+            var modifiedHtml = htmlTemplate.replace("</head>", "$dataScript</head>")
+            modifiedHtml = modifiedHtml.replace("</body>", "$autoLoadScript</body>")
+
+            // Write to temp file
+            val tempDir = java.io.File(System.getProperty("java.io.tmpdir"), "trueflow")
+            tempDir.mkdirs()
+            val tempFile = java.io.File(tempDir, "interactive_explorer_${System.currentTimeMillis()}.html")
+            tempFile.writeText(modifiedHtml)
+
+            // Open in default browser
+            java.awt.Desktop.getDesktop().browse(tempFile.toURI())
+            PluginLogger.info("Opened Interactive Explorer in browser: ${tempFile.absolutePath}")
+
+        } catch (e: Exception) {
+            PluginLogger.error("Failed to open explorer in browser", e)
         }
     }
 
@@ -434,18 +701,67 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     }
 
     /**
-     * Builds visualization data from current trace and dead code analysis.
-     * This combines data from the Dead Code tab and Call Tree tab.
+     * Builds visualization data from stored visualization data.
+     * Returns the cached data from updateVisualizationData() calls.
      */
     private fun buildVisualizationData(): Map<String, Any> {
-        // This will be populated by the EnhancedLearningFlowToolWindow
-        // For now, return demo data structure
-        return mapOf(
+        // Return stored visualization data if available
+        val data = visualizationData ?: return mapOf(
             "functions" to emptyMap<String, Any>(),
             "call_graph" to emptyMap<String, Any>(),
+            "resolved_call_graph" to emptyMap<String, Any>(),
             "covered_functions" to emptyList<String>(),
             "dead_functions" to emptyList<String>(),
             "why_not_covered" to emptyMap<String, Any>()
+        )
+
+        // Convert stored FunctionInfo objects to proper map format
+        return mapOf(
+            "functions" to data.functions.mapValues { (funcName, info) ->
+                mapOf(
+                    "name" to funcName,
+                    "line" to info.line,
+                    "file" to (info.file ?: ""),
+                    "call_count" to info.callCount,
+                    "branches" to info.branches.map { branch ->
+                        mapOf(
+                            "type" to branch.type,
+                            "line" to branch.line,
+                            "condition" to branch.condition
+                        )
+                    }
+                )
+            },
+            "call_graph" to data.callGraph,
+            "resolved_call_graph" to data.resolvedCallGraph,
+            "covered_functions" to data.coveredFunctions,
+            "dead_functions" to data.deadFunctions,
+            "why_not_covered" to data.whyNotCovered.mapValues { (_, info) ->
+                mapOf(
+                    "function" to info.function,
+                    "root_cause" to info.rootCause,
+                    "root_cause_detail" to (info.rootCauseDetail?.let { detail ->
+                        mapOf(
+                            "type" to detail.type,
+                            "caller" to detail.caller,
+                            "line" to detail.line,
+                            "branch_type" to detail.branchType,
+                            "branch_condition" to detail.branchCondition,
+                            "branch_line" to detail.branchLine
+                        )
+                    }),
+                    "reasons" to info.reasons.map { reason ->
+                        mapOf(
+                            "type" to reason.type,
+                            "caller" to reason.caller,
+                            "line" to reason.line,
+                            "branch_type" to reason.branchType,
+                            "branch_condition" to reason.branchCondition,
+                            "explanation" to reason.explanation
+                        )
+                    }
+                )
+            }
         )
     }
 
@@ -458,7 +774,8 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         calledFunctions: Map<String, Int>,
         callTree: Map<String, List<String>>,
         functionDefinitions: Map<String, Pair<String, Int>>,  // func -> (file, line)
-        whyNotCovered: Map<String, WhyNotCoveredInfo>
+        whyNotCovered: Map<String, WhyNotCoveredInfo>,
+        resolvedCallGraph: Map<String, List<String>> = emptyMap()  // Static call graph for cross-class connections
     ) {
         val coveredFunctions = calledFunctions.keys.toList()
         val deadFunctions = allFunctions.filter { it !in calledFunctions.keys }
@@ -474,9 +791,30 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             )
         }
 
+        // Store visualization data for Open in Browser and export functionality
+        val functionInfoMap = allFunctions.associateWith { func ->
+            val (file, line) = functionDefinitions[func] ?: ("" to 0)
+            FunctionInfo(
+                name = func,
+                line = line,
+                file = file,
+                callCount = calledFunctions[func] ?: 0
+            )
+        }
+
+        visualizationData = InteractiveVisualizationData(
+            functions = functionInfoMap,
+            callGraph = callTree,
+            resolvedCallGraph = resolvedCallGraph,
+            coveredFunctions = coveredFunctions,
+            deadFunctions = deadFunctions,
+            whyNotCovered = whyNotCovered
+        )
+
         val data = mapOf(
             "functions" to functions,
             "call_graph" to callTree,
+            "resolved_call_graph" to resolvedCallGraph,  // Include for cross-class static connections
             "covered_functions" to coveredFunctions,
             "dead_functions" to deadFunctions,
             "why_not_covered" to whyNotCovered.mapValues { (_, info) ->
