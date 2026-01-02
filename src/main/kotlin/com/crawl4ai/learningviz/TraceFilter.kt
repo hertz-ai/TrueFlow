@@ -264,6 +264,18 @@ class TraceFilter : PersistentStateComponent<TraceFilter.FilterState> {
     }
 
     /**
+     * Check if a string matches any excluded module pattern.
+     * Unlike shouldExcludeModule, this ONLY checks exclusion patterns (not includeOnly).
+     * Use this for checking class/method names where includeOnly doesn't apply.
+     */
+    fun matchesExcludedPattern(text: String): Boolean {
+        if (text.isBlank()) return false
+        return config.excludedModules.any { pattern ->
+            text.contains(pattern, ignoreCase = true)
+        }
+    }
+
+    /**
      * Filter a list of trace events
      */
     fun filterTraces(traces: List<Map<String, Any>>): List<Map<String, Any>> {

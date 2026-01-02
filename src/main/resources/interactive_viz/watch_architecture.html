@@ -1,0 +1,4077 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrueFlow - Watch Architecture in Action</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a1a;
+            color: #e0e0e0;
+            overflow: hidden;
+        }
+
+        #app {
+            display: flex;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        /* Left Panel - Data Sources */
+        #sources-panel {
+            width: 200px;
+            background: #12122a;
+            border-right: 1px solid #2a2a4a;
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+        }
+
+        #sources-panel h3 {
+            font-size: 12px;
+            color: #7dd3fc;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .source-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            margin-bottom: 6px;
+            background: #1a1a3a;
+            border-radius: 6px;
+            border-left: 3px solid #4a4a6a;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .source-item:hover {
+            background: #2a2a4a;
+        }
+
+        .source-item.active {
+            border-left-color: #4ade80;
+            background: rgba(74, 222, 128, 0.1);
+        }
+
+        .source-item.video { border-left-color: #f472b6; }
+        .source-item.api { border-left-color: #60a5fa; }
+        .source-item.screen { border-left-color: #a78bfa; }
+        .source-item.audio { border-left-color: #fbbf24; }
+
+        .source-icon {
+            font-size: 18px;
+        }
+
+        .source-info {
+            flex: 1;
+        }
+
+        .source-name {
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .source-status {
+            font-size: 9px;
+            color: #888;
+        }
+
+        .source-pulse {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4ade80;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.8); }
+        }
+
+        /* Main Visualization Area */
+        #main-viz {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: #0d0d20;
+        }
+
+        /* Top Controls */
+        #controls-bar {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 10px 15px;
+            background: #12122a;
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        .control-btn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 14px;
+            background: #1a1a3a;
+            border: 1px solid #3a3a5a;
+            border-radius: 6px;
+            color: #e0e0e0;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .control-btn:hover {
+            background: #2a2a4a;
+            border-color: #4a4a6a;
+        }
+
+        .control-btn.recording {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: #ef4444;
+            color: #ef4444;
+            animation: recording-pulse 1s infinite;
+        }
+
+        @keyframes recording-pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+            50% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+        }
+
+        .control-btn.primary {
+            background: #3b82f6;
+            border-color: #3b82f6;
+        }
+
+        .control-btn.primary:hover {
+            background: #2563eb;
+        }
+
+        #playback-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: auto;
+        }
+
+        #timeline-slider {
+            width: 200px;
+            height: 4px;
+            -webkit-appearance: none;
+            background: #2a2a4a;
+            border-radius: 2px;
+            cursor: pointer;
+        }
+
+        #timeline-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            background: #3b82f6;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
+        #time-display {
+            font-size: 11px;
+            color: #888;
+            font-family: monospace;
+        }
+
+        /* Data Flow Canvas - 3D Three.js */
+        #flow-canvas {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+        }
+
+        #threejs-container {
+            width: 100%;
+            height: 100%;
+            background: #0d0d20;
+        }
+
+        #threejs-container canvas {
+            display: block;
+        }
+
+        /* Data Type Badges */
+        .data-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 9px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .data-badge.tensor {
+            background: rgba(139, 92, 246, 0.2);
+            color: #a78bfa;
+            border: 1px solid rgba(139, 92, 246, 0.3);
+        }
+
+        .data-badge.message {
+            background: rgba(96, 165, 250, 0.2);
+            color: #60a5fa;
+            border: 1px solid rgba(96, 165, 250, 0.3);
+        }
+
+        .data-badge.class {
+            background: rgba(74, 222, 128, 0.2);
+            color: #4ade80;
+            border: 1px solid rgba(74, 222, 128, 0.3);
+        }
+
+        .data-badge.primitive {
+            background: rgba(251, 191, 36, 0.2);
+            color: #fbbf24;
+            border: 1px solid rgba(251, 191, 36, 0.3);
+        }
+
+        /* Right Panel - Details */
+        #details-panel {
+            width: 320px;
+            background: #12122a;
+            border-left: 1px solid #2a2a4a;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        #details-header {
+            padding: 12px 15px;
+            background: #1a1a3a;
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        #details-header h3 {
+            font-size: 13px;
+            margin-bottom: 4px;
+        }
+
+        #details-header .subtitle {
+            font-size: 10px;
+            color: #888;
+        }
+
+        #details-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px;
+        }
+
+        .detail-section {
+            margin-bottom: 20px;
+        }
+
+        .detail-section h4 {
+            font-size: 10px;
+            color: #7dd3fc;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+            padding-bottom: 4px;
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        .param-list {
+            font-size: 11px;
+        }
+
+        .param-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 8px;
+            background: #1a1a3a;
+            margin-bottom: 4px;
+            border-radius: 4px;
+        }
+
+        .param-name {
+            color: #a78bfa;
+            font-family: monospace;
+        }
+
+        .param-value {
+            color: #4ade80;
+            font-family: monospace;
+            max-width: 150px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        /* Transformation View */
+        .transform-card {
+            background: #1a1a3a;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 10px;
+            border-left: 3px solid #3b82f6;
+        }
+
+        .transform-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .transform-name {
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .transform-time {
+            font-size: 9px;
+            color: #888;
+            font-family: monospace;
+        }
+
+        .transform-io {
+            display: flex;
+            gap: 10px;
+            font-size: 10px;
+        }
+
+        .transform-input, .transform-output {
+            flex: 1;
+            padding: 8px;
+            background: #0d0d20;
+            border-radius: 4px;
+        }
+
+        .transform-input { border-left: 2px solid #f472b6; }
+        .transform-output { border-left: 2px solid #4ade80; }
+
+        .io-label {
+            font-size: 8px;
+            color: #888;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        /* Temporal Comparison */
+        .temporal-compare {
+            display: flex;
+            gap: 8px;
+            margin-top: 15px;
+        }
+
+        .temporal-box {
+            flex: 1;
+            padding: 10px;
+            background: #1a1a3a;
+            border-radius: 6px;
+            text-align: center;
+        }
+
+        .temporal-box.t0 { border-top: 2px solid #60a5fa; }
+        .temporal-box.t1 { border-top: 2px solid #fbbf24; }
+
+        .temporal-label {
+            font-size: 10px;
+            color: #888;
+            margin-bottom: 6px;
+        }
+
+        .temporal-value {
+            font-size: 11px;
+            font-family: monospace;
+            color: #e0e0e0;
+        }
+
+        .temporal-diff {
+            margin-top: 8px;
+            padding: 6px;
+            background: rgba(251, 191, 36, 0.1);
+            border-radius: 4px;
+            font-size: 9px;
+            color: #fbbf24;
+        }
+
+        /* Why Not Called Section */
+        #why-not-called {
+            margin-top: 20px;
+            padding: 12px;
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            border-radius: 8px;
+        }
+
+        #why-not-called h4 {
+            color: #f87171;
+            font-size: 11px;
+            margin-bottom: 8px;
+        }
+
+        .missing-call {
+            padding: 8px;
+            background: #1a1a3a;
+            border-radius: 4px;
+            margin-bottom: 6px;
+            font-size: 10px;
+        }
+
+        .missing-call .expected {
+            color: #f87171;
+        }
+
+        .missing-call .reason {
+            color: #888;
+            margin-top: 4px;
+        }
+
+        /* Rationale Section */
+        .rationale-card {
+            background: rgba(59, 130, 246, 0.1);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            border-radius: 8px;
+            padding: 12px;
+            margin-top: 15px;
+        }
+
+        .rationale-card h4 {
+            color: #60a5fa;
+            font-size: 11px;
+            margin-bottom: 8px;
+        }
+
+        .rationale-text {
+            font-size: 11px;
+            line-height: 1.5;
+            color: #ccc;
+        }
+
+        /* Bottom Timeline */
+        #timeline-panel {
+            height: 120px;
+            background: #12122a;
+            border-top: 1px solid #2a2a4a;
+            padding: 10px 15px;
+        }
+
+        #timeline-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        #timeline-header h4 {
+            font-size: 11px;
+            color: #7dd3fc;
+        }
+
+        #timeline-view {
+            height: 70px;
+            background: #0d0d20;
+            border-radius: 6px;
+            position: relative;
+            overflow-x: auto;
+            overflow-y: hidden;
+        }
+
+        .timeline-track {
+            height: 20px;
+            position: relative;
+            border-bottom: 1px solid #1a1a3a;
+        }
+
+        .timeline-event {
+            position: absolute;
+            height: 16px;
+            top: 2px;
+            border-radius: 3px;
+            display: flex;
+            align-items: center;
+            padding: 0 6px;
+            font-size: 8px;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+
+        .timeline-event:hover {
+            transform: scaleY(1.2);
+            z-index: 10;
+        }
+
+        .timeline-event.call { background: #3b82f6; }
+        .timeline-event.return { background: #4ade80; }
+        .timeline-event.error { background: #ef4444; }
+        .timeline-event.data { background: #a78bfa; }
+
+        /* Camera Controls */
+        .camera-btn.active {
+            background: rgba(59, 130, 246, 0.3);
+            border-color: #3b82f6;
+            color: #60a5fa;
+        }
+
+        /* Importance Indicators */
+        .importance-high { border-left-color: #ef4444 !important; }
+        .importance-medium { border-left-color: #fbbf24 !important; }
+        .importance-low { border-left-color: #4ade80 !important; }
+
+        .importance-badge {
+            position: absolute;
+            top: -8px;
+            right: -8px;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10px;
+            font-weight: bold;
+        }
+
+        .importance-badge.high { background: #ef4444; color: white; }
+        .importance-badge.medium { background: #fbbf24; color: black; }
+        .importance-badge.low { background: #4ade80; color: black; }
+
+        /* Slow-motion effect */
+        .slow-motion {
+            transition: all 1s ease-in-out !important;
+        }
+
+        /* LLM Status Indicator */
+        #llm-status {
+            position: fixed;
+            bottom: 140px;
+            right: 340px;
+            background: #1a1a3a;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 10px;
+            display: none;
+            z-index: 50;
+        }
+
+        #llm-status.active {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        #llm-status .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4ade80;
+            animation: llm-pulse 1s infinite;
+        }
+
+        @keyframes llm-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        /* Node Styles for SVG */
+        .flow-node {
+            cursor: pointer;
+        }
+
+        .flow-node:hover .node-bg {
+            filter: brightness(1.2);
+        }
+
+        /* Loading State */
+        #loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(10, 10, 26, 0.9);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+
+        #loading-overlay.hidden {
+            display: none;
+        }
+
+        .loading-spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid #2a2a4a;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .loading-text {
+            margin-top: 15px;
+            font-size: 12px;
+            color: #888;
+        }
+
+        /* Export Modal */
+        #export-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 200;
+        }
+
+        #export-modal.hidden {
+            display: none;
+        }
+
+        .modal-content {
+            background: #1a1a3a;
+            border-radius: 12px;
+            padding: 25px;
+            width: 500px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .modal-header h3 {
+            font-size: 16px;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: #888;
+            font-size: 20px;
+            cursor: pointer;
+        }
+
+        .export-option {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px;
+            background: #12122a;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .export-option:hover {
+            background: #2a2a4a;
+        }
+
+        .export-option input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+        }
+
+        .export-option-info h4 {
+            font-size: 13px;
+            margin-bottom: 2px;
+        }
+
+        .export-option-info p {
+            font-size: 10px;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <!-- Left Panel - Data Sources -->
+        <div id="sources-panel">
+            <h3>Data Sources</h3>
+            <div id="sources-list">
+                <div class="source-item video active" data-source="video">
+                    <span class="source-icon">📹</span>
+                    <div class="source-info">
+                        <div class="source-name">Video Frame</div>
+                        <div class="source-status">Camera Feed</div>
+                    </div>
+                    <div class="source-pulse"></div>
+                </div>
+                <div class="source-item api" data-source="api">
+                    <span class="source-icon">🌐</span>
+                    <div class="source-info">
+                        <div class="source-name">API Request</div>
+                        <div class="source-status">REST/WebSocket</div>
+                    </div>
+                    <div class="source-pulse" style="background: #60a5fa;"></div>
+                </div>
+                <div class="source-item screen" data-source="screen">
+                    <span class="source-icon">🖥️</span>
+                    <div class="source-info">
+                        <div class="source-name">Screen Data</div>
+                        <div class="source-status">Display Capture</div>
+                    </div>
+                    <div class="source-pulse" style="background: #a78bfa;"></div>
+                </div>
+                <div class="source-item audio" data-source="audio">
+                    <span class="source-icon">🎤</span>
+                    <div class="source-info">
+                        <div class="source-name">Audio Input</div>
+                        <div class="source-status">Microphone</div>
+                    </div>
+                    <div class="source-pulse" style="background: #fbbf24;"></div>
+                </div>
+            </div>
+
+            <div style="margin-top: auto; padding-top: 15px; border-top: 1px solid #2a2a4a;">
+                <h3 style="margin-bottom: 10px;">Learning Paths</h3>
+                <div id="learning-paths">
+                    <!-- Dynamically populated -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Visualization -->
+        <div id="main-viz">
+            <!-- Controls -->
+            <div id="controls-bar">
+                <!-- Source Filters - Show/Hide by data source type -->
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span style="font-size: 10px; color: #888;">Show:</span>
+                    <button class="control-btn source-filter active" data-source="all" onclick="toggleSourceFilter('all')" title="Show all">All</button>
+                    <button class="control-btn source-filter active" data-source="video" onclick="toggleSourceFilter('video')" title="Video/Camera" style="border-left-color: #f472b6;">📹</button>
+                    <button class="control-btn source-filter active" data-source="api" onclick="toggleSourceFilter('api')" title="API/Network" style="border-left-color: #60a5fa;">🌐</button>
+                    <button class="control-btn source-filter active" data-source="screen" onclick="toggleSourceFilter('screen')" title="Screen" style="border-left-color: #a78bfa;">🖥️</button>
+                    <button class="control-btn source-filter active" data-source="audio" onclick="toggleSourceFilter('audio')" title="Audio" style="border-left-color: #fbbf24;">🎤</button>
+                </div>
+                <div style="border-left: 1px solid #3a3a5a; height: 24px; margin: 0 10px;"></div>
+                <!-- Branch Coverage Toggle -->
+                <button class="control-btn" id="branch-toggle" onclick="toggleBranchDisplay()" title="Show branches not taken">
+                    <span>🔀</span> Branches
+                </button>
+                <button class="control-btn" id="play-btn" onclick="togglePlayback()">
+                    <span>▶</span> Play
+                </button>
+                <button class="control-btn" onclick="stepBack()">
+                    <span>⏮</span>
+                </button>
+                <button class="control-btn" onclick="stepForward()">
+                    <span>⏭</span>
+                </button>
+
+                <div id="playback-controls">
+                    <input type="range" id="timeline-slider" min="0" max="100" value="0" oninput="seekTo(this.value)">
+                    <span id="time-display">00:00.000 / 00:00.000</span>
+                </div>
+
+                <button class="control-btn primary" onclick="showExportModal()">
+                    <span>📤</span> Export
+                </button>
+                <button class="control-btn" onclick="openInBrowser()" title="Open in browser">
+                    <span>🌐</span> Full Screen
+                </button>
+            </div>
+
+            <!-- Playback Controls -->
+            <div id="playback-controls" style="display: flex; align-items: center; gap: 8px; margin-left: 15px; padding-left: 15px; border-left: 1px solid #3a3a5a;">
+                <button class="control-btn" id="play-btn" onclick="togglePlayback()" title="Play/Pause">
+                    <span id="play-icon">▶</span>
+                </button>
+                <select id="playback-speed" onchange="setPlaybackSpeed(this.value)" style="background: #1a1a3a; border: 1px solid #3a3a5a; color: #e0e0e0; padding: 4px 8px; border-radius: 4px; font-size: 11px;">
+                    <option value="0.25">0.25x</option>
+                    <option value="0.5">0.5x</option>
+                    <option value="1" selected>1x</option>
+                    <option value="2">2x</option>
+                    <option value="4">4x</option>
+                </select>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span id="current-time" style="font-family: monospace; font-size: 11px; color: #888;">00:00</span>
+                    <input type="range" id="timeline-scrubber" min="0" max="100" value="0" style="width: 150px;" onchange="scrubTimeline(this.value)">
+                    <span id="total-time" style="font-family: monospace; font-size: 11px; color: #888;">00:00</span>
+                </div>
+            </div>
+
+            <!-- Camera Mode -->
+            <div id="camera-controls" style="margin-left: 15px; display: flex; align-items: center; gap: 6px;">
+                <span style="font-size: 10px; color: #888;">Mode:</span>
+                <button class="control-btn camera-btn active" data-camera="auto" onclick="setCamera('auto')" title="Auto - Intelligent camera follows action">
+                    <span>🤖</span> Auto
+                </button>
+                <button class="control-btn camera-btn" data-camera="overview" onclick="setCamera('overview')" title="Overview - See all">
+                    <span>🎥</span>
+                </button>
+                <button class="control-btn camera-btn" data-camera="follow" onclick="setCamera('follow')" title="Follow data flow">
+                    <span>⚽</span>
+                </button>
+            </div>
+
+            <!-- Event Counter -->
+            <div style="margin-left: auto; display: flex; align-items: center; gap: 15px;">
+                <div style="font-size: 11px; color: #888;">
+                    <span id="event-index">0</span> / <span id="total-events">0</span> events
+                </div>
+                <div id="branch-indicator" style="font-size: 10px; padding: 3px 8px; border-radius: 4px; display: none;">
+                </div>
+            </div>
+
+            <!-- Flow Canvas - 3D Three.js visualization -->
+            <div id="flow-canvas">
+                <div id="threejs-container"></div>
+
+                <div id="loading-overlay">
+                    <div class="loading-spinner"></div>
+                    <div class="loading-text">Loading architecture data...</div>
+                </div>
+
+                <!-- Controls hint overlay -->
+                <div id="viz-controls-hint" style="position: absolute; bottom: 10px; right: 10px; background: rgba(26, 26, 46, 0.9); padding: 8px 12px; border-radius: 6px; font-size: 10px; color: #888; z-index: 50;">
+                    <div>Left-drag: Rotate | Scroll: Zoom | <strong style="color: #7dd3fc;">Right-drag: Pan</strong></div>
+                    <div>Click node for details | Double-click to focus</div>
+                </div>
+            </div>
+
+            <!-- Timeline Panel -->
+            <div id="timeline-panel">
+                <div id="timeline-header">
+                    <h4>Execution Timeline</h4>
+                    <span id="event-count">0 events</span>
+                </div>
+                <div id="timeline-view">
+                    <!-- Timeline tracks -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Panel - Details -->
+        <div id="details-panel">
+            <div id="details-header">
+                <h3>Select a node</h3>
+                <div class="subtitle">Click on any function or class to see details</div>
+            </div>
+            <div id="details-content">
+                <div class="detail-section">
+                    <h4>Data Flow</h4>
+                    <p style="color: #888; font-size: 11px;">Select a node to view input/output data flow</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export Modal -->
+    <div id="export-modal" class="hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Export with Rationales</h3>
+                <button class="modal-close" onclick="hideExportModal()">&times;</button>
+            </div>
+
+            <div class="export-option">
+                <input type="checkbox" id="export-trace" checked>
+                <div class="export-option-info">
+                    <h4>Execution Trace</h4>
+                    <p>Complete call graph with timing and data flow</p>
+                </div>
+            </div>
+
+            <div class="export-option">
+                <input type="checkbox" id="export-rationales" checked>
+                <div class="export-option-info">
+                    <h4>AI Rationales</h4>
+                    <p>Why each decision was made, with confidence scores</p>
+                </div>
+            </div>
+
+            <div class="export-option">
+                <input type="checkbox" id="export-missing" checked>
+                <div class="export-option-info">
+                    <h4>Missing Calls Analysis</h4>
+                    <p>Expected calls that didn't happen and why</p>
+                </div>
+            </div>
+
+            <div class="export-option">
+                <input type="checkbox" id="export-temporal" checked>
+                <div class="export-option-info">
+                    <h4>Temporal Comparisons</h4>
+                    <p>Input@t vs Output@t vs Input@t+1 analysis</p>
+                </div>
+            </div>
+
+            <div class="export-option">
+                <input type="checkbox" id="export-sources" checked>
+                <div class="export-option-info">
+                    <h4>Data Source Mappings</h4>
+                    <p>Video, API, Screen, Audio source tracking</p>
+                </div>
+            </div>
+
+            <div class="export-option">
+                <input type="checkbox" id="export-standalone" checked>
+                <div class="export-option-info">
+                    <h4>Standalone HTML (with embedded data)</h4>
+                    <p>Self-contained HTML file with all data and visualization for later exploration</p>
+                </div>
+            </div>
+
+            <div style="margin-top: 20px; display: flex; gap: 10px;">
+                <button class="control-btn primary" style="flex: 1;" onclick="exportData('json')">
+                    Export as JSON
+                </button>
+                <button class="control-btn" style="flex: 1;" onclick="exportData('html')">
+                    Export as HTML Report
+                </button>
+                <button class="control-btn" style="flex: 1; background: #059669;" onclick="exportData('standalone')">
+                    Export Standalone
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- LLM Status Indicator -->
+    <div id="llm-status">
+        <div class="dot"></div>
+        <span id="llm-status-text">LLM analyzing importance...</span>
+    </div>
+
+    <!-- Rendering Monitor - logs white screens and rendering issues -->
+    <script src="rendering_monitor.js"></script>
+
+    <!-- Export Templates - externalized to avoid script tag escaping issues -->
+    <script src="export_templates.js"></script>
+
+    <!-- Three.js for 3D visualization -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <script>
+        // EARLY DIAGNOSTIC: Check if script is running at all
+        console.log('[WatchArch] Script block started executing');
+
+        // TrueFlow Watch Architecture Visualizer
+        // Football-style visualization with intelligent camera angles and LLM-powered importance scoring
+        class WatchArchitecture {
+            constructor() {
+                this.data = null;
+                this.selectedNode = null;
+                this.dataFlows = [];
+                this.learningPaths = new Map();
+
+                // Playback state (NOT recording - this is a viewer!)
+                this.traceEvents = [];  // All events from socket since start
+                this.playing = false;
+                this.playbackSpeed = 1.0;
+                this.currentEventIndex = 0;
+                this.playbackStartTime = 0;
+                this.lastEventTime = 0;
+
+                // Source filters (show/hide by type)
+                this.sourceFilters = {
+                    all: true,
+                    video: true,
+                    api: true,
+                    screen: true,
+                    audio: true
+                };
+                this.showBranchesNotTaken = false;
+
+                // Three.js properties
+                this.scene = null;
+                this.camera = null;
+                this.renderer = null;
+                this.controls = null;
+                this.nodes3D = new Map();  // function name -> mesh
+                this.edges3D = [];
+                this.dataParticles = [];  // Data flow particles
+                this.branchMarkers = [];  // Branch decision markers
+                this.activeFlows = [];    // Currently animating flows
+                this.raycaster = new THREE.Raycaster();
+                this.mouse = new THREE.Vector2();
+
+                // Performance optimization
+                this.needsRender = true;
+                this.isInteracting = false;
+                this.lastRenderTime = 0;
+                this.targetFPS = 60;
+                this.minFrameTime = 1000 / this.targetFPS;
+                this.lowPowerMode = false;
+                this.isVisible = true;
+
+                // Camera system - auto mode follows data AND switches intelligently
+                this.cameraMode = 'auto';  // auto (intelligent follow + zoom), follow (just follow), overview (static)
+                this.lastDataPosition = null;  // Track where data was last
+                this.dataVelocity = 0;  // How fast data is moving (for zoom decisions)
+                this.cameraTarget = null;
+                this.currentFocusNode = null;
+                this.autoZoomLevel = 1.0;
+
+                // Importance scoring system
+                this.importanceScores = new Map();  // function -> importance (0-1)
+                this.llmEndpoint = null;  // Local LLM endpoint (e.g., http://localhost:11434/api/generate)
+                this.llmPromptTemplate = `Analyze the importance of this function in a data processing pipeline:
+Function: {function_name}
+Type: {function_type}
+Data Types: {data_types}
+Called by: {callers}
+Calls: {callees}
+
+Rate importance 0-1 (1=critical API/data transform, 0=utility). Return only the number.`;
+
+                // Fallback importance rules (when LLM unavailable)
+                this.importanceRules = {
+                    patterns: {
+                        high: ['api', 'request', 'response', 'model', 'inference', 'predict', 'forward', 'train', 'loss', 'gradient', 'embed', 'transform'],
+                        medium: ['process', 'encode', 'decode', 'parse', 'convert', 'extract', 'filter', 'validate'],
+                        low: ['log', 'debug', 'print', 'helper', 'util', 'init', '__', 'get_', 'set_']
+                    },
+                    dataTypeBonus: {
+                        tensor: 0.3,
+                        message: 0.2,
+                        class: 0.1,
+                        primitive: 0
+                    }
+                };
+
+                // Recording duration tracking
+                this.recordStartTime = null;
+                this.recordDurationMs = 0;
+                this.durationTimer = null;
+
+                // Incremental update signatures
+                this.lastStructureSignature = null;
+                this.lastCoverageSignature = null;
+
+                // Source-to-sink tracking
+                this.dataSources = [];
+                this.dataSinks = [];
+                this.sourceToSinkPaths = [];
+                this.branchPoints = [];
+
+                // Playback speed multiplier (for slow-motion on important calls)
+                this.playbackSpeed = 1.0;
+                this.slowMotionThreshold = 0.7;  // Slow down when importance > 0.7
+
+                // Data type classifiers
+                this.dataTypes = {
+                    tensor: ['ndarray', 'Tensor', 'tensor', 'np.array', 'torch.Tensor', 'tf.Tensor'],
+                    message: ['Message', 'Request', 'Response', 'Event', 'Packet', 'Frame'],
+                    class: [],  // Custom classes
+                    primitive: ['int', 'float', 'str', 'bool', 'list', 'dict', 'tuple']
+                };
+
+                // Data source patterns
+                this.sourcePatterns = {
+                    video: ['frame', 'camera', 'video', 'image', 'cv2', 'PIL', 'ImageCapture'],
+                    api: ['request', 'response', 'http', 'websocket', 'api', 'fetch', 'axios'],
+                    screen: ['screen', 'display', 'monitor', 'screenshot', 'grab'],
+                    audio: ['audio', 'sound', 'microphone', 'wav', 'mp3', 'speech']
+                };
+
+                try {
+                    this.init();
+                } catch (e) {
+                    console.error('[WatchArch] Constructor init failed:', e);
+                    // Force hide loading on any error
+                    const overlay = document.getElementById('loading-overlay');
+                    if (overlay) overlay.style.display = 'none';
+                }
+            }
+
+            init() {
+                console.log('[WatchArch] init() called');
+
+                // Immediately hide loading overlay - we'll show errors if needed
+                const loadingOverlay = document.getElementById('loading-overlay');
+                if (loadingOverlay) {
+                    // Update text to show init started (debugging)
+                    const textEl = loadingOverlay.querySelector('.loading-text');
+                    if (textEl) textEl.textContent = 'Initializing Three.js...';
+
+                    loadingOverlay.style.display = 'none';
+                    loadingOverlay.style.visibility = 'hidden';
+                    loadingOverlay.style.opacity = '0';
+                    loadingOverlay.style.pointerEvents = 'none';
+                    console.log('[WatchArch] Loading overlay hidden at start of init');
+                }
+
+                const log = (level, msg, data) => {
+                    console[level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'log'](`[WatchArch] ${msg}`, data || '');
+                    if (window.renderingMonitor) {
+                        window.renderingMonitor.log(level, `[WatchArch] ${msg}`, data);
+                    }
+                };
+
+                try {
+                    log('INFO', 'Initializing Watch Architecture...');
+
+                    const container = document.getElementById('threejs-container');
+                    if (!container) {
+                        log('ERROR', 'Three.js container not found!');
+                        return;
+                    }
+
+                    // Ensure container has dimensions (use defaults if 0)
+                    let width = container.clientWidth || 800;
+                    let height = container.clientHeight || 600;
+                    log('INFO', 'Container dimensions', { width, height });
+
+                    // Scene
+                    this.scene = new THREE.Scene();
+                    this.scene.background = new THREE.Color(0x0d0d20);
+
+                    // Camera
+                    const aspect = width / height;
+                    this.camera = new THREE.PerspectiveCamera(60, aspect, 0.1, 1000);
+                    this.camera.position.set(0, 15, 30);
+
+                    // Renderer with performance optimizations
+                    this.renderer = new THREE.WebGLRenderer({
+                        antialias: true,
+                        powerPreference: 'default',
+                        stencil: false,
+                        alpha: false,
+                        preserveDrawingBuffer: false
+                    });
+                    this.renderer.setSize(width, height);
+                    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                    container.appendChild(this.renderer.domElement);
+                    log('INFO', 'WebGL renderer created', { pixelRatio: this.renderer.getPixelRatio() });
+
+                    // Controls with right-click panning
+                    this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+                    this.controls.enableDamping = true;
+                    this.controls.dampingFactor = 0.1;
+                    this.controls.minDistance = 5;
+                    this.controls.maxDistance = 150;
+                    this.controls.enablePan = true;
+                    this.controls.panSpeed = 1.5;
+                    this.controls.screenSpacePanning = true;
+                    this.controls.mouseButtons = {
+                        LEFT: THREE.MOUSE.ROTATE,
+                        MIDDLE: THREE.MOUSE.DOLLY,
+                        RIGHT: THREE.MOUSE.PAN
+                    };
+
+                    // Request render on controls change
+                    this.controls.addEventListener('change', () => this.needsRender = true);
+                    this.controls.addEventListener('start', () => { this.isInteracting = true; this.needsRender = true; });
+                    this.controls.addEventListener('end', () => this.isInteracting = false);
+
+                    // Lighting
+                    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+                    this.scene.add(ambientLight);
+
+                    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+                    directionalLight.position.set(10, 20, 10);
+                    this.scene.add(directionalLight);
+
+                    // Grid (like a football field)
+                    const gridHelper = new THREE.GridHelper(60, 30, 0x2a4a2a, 0x1a3a1a);
+                    gridHelper.position.y = -3;
+                    this.scene.add(gridHelper);
+
+                    // Field markings
+                    this.createFieldMarkings();
+
+                    // Event listeners
+                    window.addEventListener('resize', () => this.onResize());
+                    this.renderer.domElement.addEventListener('click', (e) => this.onClick3D(e));
+                    this.renderer.domElement.addEventListener('dblclick', (e) => this.onDoubleClick3D(e));
+                    this.renderer.domElement.addEventListener('mousemove', (e) => this.onMouseMove3D(e));
+                    this.renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+
+                    // Visibility change - pause when tab not visible
+                    document.addEventListener('visibilitychange', () => {
+                        this.isVisible = !document.hidden;
+                        if (this.isVisible) {
+                            this.needsRender = true;
+                            this.animate();
+                        }
+                    });
+
+                    log('INFO', 'Setting up event listeners...');
+                    this.setupEventListeners();
+
+                    log('INFO', 'Initializing camera controls...');
+                    this.initCameraControls();
+
+                    log('INFO', 'Connecting to LLM...');
+                    this.tryConnectLLM();
+
+                    log('INFO', 'Setting up performance monitor...');
+                    this.setupPerformanceMonitor();
+
+                    // Start animation loop
+                    log('INFO', 'Starting animation loop...');
+                    this.animate();
+
+                    log('INFO', 'All init steps complete');
+
+                    // Force initial render
+                    this.renderer.render(this.scene, this.camera);
+                    log('INFO', 'Initial render complete - Watch Architecture ready!');
+
+                } catch (error) {
+                    log('ERROR', 'Watch Architecture init FAILED', { error: error.message, stack: error.stack });
+                } finally {
+                    // ALWAYS hide loading overlay
+                    this.hideLoading();
+                }
+            }
+
+            hideLoading() {
+                console.log('[WatchArch] hideLoading called');
+                const overlay = document.getElementById('loading-overlay');
+                if (overlay) {
+                    overlay.style.display = 'none';
+                    overlay.style.visibility = 'hidden';
+                    overlay.style.opacity = '0';
+                    overlay.style.pointerEvents = 'none';
+                    overlay.classList.add('hidden');
+                    console.log('[WatchArch] Loading overlay hidden');
+                    if (window.renderingMonitor) {
+                        window.renderingMonitor.log('INFO', 'Loading overlay hidden');
+                    }
+                }
+            }
+
+            createFieldMarkings() {
+                // Create football field-style ground plane
+                const fieldGeometry = new THREE.PlaneGeometry(60, 40);
+                const fieldMaterial = new THREE.MeshBasicMaterial({
+                    color: 0x1a3a1a,
+                    transparent: true,
+                    opacity: 0.8,
+                    side: THREE.DoubleSide
+                });
+                const field = new THREE.Mesh(fieldGeometry, fieldMaterial);
+                field.rotation.x = -Math.PI / 2;
+                field.position.y = -2.99;
+                this.scene.add(field);
+
+                // Center line
+                const centerLineGeometry = new THREE.BufferGeometry().setFromPoints([
+                    new THREE.Vector3(0, -2.98, -20),
+                    new THREE.Vector3(0, -2.98, 20)
+                ]);
+                const centerLine = new THREE.Line(centerLineGeometry, new THREE.LineBasicMaterial({ color: 0x4a6a4a }));
+                this.scene.add(centerLine);
+
+                // Center circle
+                const circleGeometry = new THREE.RingGeometry(4, 4.1, 32);
+                const circleMaterial = new THREE.MeshBasicMaterial({ color: 0x4a6a4a, side: THREE.DoubleSide });
+                const circle = new THREE.Mesh(circleGeometry, circleMaterial);
+                circle.rotation.x = -Math.PI / 2;
+                circle.position.y = -2.98;
+                this.scene.add(circle);
+            }
+
+            setupPerformanceMonitor() {
+                // Simple FPS-based frame limiting only (no pixel ratio changes to avoid white screen)
+                let frameCount = 0;
+                let lastCheck = performance.now();
+
+                const checkPerformance = () => {
+                    const now = performance.now();
+                    if (now - lastCheck >= 1000) {
+                        const fps = (frameCount * 1000) / (now - lastCheck);
+                        frameCount = 0;
+                        lastCheck = now;
+
+                        // Only adjust frame rate target, not pixel ratio (pixel ratio changes break rendering)
+                        if (fps < 20 && !this.lowPowerMode) {
+                            this.lowPowerMode = true;
+                            this.targetFPS = 30;
+                            this.minFrameTime = 1000 / 30;
+                            console.log('Low power mode enabled (FPS:', fps.toFixed(1), ')');
+                        } else if (fps > 45 && this.lowPowerMode) {
+                            this.lowPowerMode = false;
+                            this.targetFPS = 60;
+                            this.minFrameTime = 1000 / 60;
+                            console.log('Normal mode restored (FPS:', fps.toFixed(1), ')');
+                        }
+                    }
+                    frameCount++;
+                    if (this.isVisible) requestAnimationFrame(checkPerformance);
+                };
+                requestAnimationFrame(checkPerformance);
+            }
+
+            onResize() {
+                const container = document.getElementById('threejs-container');
+                if (!container || !this.camera || !this.renderer) return;
+
+                this.camera.aspect = container.clientWidth / container.clientHeight;
+                this.camera.updateProjectionMatrix();
+                this.renderer.setSize(container.clientWidth, container.clientHeight);
+                this.needsRender = true;
+            }
+
+            onClick3D(event) {
+                const rect = this.renderer.domElement.getBoundingClientRect();
+                this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+                this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+                this.raycaster.setFromCamera(this.mouse, this.camera);
+                const meshes = Array.from(this.nodes3D.values());
+                const intersects = this.raycaster.intersectObjects(meshes, true);
+
+                if (intersects.length > 0) {
+                    let obj = intersects[0].object;
+                    while (obj.parent && !obj.userData.name) obj = obj.parent;
+                    if (obj.userData.name) {
+                        this.selectNode(obj.userData.name);
+                    }
+                }
+            }
+
+            onDoubleClick3D(event) {
+                const rect = this.renderer.domElement.getBoundingClientRect();
+                this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+                this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+                this.raycaster.setFromCamera(this.mouse, this.camera);
+                const meshes = Array.from(this.nodes3D.values());
+                const intersects = this.raycaster.intersectObjects(meshes, true);
+
+                if (intersects.length > 0) {
+                    let obj = intersects[0].object;
+                    while (obj.parent && !obj.userData.name) obj = obj.parent;
+                    if (obj.userData.name) {
+                        this.focusOnNode(obj.userData.name);
+                    }
+                }
+            }
+
+            onMouseMove3D(event) {
+                // Update tooltip on hover - can be implemented for hover effects
+                this.needsRender = true;
+            }
+
+            focusOnNode(name) {
+                const mesh = this.nodes3D.get(name);
+                if (!mesh) return;
+
+                const pos = mesh.position;
+                this.camera.position.set(pos.x, pos.y + 8, pos.z + 12);
+                this.controls.target.set(pos.x, pos.y, pos.z);
+                this.controls.update();
+                this.needsRender = true;
+            }
+
+            selectNode(name) {
+                this.selectedNode = { name };
+                this.showNodeDetails(name);
+
+                // Highlight selected node
+                this.nodes3D.forEach((mesh, n) => {
+                    const isSelected = n === name;
+                    if (mesh.children[0] && mesh.children[0].material) {
+                        mesh.children[0].material.emissive = new THREE.Color(isSelected ? 0x3b82f6 : 0x000000);
+                        mesh.children[0].material.emissiveIntensity = isSelected ? 0.3 : 0;
+                    }
+                });
+                this.needsRender = true;
+            }
+
+            showNodeDetails(name) {
+                const info = this.data?.functions?.[name] || {};
+                const importance = this.importanceScores.get(name) || 0.5;
+                const dataType = this.classifyDataType(info);
+                const source = this.classifyDataSource(name, '', info);
+
+                const detailsContent = document.getElementById('details-content');
+                if (!detailsContent) return;
+
+                const header = document.getElementById('details-header');
+                if (header) {
+                    header.querySelector('h3').textContent = name;
+                    header.querySelector('.subtitle').textContent = dataType + ' | Importance: ' + importance.toFixed(2);
+                }
+
+                let html = '<div class="detail-section">';
+                html += '<h4>Function Info</h4>';
+                html += '<div style="font-size: 11px; color: #ccc;">';
+                html += '<div>Line: ' + (info.line || 'N/A') + '</div>';
+                html += '<div>Type: ' + dataType + '</div>';
+                if (source) html += '<div>Source: ' + source + '</div>';
+                html += '<div style="margin-top: 8px;">Importance: <span style="color: ' +
+                    (importance > 0.7 ? '#ef4444' : importance > 0.4 ? '#fbbf24' : '#4ade80') + ';">' +
+                    importance.toFixed(2) + '</span></div>';
+                html += '</div></div>';
+
+                detailsContent.innerHTML = html;
+            }
+
+            // ============================================================
+            // CAMERA SYSTEM - Football-style viewing angles
+            // ============================================================
+            initCameraControls() {
+                // Set initial camera button state
+                document.querySelectorAll('.camera-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.camera === this.cameraMode);
+                });
+            }
+
+            setCameraMode(mode) {
+                this.cameraMode = mode;
+
+                // Update button states
+                document.querySelectorAll('.camera-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.camera === mode);
+                });
+
+                // Stop any running camera animation
+                if (this.cameraAnimation) {
+                    cancelAnimationFrame(this.cameraAnimation);
+                    this.cameraAnimation = null;
+                }
+
+                switch (mode) {
+                    case 'overview':
+                        this.animateCameraTo(this.originalViewBox);
+                        break;
+                    case 'flyby':
+                        this.startFlybyAnimation();
+                        break;
+                    case 'tele':
+                        this.startTelephotoMode();
+                        break;
+                    case 'follow':
+                        this.startFollowMode();
+                        break;
+                }
+            }
+
+            animateCameraTo(targetViewBox, duration = 500) {
+                const startViewBox = { ...this.viewBox };
+                const startTime = performance.now();
+
+                const animate = (currentTime) => {
+                    const elapsed = currentTime - startTime;
+                    const progress = Math.min(elapsed / duration, 1);
+                    const eased = this.easeInOutCubic(progress);
+
+                    this.viewBox = {
+                        x: startViewBox.x + (targetViewBox.x - startViewBox.x) * eased,
+                        y: startViewBox.y + (targetViewBox.y - startViewBox.y) * eased,
+                        width: startViewBox.width + (targetViewBox.width - startViewBox.width) * eased,
+                        height: startViewBox.height + (targetViewBox.height - startViewBox.height) * eased
+                    };
+
+                    this.svg.setAttribute('viewBox',
+                        `${this.viewBox.x} ${this.viewBox.y} ${this.viewBox.width} ${this.viewBox.height}`);
+
+                    if (progress < 1) {
+                        this.cameraAnimation = requestAnimationFrame(animate);
+                    }
+                };
+
+                this.cameraAnimation = requestAnimationFrame(animate);
+            }
+
+            startFlybyAnimation() {
+                // Fly-by: Smooth pan across the entire visualization
+                const nodes = document.querySelectorAll('.flow-node');
+                if (nodes.length === 0) return;
+
+                let currentNodeIndex = 0;
+                const nodePositions = Array.from(nodes).map(node => {
+                    const transform = node.getAttribute('transform');
+                    const match = transform.match(/translate\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)\)/);
+                    return match ? { x: parseFloat(match[1]), y: parseFloat(match[2]) } : { x: 500, y: 300 };
+                });
+
+                const flyToNext = () => {
+                    if (this.cameraMode !== 'flyby') return;
+
+                    const pos = nodePositions[currentNodeIndex];
+                    const targetViewBox = {
+                        x: pos.x - 200,
+                        y: pos.y - 150,
+                        width: 400,
+                        height: 300
+                    };
+
+                    this.animateCameraTo(targetViewBox, 1500);
+
+                    currentNodeIndex = (currentNodeIndex + 1) % nodePositions.length;
+                    setTimeout(flyToNext, 2000);
+                };
+
+                flyToNext();
+            }
+
+            startTelephotoMode() {
+                // Telephoto: Zoom in on currently selected node or most important node
+                if (this.selectedNode) {
+                    this.zoomToNode(this.selectedNode.pos);
+                } else {
+                    // Find most important node
+                    let maxImportance = 0;
+                    let targetNode = null;
+                    this.importanceScores.forEach((importance, name) => {
+                        if (importance > maxImportance) {
+                            maxImportance = importance;
+                            targetNode = name;
+                        }
+                    });
+
+                    if (targetNode) {
+                        const node = document.querySelector(`.flow-node[data-name="${targetNode}"]`);
+                        if (node) {
+                            const transform = node.getAttribute('transform');
+                            const match = transform.match(/translate\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)\)/);
+                            if (match) {
+                                this.zoomToNode({ x: parseFloat(match[1]), y: parseFloat(match[2]) });
+                            }
+                        }
+                    }
+                }
+            }
+
+            zoomToNode(pos) {
+                const targetViewBox = {
+                    x: pos.x - 100,
+                    y: pos.y - 75,
+                    width: 200,
+                    height: 150
+                };
+                this.animateCameraTo(targetViewBox, 800);
+            }
+
+            startFollowMode() {
+                // Follow mode: Track data flow like ball-passing
+                // Will be activated during playback to follow particles
+                console.log('Follow mode activated - will track data flow during playback');
+            }
+
+            followDataParticle(fromPos, toPos, duration) {
+                if (this.cameraMode !== 'follow') return;
+
+                const midPoint = {
+                    x: (fromPos.x + toPos.x) / 2,
+                    y: (fromPos.y + toPos.y) / 2
+                };
+
+                const targetViewBox = {
+                    x: midPoint.x - 150,
+                    y: midPoint.y - 100,
+                    width: 300,
+                    height: 200
+                };
+
+                this.animateCameraTo(targetViewBox, duration * 0.8);
+            }
+
+            easeInOutCubic(t) {
+                return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+            }
+
+            // ============================================================
+            // IMPORTANCE SCORING - LLM with fallback defaults
+            // ============================================================
+            async tryConnectLLM() {
+                // Try common local LLM endpoints
+                const endpoints = [
+                    'http://localhost:11434/api/generate',  // Ollama
+                    'http://localhost:8080/v1/completions', // llama.cpp
+                    'http://localhost:1234/v1/completions'  // LM Studio
+                ];
+
+                for (const endpoint of endpoints) {
+                    try {
+                        const response = await fetch(endpoint, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ prompt: 'test', max_tokens: 1 }),
+                            signal: AbortSignal.timeout(2000)
+                        });
+                        if (response.ok || response.status === 400) {  // 400 might just be bad request but endpoint exists
+                            this.llmEndpoint = endpoint;
+                            console.log('Connected to local LLM:', endpoint);
+                            return;
+                        }
+                    } catch (e) {
+                        // Try next endpoint
+                    }
+                }
+                console.log('No local LLM found - using fallback importance rules');
+            }
+
+            async calculateImportance(funcName, info) {
+                // Try LLM first
+                if (this.llmEndpoint) {
+                    try {
+                        const importance = await this.calculateImportanceWithLLM(funcName, info);
+                        if (importance !== null) {
+                            return importance;
+                        }
+                    } catch (e) {
+                        console.warn('LLM importance failed, using fallback:', e);
+                    }
+                }
+
+                // Fallback: Rule-based importance
+                return this.calculateImportanceFallback(funcName, info);
+            }
+
+            async calculateImportanceWithLLM(funcName, info) {
+                document.getElementById('llm-status').classList.add('active');
+                document.getElementById('llm-status-text').textContent = `Analyzing: ${funcName}`;
+
+                try {
+                    const dataType = this.classifyDataType(info);
+                    const callGraph = this.data?.call_graph || {};
+                    const callers = Object.entries(callGraph)
+                        .filter(([_, callees]) => callees.includes(funcName))
+                        .map(([caller]) => caller);
+                    const callees = callGraph[funcName] || [];
+
+                    const prompt = this.llmPromptTemplate
+                        .replace('{function_name}', funcName)
+                        .replace('{function_type}', dataType || 'unknown')
+                        .replace('{data_types}', JSON.stringify(info.params?.map(p => p.type) || []))
+                        .replace('{callers}', callers.join(', ') || 'none')
+                        .replace('{callees}', callees.join(', ') || 'none');
+
+                    // Detect LLM type from endpoint
+                    let body;
+                    if (this.llmEndpoint.includes('ollama')) {
+                        body = JSON.stringify({ model: 'llama3', prompt, stream: false });
+                    } else {
+                        body = JSON.stringify({ prompt, max_tokens: 5, temperature: 0 });
+                    }
+
+                    const response = await fetch(this.llmEndpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body,
+                        signal: AbortSignal.timeout(5000)
+                    });
+
+                    const result = await response.json();
+                    const text = result.response || result.choices?.[0]?.text || '';
+                    const importance = parseFloat(text.match(/\d+\.?\d*/)?.[0] || '0.5');
+
+                    return Math.min(Math.max(importance, 0), 1);  // Clamp 0-1
+                } finally {
+                    document.getElementById('llm-status').classList.remove('active');
+                }
+            }
+
+            calculateImportanceFallback(funcName, info) {
+                const nameLower = funcName.toLowerCase();
+                let importance = 0.5;  // Base importance
+
+                // Check pattern matches
+                for (const pattern of this.importanceRules.patterns.high) {
+                    if (nameLower.includes(pattern)) {
+                        importance = Math.max(importance, 0.8 + Math.random() * 0.2);
+                        break;
+                    }
+                }
+
+                for (const pattern of this.importanceRules.patterns.medium) {
+                    if (nameLower.includes(pattern)) {
+                        importance = Math.max(importance, 0.5 + Math.random() * 0.2);
+                        break;
+                    }
+                }
+
+                for (const pattern of this.importanceRules.patterns.low) {
+                    if (nameLower.includes(pattern)) {
+                        importance = Math.min(importance, 0.2 + Math.random() * 0.1);
+                        break;
+                    }
+                }
+
+                // Data type bonus
+                const dataType = this.classifyDataType(info);
+                importance += this.importanceRules.dataTypeBonus[dataType] || 0;
+
+                // Connectivity bonus (more connections = more important)
+                const callGraph = this.data?.call_graph || {};
+                const callees = (callGraph[funcName] || []).length;
+                const callers = Object.values(callGraph).filter(c => c.includes(funcName)).length;
+                importance += Math.min((callees + callers) * 0.05, 0.2);
+
+                return Math.min(Math.max(importance, 0), 1);  // Clamp 0-1
+            }
+
+            async calculateAllImportanceScores() {
+                if (!this.data?.functions) return;
+
+                const functions = Object.entries(this.data.functions);
+                for (const [name, info] of functions) {
+                    const importance = await this.calculateImportance(name, info);
+                    this.importanceScores.set(name, importance);
+                }
+
+                // Update node visuals with importance
+                this.updateNodeImportanceVisuals();
+            }
+
+            updateNodeImportanceVisuals() {
+                document.querySelectorAll('.flow-node').forEach(node => {
+                    const name = node.dataset.name;
+                    const importance = this.importanceScores.get(name) || 0.5;
+
+                    // Add importance badge
+                    let badge = node.querySelector('.importance-badge');
+                    if (!badge) {
+                        badge = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                        badge.setAttribute('class', 'importance-badge');
+                        badge.setAttribute('x', 45);
+                        badge.setAttribute('y', -12);
+                        badge.setAttribute('font-size', '9');
+                        badge.setAttribute('fill', importance > 0.7 ? '#ef4444' : importance > 0.4 ? '#fbbf24' : '#4ade80');
+                        badge.textContent = importance.toFixed(1);
+                        node.appendChild(badge);
+                    }
+
+                    // Update border based on importance
+                    const bg = node.querySelector('.node-bg');
+                    if (bg && importance > 0.7) {
+                        bg.setAttribute('stroke-width', '3');
+                        bg.setAttribute('stroke-dasharray', '5,3');
+                    }
+                });
+            }
+
+            getPlaybackSpeedForImportance(importance) {
+                // Slow down for important events
+                if (importance >= this.slowMotionThreshold) {
+                    return 0.3;  // 30% speed for high importance
+                } else if (importance >= 0.5) {
+                    return 0.6;  // 60% speed for medium importance
+                }
+                return 1.0;  // Normal speed
+            }
+
+            drawGrid() {
+                const grid = document.getElementById('grid');
+                const spacing = 50;
+
+                for (let x = 0; x <= 1000; x += spacing) {
+                    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                    line.setAttribute('x1', x);
+                    line.setAttribute('y1', 0);
+                    line.setAttribute('x2', x);
+                    line.setAttribute('y2', 600);
+                    line.setAttribute('stroke', '#1a1a3a');
+                    line.setAttribute('stroke-width', '1');
+                    grid.appendChild(line);
+                }
+
+                for (let y = 0; y <= 600; y += spacing) {
+                    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                    line.setAttribute('x1', 0);
+                    line.setAttribute('y1', y);
+                    line.setAttribute('x2', 1000);
+                    line.setAttribute('y2', y);
+                    line.setAttribute('stroke', '#1a1a3a');
+                    line.setAttribute('stroke-width', '1');
+                    grid.appendChild(line);
+                }
+            }
+
+            setupEventListeners() {
+                // Source selection
+                document.querySelectorAll('.source-item').forEach(item => {
+                    item.addEventListener('click', () => {
+                        document.querySelectorAll('.source-item').forEach(i => i.classList.remove('active'));
+                        item.classList.add('active');
+                        this.filterBySource(item.dataset.source);
+                    });
+                });
+            }
+
+            loadData(data, forceRecreate = false) {
+                console.log('[WatchArch] loadData method called');
+                if (window.renderingMonitor) {
+                    window.renderingMonitor.log('INFO', 'loadData method executing');
+                }
+
+                // Create separate signatures for structure vs coverage
+                const structureSignature = JSON.stringify({
+                    functions: Object.keys(data.functions || {}).sort(),
+                    callGraph: Object.keys(data.call_graph || {}).sort()
+                });
+                const coverageSignature = JSON.stringify({
+                    covered: (data.covered_functions || []).sort(),
+                    dead: (data.dead_functions || []).sort()
+                });
+
+                const structureChanged = this.lastStructureSignature !== structureSignature;
+                const coverageChanged = this.lastCoverageSignature !== coverageSignature;
+
+                // Skip if nothing changed
+                if (!forceRecreate && !structureChanged && !coverageChanged && this.nodes3D.size > 0) {
+                    console.log('[WatchArch] Data unchanged, skipping update');
+                    this.hideLoading();
+                    this.needsRender = true;
+                    return;
+                }
+
+                this.data = data;
+
+                // Normalize: prefer resolved_call_graph over raw call_graph for better cross-class connections
+                if (data.resolved_call_graph && Object.keys(data.resolved_call_graph).length > 0) {
+                    console.log('[WatchArch] Using resolved_call_graph for cross-class connections');
+                    this.data.call_graph = data.resolved_call_graph;
+                } else if (data.global_resolved_call_graph && Object.keys(data.global_resolved_call_graph).length > 0) {
+                    console.log('[WatchArch] Using global_resolved_call_graph for cross-class connections');
+                    this.data.call_graph = data.global_resolved_call_graph;
+                }
+
+                // If only coverage changed, do incremental update (repaint all changed data)
+                if (!forceRecreate && !structureChanged && coverageChanged && this.nodes3D.size > 0) {
+                    console.log('[WatchArch] Coverage changed, repainting all changed nodes/edges...');
+                    this.lastCoverageSignature = coverageSignature;
+
+                    // Re-identify sources and sinks based on new coverage
+                    this.identifySourcesAndSinks();
+
+                    // Repaint ALL nodes and edges with new colors
+                    this.repaintAllElements();
+
+                    // Update source-to-sink paths and branch points
+                    this.updateSourceToSinkPaths();
+
+                    // Trigger importance recalculation for newly covered functions
+                    this.recalculateChangedImportance();
+
+                    this.hideLoading();
+                    this.needsRender = true;
+                    console.log('[WatchArch] Incremental repaint complete');
+                    return;
+                }
+
+                // Full recreation needed
+                console.log('[WatchArch] Creating visualization...');
+                this.lastStructureSignature = structureSignature;
+                this.lastCoverageSignature = coverageSignature;
+                this.clearVisualization();
+                this.createVisualization();
+                this.updateLearningPaths();
+                this.identifySourcesAndSinks();
+                this.updateSourceToSinkPaths();
+                this.hideLoading();
+
+                // Calculate importance scores for all functions
+                this.calculateAllImportanceScores();
+                this.needsRender = true;
+
+                console.log('[WatchArch] loadData completed');
+            }
+
+            // Identify data sources (entry points) and sinks (final data usage)
+            identifySourcesAndSinks() {
+                if (!this.data) return;
+
+                const callGraph = this.data.call_graph || {};
+                const functions = this.data.functions || {};
+                const coveredFunctions = new Set(this.data.covered_functions || []);
+
+                // Build reverse call graph
+                const reverseGraph = {};
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    callees.forEach(callee => {
+                        if (!reverseGraph[callee]) reverseGraph[callee] = [];
+                        reverseGraph[callee].push(caller);
+                    });
+                });
+
+                this.dataSources = [];  // Entry points (no callers or external callers)
+                this.dataSinks = [];    // Exit points (no callees or final consumers)
+
+                Object.keys(functions).forEach(func => {
+                    const callers = reverseGraph[func] || [];
+                    const callees = callGraph[func] || [];
+
+                    // Source: No callers (entry point) or matches source patterns
+                    const isSource = callers.length === 0 ||
+                        Object.values(this.sourcePatterns).some(patterns =>
+                            patterns.some(p => func.toLowerCase().includes(p))
+                        );
+
+                    // Sink: No callees (terminal) or matches sink patterns
+                    const isSink = callees.length === 0 ||
+                        ['save', 'write', 'send', 'output', 'render', 'display', 'store', 'commit'].some(p =>
+                            func.toLowerCase().includes(p)
+                        );
+
+                    if (isSource && coveredFunctions.has(func)) {
+                        this.dataSources.push(func);
+                    }
+                    if (isSink && coveredFunctions.has(func)) {
+                        this.dataSinks.push(func);
+                    }
+                });
+
+                console.log('[WatchArch] Sources:', this.dataSources, 'Sinks:', this.dataSinks);
+            }
+
+            // Update source-to-sink path visualization
+            updateSourceToSinkPaths() {
+                if (!this.data || !this.dataSources) return;
+
+                const callGraph = this.data.call_graph || {};
+                const coveredFunctions = new Set(this.data.covered_functions || []);
+                const deadFunctions = new Set(this.data.dead_functions || []);
+
+                // Build reverse graph for tracing
+                const reverseGraph = {};
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    callees.forEach(callee => {
+                        if (!reverseGraph[callee]) reverseGraph[callee] = [];
+                        reverseGraph[callee].push(caller);
+                    });
+                });
+
+                // Find paths from sources to sinks
+                this.sourceToSinkPaths = [];
+
+                this.dataSources.forEach(source => {
+                    // BFS to find all reachable sinks
+                    const visited = new Set();
+                    const queue = [[source]];
+
+                    while (queue.length > 0) {
+                        const path = queue.shift();
+                        const current = path[path.length - 1];
+
+                        if (visited.has(current)) continue;
+                        visited.add(current);
+
+                        if (this.dataSinks.includes(current) && path.length > 1) {
+                            this.sourceToSinkPaths.push({
+                                source,
+                                sink: current,
+                                path,
+                                covered: path.every(f => coveredFunctions.has(f))
+                            });
+                        }
+
+                        const callees = callGraph[current] || [];
+                        callees.forEach(callee => {
+                            if (!visited.has(callee)) {
+                                queue.push([...path, callee]);
+                            }
+                        });
+                    }
+                });
+
+                // Update edge colors to show source-to-sink paths
+                this.highlightSourceToSinkPaths();
+
+                // Find and mark uncalled paths intelligently
+                this.markUncalledPaths(reverseGraph, coveredFunctions, deadFunctions);
+            }
+
+            // Highlight edges that are part of source-to-sink data flow
+            highlightSourceToSinkPaths() {
+                if (!this.sourceToSinkPaths) return;
+
+                // Create set of edges in active paths
+                const activeEdges = new Set();
+                this.sourceToSinkPaths.forEach(pathInfo => {
+                    if (pathInfo.covered) {
+                        for (let i = 0; i < pathInfo.path.length - 1; i++) {
+                            activeEdges.add(`${pathInfo.path[i]}->${pathInfo.path[i + 1]}`);
+                        }
+                    }
+                });
+
+                // Update edge colors
+                const callGraph = this.data.call_graph || {};
+                let edgeIndex = 0;
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    callees.forEach(callee => {
+                        if (edgeIndex < this.edges3D.length) {
+                            const edge = this.edges3D[edgeIndex];
+                            const edgeKey = `${caller}->${callee}`;
+
+                            if (activeEdges.has(edgeKey)) {
+                                // Bright cyan for active data flow path
+                                edge.material.color.setHex(0x22d3ee);
+                                edge.material.opacity = 1.0;
+                            }
+                            edgeIndex++;
+                        }
+                    });
+                });
+            }
+
+            // Mark uncalled paths intelligently - show when they branch off from called paths
+            markUncalledPaths(reverseGraph, coveredFunctions, deadFunctions) {
+                const callGraph = this.data.call_graph || {};
+                const functions = this.data.functions || {};
+
+                // Find branch points: covered functions that have uncalled callees
+                this.branchPoints = [];
+
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    if (coveredFunctions.has(caller)) {
+                        const uncalledCallees = callees.filter(c => deadFunctions.has(c));
+                        if (uncalledCallees.length > 0) {
+                            this.branchPoints.push({
+                                caller,
+                                calledBranches: callees.filter(c => coveredFunctions.has(c)),
+                                uncalledBranches: uncalledCallees
+                            });
+                        }
+                    }
+                });
+
+                // Update node colors based on dead type analysis
+                this.nodes3D.forEach((node, name) => {
+                    if (deadFunctions.has(name)) {
+                        const whyInfo = this.analyzeDeadFunction(name, callGraph, reverseGraph, coveredFunctions, deadFunctions);
+                        node.userData.deadType = whyInfo.root_cause;
+                        node.userData.whyNotCovered = whyInfo;
+
+                        // Color: red for orphaned, purple for dead branch
+                        const color = whyInfo.root_cause === 'NO_CALL_SITES' ? 0xef4444 : 0xa78bfa;
+                        node.material.color.setHex(color);
+                    }
+                });
+
+                // Mark edges to uncalled branches as purple
+                let edgeIndex = 0;
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    callees.forEach(callee => {
+                        if (edgeIndex < this.edges3D.length) {
+                            const edge = this.edges3D[edgeIndex];
+                            if (coveredFunctions.has(caller) && deadFunctions.has(callee)) {
+                                // Purple edge for uncalled branch
+                                edge.material.color.setHex(0xa78bfa);
+                                edge.material.opacity = 0.8;
+                            }
+                            edgeIndex++;
+                        }
+                    });
+                });
+
+                console.log('[WatchArch] Branch points with uncalled paths:', this.branchPoints.length);
+            }
+
+            // Analyze why a function is dead
+            analyzeDeadFunction(funcName, callGraph, reverseGraph, coveredFunctions, deadFunctions) {
+                const callers = reverseGraph[funcName] || [];
+
+                if (callers.length === 0) {
+                    return { root_cause: 'NO_CALL_SITES', reasons: [{ explanation: 'No callers found' }] };
+                }
+
+                const coveredCallers = callers.filter(c => coveredFunctions.has(c));
+                if (coveredCallers.length > 0) {
+                    return {
+                        root_cause: 'BRANCH_NOT_TAKEN',
+                        root_cause_detail: { caller: coveredCallers[0] },
+                        reasons: [{ explanation: `${coveredCallers[0]} didn't call this branch` }]
+                    };
+                }
+
+                // Trace up to find root cause
+                const visited = new Set();
+                const queue = [[funcName]];
+
+                while (queue.length > 0) {
+                    const path = queue.shift();
+                    const current = path[0];
+
+                    if (visited.has(current)) continue;
+                    visited.add(current);
+
+                    const parentCallers = reverseGraph[current] || [];
+                    for (const caller of parentCallers) {
+                        if (coveredFunctions.has(caller)) {
+                            return {
+                                root_cause: 'BRANCH_NOT_TAKEN',
+                                root_cause_detail: { caller, target: current },
+                                chain: [caller, ...path],
+                                reasons: [{ explanation: `Chain: ${[caller, ...path].join(' → ')}` }]
+                            };
+                        }
+                        if (!visited.has(caller)) {
+                            queue.push([caller, ...path]);
+                        }
+                    }
+                }
+
+                return { root_cause: 'UNREACHABLE_FROM_ENTRY', reasons: [{ explanation: 'Orphaned chain' }] };
+            }
+
+            // Repaint ALL nodes and edges without recreating geometry
+            repaintAllElements() {
+                const coveredFunctions = new Set(this.data.covered_functions || []);
+                const deadFunctions = new Set(this.data.dead_functions || []);
+                const callGraph = this.data.call_graph || {};
+                const prevCovered = this.prevCoveredFunctions || new Set();
+
+                // Build reverse graph
+                const reverseGraph = {};
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    callees.forEach(callee => {
+                        if (!reverseGraph[callee]) reverseGraph[callee] = [];
+                        reverseGraph[callee].push(caller);
+                    });
+                });
+
+                // Track what changed for logging
+                let nodesRepainted = 0;
+                let edgesRepainted = 0;
+
+                // Repaint ALL nodes
+                this.nodes3D.forEach((node, name) => {
+                    const wasAlive = prevCovered.has(name);
+                    const isAlive = coveredFunctions.has(name);
+                    const isDead = deadFunctions.has(name);
+                    const statusChanged = wasAlive !== isAlive;
+
+                    let color;
+                    let opacity = 1.0;
+
+                    if (isDead) {
+                        const whyInfo = this.analyzeDeadFunction(name, callGraph, reverseGraph, coveredFunctions, deadFunctions);
+                        node.userData.deadType = whyInfo.root_cause;
+                        node.userData.whyNotCovered = whyInfo;
+                        color = whyInfo.root_cause === 'NO_CALL_SITES' ? 0xef4444 : 0xa78bfa;
+                        opacity = 0.7;
+                    } else if (isAlive) {
+                        // Check if it's a source or sink
+                        if (this.dataSources?.includes(name)) {
+                            color = 0x22d3ee;  // Cyan for data source
+                        } else if (this.dataSinks?.includes(name)) {
+                            color = 0xfbbf24;  // Amber for data sink
+                        } else {
+                            color = 0x4ade80;  // Green for covered
+                        }
+                    } else {
+                        color = 0x888888;
+                        opacity = 0.5;
+                    }
+
+                    // Always repaint to ensure consistency
+                    node.material.color.setHex(color);
+                    node.material.opacity = opacity;
+                    node.material.needsUpdate = true;
+                    node.userData.isAlive = isAlive;
+                    node.userData.isDead = isDead;
+                    node.userData.statusChanged = statusChanged;
+
+                    if (statusChanged) nodesRepainted++;
+                });
+
+                // Repaint ALL edges
+                let edgeIndex = 0;
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    const callerNode = this.nodes3D.get(caller);
+                    if (!callerNode) return;
+
+                    callees.forEach(callee => {
+                        const calleeNode = this.nodes3D.get(callee);
+                        if (!calleeNode || edgeIndex >= this.edges3D.length) return;
+
+                        const edge = this.edges3D[edgeIndex];
+                        const callerAlive = coveredFunctions.has(caller);
+                        const calleeAlive = coveredFunctions.has(callee);
+                        const calleeDead = deadFunctions.has(callee);
+
+                        let edgeColor = 0x4a4a6a;
+                        let edgeOpacity = 0.4;
+
+                        if (callerAlive && calleeAlive) {
+                            edgeColor = 0x4ade80;  // Green for active path
+                            edgeOpacity = 0.9;
+                        } else if (callerAlive && calleeDead) {
+                            edgeColor = 0xa78bfa;  // Purple for dead branch
+                            edgeOpacity = 0.8;
+                        } else if (!callerAlive && !calleeAlive) {
+                            edgeColor = 0x4a4a6a;  // Gray for inactive
+                            edgeOpacity = 0.3;
+                        }
+
+                        edge.material.color.setHex(edgeColor);
+                        edge.material.opacity = edgeOpacity;
+                        edge.material.needsUpdate = true;
+                        edgesRepainted++;
+                        edgeIndex++;
+                    });
+                });
+
+                // Store current coverage for next comparison
+                this.prevCoveredFunctions = new Set(coveredFunctions);
+
+                console.log(`[WatchArch] Repainted ${nodesRepainted} changed nodes, ${edgesRepainted} edges`);
+            }
+
+            // Recalculate importance for newly covered functions
+            recalculateChangedImportance() {
+                if (!this.data) return;
+
+                const coveredFunctions = new Set(this.data.covered_functions || []);
+                const prevCovered = this.prevImportanceCovered || new Set();
+
+                // Find newly covered functions
+                const newlyCovered = [...coveredFunctions].filter(f => !prevCovered.has(f));
+
+                if (newlyCovered.length > 0) {
+                    console.log(`[WatchArch] Recalculating importance for ${newlyCovered.length} newly covered functions`);
+                    newlyCovered.forEach(func => {
+                        this.calculateImportanceScore(func);
+                    });
+                }
+
+                this.prevImportanceCovered = new Set(coveredFunctions);
+            }
+
+            clearVisualization() {
+                // Clear 3D nodes and edges
+                this.nodes3D.forEach((mesh) => {
+                    this.scene.remove(mesh);
+                });
+                this.nodes3D.clear();
+
+                this.edges3D.forEach((line) => {
+                    this.scene.remove(line);
+                });
+                this.edges3D = [];
+
+                // Clear data particles
+                this.dataParticles.forEach((p) => {
+                    if (p.mesh) this.scene.remove(p.mesh);
+                });
+                this.dataParticles = [];
+
+                // Clear branch markers
+                this.branchMarkers.forEach((m) => this.scene.remove(m));
+                this.branchMarkers = [];
+
+                this.needsRender = true;
+            }
+
+            createVisualization() {
+                if (!this.data || !this.scene) return;
+
+                // Clear existing 3D objects
+                this.clearScene3D();
+
+                const functions = this.data.functions || {};
+                const callGraph = this.data.call_graph || {};
+                const dataFlows = this.data.data_flows || [];
+
+                // Calculate 3D positions
+                const positions = this.calculateLayout3D(functions, callGraph);
+
+                // Create 3D edges first
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    const callerPos = positions[caller];
+                    if (!callerPos) return;
+
+                    callees.forEach(callee => {
+                        const calleePos = positions[callee];
+                        if (!calleePos) return;
+
+                        this.createEdge3D(caller, callee, callerPos, calleePos);
+                    });
+                });
+
+                // Create 3D nodes
+                Object.entries(functions).forEach(([name, info]) => {
+                    const pos = positions[name];
+                    if (!pos) return;
+
+                    this.createNode3D(name, info, pos);
+                });
+
+                // Calculate importance scores
+                this.calculateAllImportanceScores();
+
+                // Center camera
+                this.centerCamera3D();
+
+                // Setup data flow animations (footballs)
+                this.setupDataFlowAnimations3D(dataFlows, callGraph, positions);
+
+                this.needsRender = true;
+            }
+
+            clearScene3D() {
+                this.nodes3D.forEach((mesh) => this.scene.remove(mesh));
+                this.nodes3D.clear();
+
+                this.edges3D.forEach((line) => this.scene.remove(line));
+                this.edges3D = [];
+
+                this.dataParticles.forEach((p) => this.scene.remove(p.mesh));
+                this.dataParticles = [];
+            }
+
+            calculateLayout3D(functions, callGraph) {
+                const positions = {};
+                const funcNames = Object.keys(functions);
+
+                // Group by class
+                const classes = {};
+                const standalone = [];
+
+                funcNames.forEach(name => {
+                    const dotIndex = name.lastIndexOf('.');
+                    if (dotIndex > 0) {
+                        const className = name.substring(0, dotIndex);
+                        if (!classes[className]) classes[className] = [];
+                        classes[className].push(name);
+                    } else {
+                        standalone.push(name);
+                    }
+                });
+
+                // Layout in 3D space (like players on a field)
+                let xOffset = -20;
+                const classSpacing = 12;
+                const methodSpacing = 5;
+
+                Object.entries(classes).forEach(([className, methods]) => {
+                    methods.forEach((method, i) => {
+                        positions[method] = {
+                            x: xOffset + (i % 2) * 5,
+                            y: 0,
+                            z: -10 + Math.floor(i / 2) * methodSpacing
+                        };
+                    });
+                    xOffset += classSpacing;
+                });
+
+                // Layout standalone functions
+                standalone.forEach((name, i) => {
+                    positions[name] = {
+                        x: xOffset + (i % 3) * 6,
+                        y: 0,
+                        z: -10 + Math.floor(i / 3) * methodSpacing
+                    };
+                });
+
+                return positions;
+            }
+
+            createNode3D(name, info, pos) {
+                // Create a group for the node
+                const group = new THREE.Group();
+                group.userData.name = name;
+                group.userData.info = info;
+
+                // Determine node color based on coverage and importance
+                const isAlive = this.data.covered_functions?.includes(name);
+                const isDead = this.data.dead_functions?.includes(name);
+                const importance = this.importanceScores.get(name) || 0.5;
+
+                let color;
+                if (isDead) {
+                    color = 0xf87171;  // Red
+                } else if (isAlive) {
+                    color = importance > 0.7 ? 0xfbbf24 : 0x4ade80;  // Yellow for high importance, green for alive
+                } else {
+                    color = 0x888888;  // Gray
+                }
+
+                // Create box geometry for the node (like a player marker)
+                const geometry = new THREE.BoxGeometry(2, 1.5, 1);
+                const material = new THREE.MeshPhongMaterial({
+                    color: color,
+                    emissive: 0x000000,
+                    shininess: 30
+                });
+                const mesh = new THREE.Mesh(geometry, material);
+                group.add(mesh);
+
+                // Add label using sprite
+                const canvas = document.createElement('canvas');
+                const context = canvas.getContext('2d');
+                canvas.width = 256;
+                canvas.height = 64;
+
+                context.fillStyle = 'rgba(0,0,0,0)';
+                context.fillRect(0, 0, 256, 64);
+                context.fillStyle = '#ffffff';
+                context.font = 'bold 20px sans-serif';
+                context.textAlign = 'center';
+                context.textBaseline = 'middle';
+                // Show method name for Class.method patterns
+                let displayName = name;
+                const dotIndex = name.lastIndexOf('.');
+                if (dotIndex > 0) {
+                    displayName = name.substring(dotIndex + 1);
+                }
+                if (displayName.length > 15) {
+                    displayName = displayName.slice(0, 12) + '...';
+                }
+                context.fillText(displayName, 128, 32);
+
+                const texture = new THREE.CanvasTexture(canvas);
+                const spriteMaterial = new THREE.SpriteMaterial({ map: texture, transparent: true });
+                const sprite = new THREE.Sprite(spriteMaterial);
+                sprite.position.set(0, 1.5, 0);
+                sprite.scale.set(4, 1, 1);
+                group.add(sprite);
+
+                // Add importance indicator (small sphere on top)
+                if (importance > 0.7) {
+                    const indicatorGeom = new THREE.SphereGeometry(0.2, 16, 16);
+                    const indicatorMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
+                    const indicator = new THREE.Mesh(indicatorGeom, indicatorMat);
+                    indicator.position.set(1, 0.9, 0);
+                    group.add(indicator);
+                }
+
+                group.position.set(pos.x, pos.y, pos.z);
+                this.scene.add(group);
+                this.nodes3D.set(name, group);
+            }
+
+            createEdge3D(from, to, fromPos, toPos) {
+                // Create curved line between nodes
+                const curve = new THREE.QuadraticBezierCurve3(
+                    new THREE.Vector3(fromPos.x, fromPos.y + 0.8, fromPos.z),
+                    new THREE.Vector3((fromPos.x + toPos.x) / 2, 3, (fromPos.z + toPos.z) / 2),
+                    new THREE.Vector3(toPos.x, toPos.y + 0.8, toPos.z)
+                );
+
+                const points = curve.getPoints(20);
+                const geometry = new THREE.BufferGeometry().setFromPoints(points);
+                const material = new THREE.LineBasicMaterial({
+                    color: 0x4a4a6a,
+                    transparent: true,
+                    opacity: 0.6
+                });
+
+                const line = new THREE.Line(geometry, material);
+                line.userData = { from, to, curve };
+                this.scene.add(line);
+                this.edges3D.push(line);
+            }
+
+            centerCamera3D() {
+                if (this.nodes3D.size === 0) return;
+
+                let minX = Infinity, maxX = -Infinity;
+                let minZ = Infinity, maxZ = -Infinity;
+
+                this.nodes3D.forEach(node => {
+                    minX = Math.min(minX, node.position.x);
+                    maxX = Math.max(maxX, node.position.x);
+                    minZ = Math.min(minZ, node.position.z);
+                    maxZ = Math.max(maxZ, node.position.z);
+                });
+
+                const centerX = (minX + maxX) / 2;
+                const centerZ = (minZ + maxZ) / 2;
+                const size = Math.max(maxX - minX, maxZ - minZ);
+
+                this.camera.position.set(centerX, 15 + size * 0.3, centerZ + size * 0.8);
+                this.controls.target.set(centerX, 0, centerZ);
+                this.controls.update();
+            }
+
+            setupDataFlowAnimations3D(dataFlows, callGraph, positions) {
+                // Create football particles that flow along edges
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    const callerPos = positions[caller];
+                    if (!callerPos) return;
+
+                    callees.forEach(callee => {
+                        const calleePos = positions[callee];
+                        if (!calleePos) return;
+
+                        // Create data particle (football)
+                        const particle = this.createDataParticle3D(callerPos, calleePos, caller, callee);
+                        this.dataParticles.push(particle);
+                    });
+                });
+            }
+
+            createDataParticle3D(fromPos, toPos, from, to) {
+                // Create a small sphere that looks like data being passed
+                const geometry = new THREE.SphereGeometry(0.15, 16, 16);
+                const dataType = this.classifyDataType(this.data?.functions?.[from] || {});
+                const color = this.getDataTypeColor3D(dataType);
+
+                const material = new THREE.MeshBasicMaterial({
+                    color: color,
+                    transparent: true,
+                    opacity: 0.9
+                });
+
+                const mesh = new THREE.Mesh(geometry, material);
+
+                // Create curve for animation path
+                const curve = new THREE.QuadraticBezierCurve3(
+                    new THREE.Vector3(fromPos.x, fromPos.y + 0.8, fromPos.z),
+                    new THREE.Vector3((fromPos.x + toPos.x) / 2, 4, (fromPos.z + toPos.z) / 2),
+                    new THREE.Vector3(toPos.x, toPos.y + 0.8, toPos.z)
+                );
+
+                mesh.position.copy(curve.getPoint(0));
+                this.scene.add(mesh);
+
+                return {
+                    mesh,
+                    curve,
+                    progress: Math.random(),  // Random start position
+                    speed: 0.002 + Math.random() * 0.003,  // Random speed
+                    from,
+                    to,
+                    active: true
+                };
+            }
+
+            getDataTypeColor3D(dataType) {
+                switch (dataType) {
+                    case 'tensor': return 0xa78bfa;  // Purple
+                    case 'message': return 0x60a5fa;  // Blue
+                    case 'class': return 0x4ade80;   // Green
+                    default: return 0xfbbf24;        // Yellow (primitive)
+                }
+            }
+
+            updateDataParticles() {
+                this.dataParticles.forEach(particle => {
+                    if (!particle.active) return;
+
+                    particle.progress += particle.speed;
+                    if (particle.progress >= 1) {
+                        particle.progress = 0;
+                    }
+
+                    const point = particle.curve.getPoint(particle.progress);
+                    particle.mesh.position.copy(point);
+
+                    // Follow mode - camera follows the particle
+                    if (this.cameraMode === 'follow' && this.followingParticle === particle) {
+                        this.camera.position.set(point.x + 5, point.y + 8, point.z + 10);
+                        this.controls.target.copy(point);
+                    }
+                });
+
+                this.needsRender = true;
+            }
+
+            // Note: SVG methods removed - now using Three.js 3D exclusively
+
+            classifyDataType(info) {
+                if (!info) return null;
+
+                const typeStr = String(info.return_type || info.type || '').toLowerCase();
+
+                for (const [type, patterns] of Object.entries(this.dataTypes)) {
+                    if (patterns.some(p => typeStr.includes(p.toLowerCase()))) {
+                        return type;
+                    }
+                }
+
+                return 'primitive';
+            }
+
+            getDataTypeColor(type) {
+                const colors = {
+                    tensor: '#a78bfa',
+                    message: '#60a5fa',
+                    class: '#4ade80',
+                    primitive: '#fbbf24'
+                };
+                return colors[type] || '#888888';
+            }
+
+            classifyDataSource(name, info) {
+                const nameStr = name.toLowerCase();
+                const infoStr = JSON.stringify(info || {}).toLowerCase();
+
+                for (const [source, patterns] of Object.entries(this.sourcePatterns)) {
+                    if (patterns.some(p => nameStr.includes(p) || infoStr.includes(p))) {
+                        return source;
+                    }
+                }
+
+                return null;
+            }
+
+            // Legacy SVG selectNode - renamed to avoid conflict with 3D version
+            selectNodeSVG(name, info, pos) {
+                this.selectedNode = { name, info, pos };
+
+                // Update details panel
+                const header = document.getElementById('details-header');
+                if (header) {
+                    header.innerHTML = `
+                        <h3>${name}</h3>
+                        <div class="subtitle">${info?.file || 'Unknown file'}:${info?.line || '?'}</div>
+                    `;
+                }
+
+                const content = document.getElementById('details-content');
+                if (content) {
+                    content.innerHTML = this.generateDetailsHTML(name, info || {});
+                }
+
+                // Highlight node (SVG version)
+                document.querySelectorAll('.flow-node').forEach(n => {
+                    const bg = n.querySelector('.node-bg');
+                    if (bg) bg.setAttribute('stroke-width', n.dataset.name === name ? 3 : 2);
+                });
+            }
+
+            generateDetailsHTML(name, info) {
+                const dataType = this.classifyDataType(info);
+                const dataSource = this.classifyDataSource(name, info);
+
+                let html = '';
+
+                // Data type badge
+                html += `
+                    <div class="detail-section">
+                        <h4>Data Classification</h4>
+                        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                            <span class="data-badge ${dataType}">${dataType || 'unknown'}</span>
+                            ${dataSource ? `<span class="data-badge" style="background: rgba(255,255,255,0.1);">${dataSource}</span>` : ''}
+                        </div>
+                    </div>
+                `;
+
+                // Parameters
+                if (info.params && info.params.length > 0) {
+                    html += `
+                        <div class="detail-section">
+                            <h4>Input Parameters</h4>
+                            <div class="param-list">
+                                ${info.params.map(p => `
+                                    <div class="param-item">
+                                        <span class="param-name">${p.name}</span>
+                                        <span class="param-value">${p.type || 'any'}</span>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                }
+
+                // Transformation card
+                html += `
+                    <div class="detail-section">
+                        <h4>Data Transformation</h4>
+                        <div class="transform-card">
+                            <div class="transform-header">
+                                <span class="transform-name">${name.split('.').pop()}</span>
+                                <span class="transform-time">${info.avg_duration_ms ? info.avg_duration_ms.toFixed(2) + 'ms' : 'N/A'}</span>
+                            </div>
+                            <div class="transform-io">
+                                <div class="transform-input">
+                                    <div class="io-label">INPUT</div>
+                                    <div>${info.input_sample || 'No sample'}</div>
+                                </div>
+                                <div class="transform-output">
+                                    <div class="io-label">OUTPUT</div>
+                                    <div>${info.output_sample || 'No sample'}</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+
+                // Temporal comparison
+                html += `
+                    <div class="detail-section">
+                        <h4>Temporal Analysis (Reality Grounding)</h4>
+                        <div class="temporal-compare">
+                            <div class="temporal-box t0">
+                                <div class="temporal-label">Input @ t</div>
+                                <div class="temporal-value">${info.input_t || 'N/A'}</div>
+                            </div>
+                            <div class="temporal-box t1">
+                                <div class="temporal-label">Input @ t+1</div>
+                                <div class="temporal-value">${info.input_t1 || 'N/A'}</div>
+                            </div>
+                        </div>
+                        ${info.temporal_diff ? `<div class="temporal-diff">Δ: ${info.temporal_diff}</div>` : ''}
+                    </div>
+                `;
+
+                // Rationale
+                if (info.rationale) {
+                    html += `
+                        <div class="rationale-card">
+                            <h4>💡 AI Rationale</h4>
+                            <div class="rationale-text">${info.rationale}</div>
+                        </div>
+                    `;
+                }
+
+                // Why not called
+                if (info.expected_but_not_called) {
+                    html += `
+                        <div id="why-not-called">
+                            <h4>⚠️ Expected Calls Not Made</h4>
+                            ${info.expected_but_not_called.map(call => `
+                                <div class="missing-call">
+                                    <div class="expected">${call.function}</div>
+                                    <div class="reason">${call.reason}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    `;
+                }
+
+                return html;
+            }
+
+            filterBySource(source) {
+                // Highlight nodes matching the data source
+                document.querySelectorAll('.flow-node').forEach(node => {
+                    const name = node.dataset.name;
+                    const info = this.data?.functions?.[name];
+                    const nodeSource = this.classifyDataSource(name, info);
+
+                    const opacity = !source || nodeSource === source ? 1 : 0.3;
+                    node.style.opacity = opacity;
+                });
+            }
+
+            updateLearningPaths() {
+                const container = document.getElementById('learning-paths');
+                if (!this.data) {
+                    container.innerHTML = '<div style="color: #888; font-size: 10px;">No paths detected</div>';
+                    return;
+                }
+
+                // Group by data source and trace path
+                const paths = this.traceLearningPaths();
+
+                container.innerHTML = paths.map((path, i) => `
+                    <div class="source-item" style="border-left-color: ${this.getDataTypeColor(path.type)};" onclick="watchArch.highlightPath(${i})">
+                        <span class="source-icon">${path.icon}</span>
+                        <div class="source-info">
+                            <div class="source-name">${path.name}</div>
+                            <div class="source-status">${path.steps} steps</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            traceLearningPaths() {
+                // Trace from input sources to outputs
+                const paths = [];
+
+                // Find entry points (functions with data source classifications)
+                const functions = this.data?.functions || {};
+                const callGraph = this.data?.call_graph || {};
+
+                Object.entries(functions).forEach(([name, info]) => {
+                    const source = this.classifyDataSource(name, info);
+                    if (source) {
+                        const path = this.traceDownstream(name, callGraph, new Set());
+                        paths.push({
+                            name: name.split('.').pop(),
+                            type: source,
+                            icon: { video: '📹', api: '🌐', screen: '🖥️', audio: '🎤' }[source] || '📊',
+                            steps: path.length,
+                            path: path
+                        });
+                    }
+                });
+
+                return paths;
+            }
+
+            traceDownstream(name, callGraph, visited) {
+                if (visited.has(name)) return [];
+                visited.add(name);
+
+                const path = [name];
+                const callees = callGraph[name] || [];
+
+                callees.forEach(callee => {
+                    path.push(...this.traceDownstream(callee, callGraph, visited));
+                });
+
+                return path;
+            }
+
+            highlightPath(pathIndex) {
+                const paths = this.traceLearningPaths();
+                const path = paths[pathIndex];
+                if (!path) return;
+
+                // Reset all nodes
+                document.querySelectorAll('.flow-node').forEach(node => {
+                    node.style.opacity = 0.3;
+                });
+
+                // Highlight path nodes
+                path.path.forEach(name => {
+                    const node = document.querySelector(`.flow-node[data-name="${name}"]`);
+                    if (node) node.style.opacity = 1;
+                });
+
+                // Animate data flow along path
+                for (let i = 0; i < path.path.length - 1; i++) {
+                    setTimeout(() => {
+                        this.animateDataFlow({
+                            from: path.path[i],
+                            to: path.path[i + 1],
+                            type: path.type
+                        });
+                    }, i * 300);
+                }
+            }
+
+            // Recording functionality with duration tracking
+            startRecording() {
+                this.recording = true;
+                this.recordedEvents = [];
+                this.recordStartTime = Date.now();
+                this.recordDurationMs = 0;
+
+                document.getElementById('record-btn').classList.add('recording');
+                document.getElementById('record-btn').innerHTML = '<span>⏹</span> Stop';
+
+                // Show and start duration display
+                document.getElementById('recording-duration').style.display = 'flex';
+                this.updateDurationDisplay();
+
+                this.durationTimer = setInterval(() => {
+                    this.recordDurationMs = Date.now() - this.recordStartTime;
+                    this.updateDurationDisplay();
+                }, 100);
+            }
+
+            stopRecording() {
+                this.recording = false;
+                this.recordDurationMs = Date.now() - this.recordStartTime;
+
+                document.getElementById('record-btn').classList.remove('recording');
+                document.getElementById('record-btn').innerHTML = '<span>⏺</span> Record';
+
+                // Stop duration timer but keep display visible
+                if (this.durationTimer) {
+                    clearInterval(this.durationTimer);
+                    this.durationTimer = null;
+                }
+
+                // Update final display
+                this.updateDurationDisplay();
+            }
+
+            updateDurationDisplay() {
+                const totalSeconds = Math.floor(this.recordDurationMs / 1000);
+                const hours = Math.floor(totalSeconds / 3600);
+                const minutes = Math.floor((totalSeconds % 3600) / 60);
+                const seconds = totalSeconds % 60;
+                const display = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+                document.getElementById('duration-display').textContent = display;
+            }
+
+            getRecordingDurationFormatted() {
+                const totalSeconds = Math.floor(this.recordDurationMs / 1000);
+                const hours = Math.floor(totalSeconds / 3600);
+                const minutes = Math.floor((totalSeconds % 3600) / 60);
+                const seconds = totalSeconds % 60;
+
+                if (hours > 0) {
+                    return `${hours}h ${minutes}m ${seconds}s`;
+                } else if (minutes > 0) {
+                    return `${minutes}m ${seconds}s`;
+                }
+                return `${seconds}s`;
+            }
+
+            recordEvent(event) {
+                if (!this.recording) return;
+
+                this.recordedEvents.push({
+                    timestamp: Date.now() - this.recordStartTime,
+                    ...event
+                });
+
+                document.getElementById('event-count').textContent = `${this.recordedEvents.length} events`;
+            }
+
+            // NOTE: Playback methods moved to enhanced version below (startPlayback, stopPlayback, playbackLoop)
+
+            formatTime(ms) {
+                const seconds = Math.floor(ms / 1000);
+                const millis = ms % 1000;
+                const minutes = Math.floor(seconds / 60);
+                const secs = seconds % 60;
+                return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(millis).padStart(3, '0')}`;
+            }
+
+            replayEventsAt(time) {
+                // Find and visualize events at this time
+                const eventsAtTime = this.recordedEvents.filter(e =>
+                    Math.abs(e.timestamp - time) < 50
+                );
+
+                eventsAtTime.forEach(event => {
+                    if (event.type === 'call') {
+                        this.highlightNode(event.function, true);
+                    } else if (event.type === 'return') {
+                        this.highlightNode(event.function, false);
+                    }
+                });
+            }
+
+            highlightNode(name, active) {
+                const node = document.querySelector(`.flow-node[data-name="${name}"]`);
+                if (node) {
+                    const bg = node.querySelector('.node-bg');
+                    if (active) {
+                        bg.setAttribute('filter', 'url(#glow)');
+                    } else {
+                        bg.removeAttribute('filter');
+                    }
+                }
+            }
+
+            // ============================================================
+            // SOURCE FILTERING - Show/hide nodes by data source type
+            // ============================================================
+            toggleSourceFilter(source) {
+                if (source === 'all') {
+                    // Toggle all filters
+                    const newState = !this.sourceFilters.all;
+                    this.sourceFilters = {
+                        all: newState,
+                        video: newState,
+                        api: newState,
+                        screen: newState,
+                        audio: newState
+                    };
+                } else {
+                    this.sourceFilters[source] = !this.sourceFilters[source];
+                    // Update 'all' based on individual states
+                    this.sourceFilters.all = ['video', 'api', 'screen', 'audio']
+                        .every(s => this.sourceFilters[s]);
+                }
+
+                // Update node visibility in 3D
+                this.updateNodeVisibilityBySource();
+            }
+
+            updateNodeVisibilityBySource() {
+                this.nodes3D.forEach((mesh, name) => {
+                    const source = this.classifyDataSource(name, '', this.data?.functions?.[name] || {});
+                    const visible = this.sourceFilters.all ||
+                        (source && this.sourceFilters[source]) ||
+                        (!source && this.sourceFilters.all);
+
+                    mesh.visible = visible;
+
+                    // Also update associated edges
+                    this.edges3D.forEach(edge => {
+                        if (edge.userData.from === name || edge.userData.to === name) {
+                            edge.visible = visible;
+                        }
+                    });
+                });
+                this.needsRender = true;
+            }
+
+            // ============================================================
+            // BRANCH MARKERS - Show branches NOT taken
+            // ============================================================
+            updateBranchMarkers() {
+                // Clear existing branch markers
+                this.branchMarkers.forEach(marker => this.scene.remove(marker));
+                this.branchMarkers = [];
+
+                if (!this.showBranchesNotTaken) return;
+
+                // Find dead functions (branches not taken)
+                const deadFunctions = this.data?.dead_functions || [];
+                const functions = this.data?.functions || {};
+
+                deadFunctions.forEach(funcName => {
+                    const mesh = this.nodes3D.get(funcName);
+                    if (!mesh) return;
+
+                    // Create a red X marker above the node
+                    const markerGeometry = new THREE.RingGeometry(0.3, 0.4, 4);
+                    const markerMaterial = new THREE.MeshBasicMaterial({
+                        color: 0xef4444,
+                        side: THREE.DoubleSide
+                    });
+                    const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+                    marker.position.copy(mesh.position);
+                    marker.position.y += 2;
+                    marker.rotation.z = Math.PI / 4;
+                    this.scene.add(marker);
+                    this.branchMarkers.push(marker);
+
+                    // Add pulsing animation
+                    const originalY = marker.position.y;
+                    const animateMarker = () => {
+                        if (!this.showBranchesNotTaken) return;
+                        marker.position.y = originalY + Math.sin(Date.now() * 0.003) * 0.2;
+                        marker.rotation.z += 0.01;
+                        this.needsRender = true;
+                        requestAnimationFrame(animateMarker);
+                    };
+                    animateMarker();
+
+                    // Also check for expected_but_not_called in function info
+                    const info = functions[funcName];
+                    if (info?.expected_but_not_called) {
+                        info.expected_but_not_called.forEach(expected => {
+                            this.createExpectedBranchMarker(mesh.position, expected);
+                        });
+                    }
+                });
+
+                // Check all functions for expected_but_not_called
+                Object.entries(functions).forEach(([name, info]) => {
+                    if (info?.expected_but_not_called) {
+                        const mesh = this.nodes3D.get(name);
+                        if (mesh) {
+                            info.expected_but_not_called.forEach((expected, i) => {
+                                this.createExpectedBranchMarker(
+                                    mesh.position,
+                                    expected,
+                                    i * 0.5  // Offset for multiple markers
+                                );
+                            });
+                        }
+                    }
+                });
+            }
+
+            createExpectedBranchMarker(position, expected, offset = 0) {
+                // Create dashed line pointing to where the call should have gone
+                const targetFunc = expected.function || expected;
+                const targetMesh = this.nodes3D.get(targetFunc);
+
+                if (targetMesh) {
+                    // Dashed line between nodes
+                    const points = [
+                        new THREE.Vector3(position.x, position.y + 1, position.z),
+                        new THREE.Vector3(targetMesh.position.x, targetMesh.position.y + 1, targetMesh.position.z)
+                    ];
+                    const lineGeometry = new THREE.BufferGeometry().setFromPoints(points);
+                    const lineMaterial = new THREE.LineDashedMaterial({
+                        color: 0xef4444,
+                        dashSize: 0.5,
+                        gapSize: 0.3,
+                        opacity: 0.6,
+                        transparent: true
+                    });
+                    const line = new THREE.Line(lineGeometry, lineMaterial);
+                    line.computeLineDistances();
+                    this.scene.add(line);
+                    this.branchMarkers.push(line);
+                }
+            }
+
+            // ============================================================
+            // PLAYBACK SCRUBBING
+            // ============================================================
+            scrubToPosition(value) {
+                const percent = parseFloat(value) / 100;
+                const totalEvents = this.traceEvents.length;
+                if (totalEvents === 0) return;
+
+                this.currentEventIndex = Math.floor(percent * totalEvents);
+                this.updatePlaybackDisplay();
+                this.visualizeEventAtIndex(this.currentEventIndex);
+            }
+
+            updatePlaybackDisplay() {
+                const current = this.currentEventIndex;
+                const total = this.traceEvents.length;
+
+                // Update event counter
+                const eventIndex = document.getElementById('event-index');
+                const totalEvents = document.getElementById('total-events');
+                if (eventIndex) eventIndex.textContent = current;
+                if (totalEvents) totalEvents.textContent = total;
+
+                // Update timeline scrubber
+                const scrubber = document.getElementById('timeline-scrubber');
+                if (scrubber && total > 0) {
+                    scrubber.value = (current / total) * 100;
+                }
+
+                // Update time display
+                if (this.traceEvents[current]) {
+                    const currentTime = this.traceEvents[current].timestamp || 0;
+                    const totalTime = this.traceEvents[total - 1]?.timestamp || 0;
+                    const formatTime = (ms) => {
+                        const seconds = Math.floor(ms / 1000);
+                        const minutes = Math.floor(seconds / 60);
+                        const secs = seconds % 60;
+                        return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+                    };
+                    const currentTimeEl = document.getElementById('current-time');
+                    const totalTimeEl = document.getElementById('total-time');
+                    if (currentTimeEl) currentTimeEl.textContent = formatTime(currentTime);
+                    if (totalTimeEl) totalTimeEl.textContent = formatTime(totalTime);
+                }
+            }
+
+            visualizeEventAtIndex(index) {
+                if (index < 0 || index >= this.traceEvents.length) return;
+
+                const event = this.traceEvents[index];
+                const funcName = event.function || event.module;
+
+                // Highlight the current node
+                this.highlightNode3D(funcName, true);
+
+                // Auto-camera: focus on action
+                if (this.cameraMode === 'auto' || this.cameraMode === 'follow') {
+                    this.autoCameraFocusOn(funcName, event);
+                }
+            }
+
+            highlightNode3D(name, active) {
+                const mesh = this.nodes3D.get(name);
+                if (!mesh) return;
+
+                if (active) {
+                    // Highlight with glow
+                    if (mesh.children[0] && mesh.children[0].material) {
+                        mesh.children[0].material.emissive = new THREE.Color(0x4ade80);
+                        mesh.children[0].material.emissiveIntensity = 0.5;
+                    }
+                    // Clear previous highlight after delay
+                    setTimeout(() => this.highlightNode3D(name, false), 500);
+                } else {
+                    if (mesh.children[0] && mesh.children[0].material) {
+                        mesh.children[0].material.emissive = new THREE.Color(0x000000);
+                        mesh.children[0].material.emissiveIntensity = 0;
+                    }
+                }
+                this.needsRender = true;
+            }
+
+            // ============================================================
+            // INTELLIGENT AUTO-CAMERA - Football-style viewing
+            // Follows data flow, zooms based on importance & activity
+            // ============================================================
+            autoCameraFocusOn(funcName, event) {
+                const mesh = this.nodes3D.get(funcName);
+                if (!mesh) return;
+
+                const pos = mesh.position.clone();
+                const importance = this.importanceScores.get(funcName) || 0.5;
+                const now = performance.now();
+
+                // Calculate data velocity (how fast data is moving between nodes)
+                if (this.lastDataPosition) {
+                    const distance = pos.distanceTo(this.lastDataPosition);
+                    const timeDelta = now - (this.lastDataTime || now);
+                    this.dataVelocity = timeDelta > 0 ? distance / timeDelta : 0;
+                }
+                this.lastDataPosition = pos.clone();
+                this.lastDataTime = now;
+
+                // AUTO MODE: Intelligent zoom based on multiple factors
+                let targetDistance;
+                let transitionDuration;
+
+                if (this.cameraMode === 'auto') {
+                    // Factor 1: Importance (critical calls get close-up)
+                    // Factor 2: Velocity (fast movement = zoom out to see context)
+                    // Factor 3: Activity burst detection
+
+                    const velocityFactor = Math.min(this.dataVelocity * 50, 1);  // 0-1 scale
+
+                    if (importance > 0.7) {
+                        // Critical call - zoom in tight, slow down
+                        targetDistance = 8 + velocityFactor * 5;
+                        transitionDuration = 800;  // Slower for dramatic effect
+                    } else if (importance > 0.4 || velocityFactor > 0.5) {
+                        // Medium importance or fast movement - balanced view
+                        targetDistance = 15 + velocityFactor * 10;
+                        transitionDuration = 400;
+                    } else {
+                        // Low importance, normal speed - follow smoothly
+                        targetDistance = 20;
+                        transitionDuration = 300;
+                    }
+
+                    // If data is moving very fast, zoom out more to show trajectory
+                    if (velocityFactor > 0.7) {
+                        targetDistance = Math.min(targetDistance + 15, 40);
+                        transitionDuration = 200;  // Quick to keep up
+                    }
+                } else if (this.cameraMode === 'follow') {
+                    // Simple follow mode - consistent distance, just track
+                    targetDistance = 18;
+                    transitionDuration = 300;
+                } else {
+                    // Overview mode - don't move camera
+                    return;
+                }
+
+                // Calculate camera position - follow from behind and above the data flow
+                const cameraOffset = new THREE.Vector3(
+                    targetDistance * 0.2,  // Slightly to the side
+                    targetDistance * 0.6,  // Above
+                    targetDistance         // Behind
+                );
+
+                const targetCameraPos = pos.clone().add(cameraOffset);
+
+                // Smooth transition to new position
+                this.smoothCameraTransition(targetCameraPos, pos, transitionDuration);
+
+                // Update branch indicator for important events
+                const indicator = document.getElementById('branch-indicator');
+                if (indicator && importance > 0.7) {
+                    indicator.style.display = 'block';
+                    indicator.style.background = importance > 0.8 ? '#ef4444' : '#fbbf24';
+                    indicator.style.color = importance > 0.8 ? 'white' : 'black';
+                    indicator.textContent = `Important: ${funcName.split('.').pop()}`;
+                    setTimeout(() => { indicator.style.display = 'none'; }, 2000);
+                }
+            }
+
+            smoothCameraTransition(targetPos, targetLookAt, duration = 500) {
+                const startPos = this.camera.position.clone();
+                const startTarget = this.controls.target.clone();
+                const startTime = performance.now();
+
+                const animate = () => {
+                    const elapsed = performance.now() - startTime;
+                    const progress = Math.min(elapsed / duration, 1);
+                    const eased = this.easeInOutCubic(progress);
+
+                    this.camera.position.lerpVectors(startPos, targetPos, eased);
+                    this.controls.target.lerpVectors(startTarget, targetLookAt, eased);
+                    this.controls.update();
+                    this.needsRender = true;
+
+                    if (progress < 1) {
+                        requestAnimationFrame(animate);
+                    }
+                };
+                animate();
+            }
+
+            // Enhanced playback with intelligent timing
+            startPlayback() {
+                if (this.traceEvents.length === 0) {
+                    // If no trace events, use recorded events as fallback
+                    if (this.recordedEvents && this.recordedEvents.length > 0) {
+                        this.traceEvents = this.recordedEvents;
+                    } else {
+                        console.log('No events to play back');
+                        return;
+                    }
+                }
+
+                this.playing = true;
+                this.playbackStartTime = performance.now();
+                document.getElementById('play-icon').textContent = '⏸';
+                this.playbackLoop();
+            }
+
+            stopPlayback() {
+                this.playing = false;
+                document.getElementById('play-icon').textContent = '▶';
+            }
+
+            playbackLoop() {
+                if (!this.playing) return;
+
+                const event = this.traceEvents[this.currentEventIndex];
+                if (!event) {
+                    this.stopPlayback();
+                    return;
+                }
+
+                // Get importance-adjusted delay
+                const funcName = event.function || event.module;
+                const importance = this.importanceScores.get(funcName) || 0.5;
+                const baseDelay = 100;  // Base delay between events
+                const importanceMultiplier = importance > 0.7 ? 3 : importance > 0.4 ? 1.5 : 1;
+                const delay = (baseDelay * importanceMultiplier) / this.playbackSpeed;
+
+                // Visualize current event
+                this.visualizeEventAtIndex(this.currentEventIndex);
+                this.updatePlaybackDisplay();
+
+                // Move to next event
+                this.currentEventIndex++;
+
+                if (this.currentEventIndex >= this.traceEvents.length) {
+                    this.stopPlayback();
+                    return;
+                }
+
+                setTimeout(() => this.playbackLoop(), delay);
+            }
+
+            // Load trace events from socket (called externally)
+            loadTraceEvents(events) {
+                this.traceEvents = events;
+                document.getElementById('total-events').textContent = events.length;
+                document.getElementById('event-count').textContent = `${events.length} events`;
+                console.log(`Loaded ${events.length} trace events for playback`);
+            }
+
+            animate() {
+                // Don't render if page not visible
+                if (!this.isVisible) return;
+
+                requestAnimationFrame(() => this.animate());
+
+                const now = performance.now();
+                const elapsed = now - this.lastRenderTime;
+
+                // Frame rate limiting
+                if (elapsed < this.minFrameTime && !this.isInteracting) return;
+
+                // Update controls
+                const controlsChanged = this.controls ? this.controls.update() : false;
+
+                // Update data particles (footballs being passed)
+                if (this.dataParticles.length > 0) {
+                    this.updateDataParticles();
+                }
+
+                // Only render if needed
+                if (this.needsRender || controlsChanged || this.isInteracting || this.dataParticles.length > 0) {
+                    if (this.renderer && this.scene && this.camera) {
+                        this.renderer.render(this.scene, this.camera);
+                    }
+                    this.lastRenderTime = now;
+
+                    if (!controlsChanged && !this.isInteracting && this.dataParticles.length === 0) {
+                        this.needsRender = false;
+                    }
+                }
+            }
+
+            // Export functionality with duration and standalone support
+            exportWithRationales(format) {
+                const includeTrace = document.getElementById('export-trace').checked;
+                const includeRationales = document.getElementById('export-rationales').checked;
+                const includeMissing = document.getElementById('export-missing').checked;
+                const includeTemporal = document.getElementById('export-temporal').checked;
+                const includeSources = document.getElementById('export-sources').checked;
+                const includeStandalone = document.getElementById('export-standalone')?.checked ?? true;
+
+                const exportData = {
+                    metadata: {
+                        exported_at: new Date().toISOString(),
+                        total_events: this.recordedEvents.length,
+                        total_functions: Object.keys(this.data?.functions || {}).length,
+                        recording_duration_ms: this.recordDurationMs,
+                        recording_duration_formatted: this.getRecordingDurationFormatted(),
+                        camera_mode: this.cameraMode,
+                        llm_available: !!this.llmEndpoint
+                    },
+                    importance_scores: Object.fromEntries(this.importanceScores)
+                };
+
+                if (includeTrace) {
+                    exportData.execution_trace = this.recordedEvents;
+                    exportData.call_graph = this.data?.call_graph;
+                    exportData.functions = this.data?.functions;
+                }
+
+                if (includeRationales) {
+                    exportData.rationales = this.extractRationales();
+                }
+
+                if (includeMissing) {
+                    exportData.missing_calls = this.analyzeMissingCalls();
+                }
+
+                if (includeTemporal) {
+                    exportData.temporal_analysis = this.extractTemporalData();
+                }
+
+                if (includeSources) {
+                    exportData.data_sources = this.mapDataSources();
+                }
+
+                if (format === 'json') {
+                    this.downloadJSON(exportData);
+                } else if (format === 'standalone') {
+                    this.downloadStandaloneHTML(exportData);
+                } else {
+                    this.downloadHTMLReport(exportData);
+                }
+            }
+
+            extractRationales() {
+                const rationales = [];
+                Object.entries(this.data?.functions || {}).forEach(([name, info]) => {
+                    if (info.rationale) {
+                        rationales.push({
+                            function: name,
+                            rationale: info.rationale,
+                            confidence: info.confidence || null
+                        });
+                    }
+                });
+                return rationales;
+            }
+
+            analyzeMissingCalls() {
+                const missing = [];
+                const called = new Set(this.data?.covered_functions || []);
+                const expected = this.data?.expected_functions || [];
+
+                expected.forEach(func => {
+                    if (!called.has(func.name)) {
+                        missing.push({
+                            function: func.name,
+                            expected_caller: func.expected_caller,
+                            reason: func.reason || 'Branch condition not satisfied',
+                            impact: func.impact || 'Unknown'
+                        });
+                    }
+                });
+
+                return missing;
+            }
+
+            extractTemporalData() {
+                const temporal = [];
+                Object.entries(this.data?.functions || {}).forEach(([name, info]) => {
+                    if (info.input_t !== undefined || info.input_t1 !== undefined) {
+                        temporal.push({
+                            function: name,
+                            input_at_t: info.input_t,
+                            output_at_t: info.output_t,
+                            input_at_t1: info.input_t1,
+                            delta: info.temporal_diff
+                        });
+                    }
+                });
+                return temporal;
+            }
+
+            mapDataSources() {
+                const sources = {
+                    video: [],
+                    api: [],
+                    screen: [],
+                    audio: []
+                };
+
+                Object.entries(this.data?.functions || {}).forEach(([name, info]) => {
+                    const source = this.classifyDataSource(name, info);
+                    if (source && sources[source]) {
+                        sources[source].push({
+                            function: name,
+                            file: info.file,
+                            line: info.line
+                        });
+                    }
+                });
+
+                return sources;
+            }
+
+            downloadJSON(data) {
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `trueflow_export_${new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')}.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+            }
+
+            downloadHTMLReport(data) {
+                const html = this.generateHTMLReport(data);
+                const blob = new Blob([html], { type: 'text/html' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `trueflow_report_${new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')}.html`;
+                a.click();
+                URL.revokeObjectURL(url);
+            }
+
+            downloadStandaloneHTML(data) {
+                const html = this.generateStandaloneHTML(data);
+                const blob = new Blob([html], { type: 'text/html' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `trueflow_standalone_${new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')}.html`;
+                a.click();
+                URL.revokeObjectURL(url);
+            }
+
+            generateStandaloneHTML(data) {
+                // Use external templates to avoid script tag escaping issues
+                if (window.TrueFlowExportTemplates) {
+                    return window.TrueFlowExportTemplates.generateStandaloneHTML(data, this);
+                }
+                // Fallback to simple debug export
+                return this.generateSimpleExport(data);
+            }
+
+            generateSimpleExport(data) {
+                return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>TrueFlow Export</title>
+    <style>
+        body { font-family: system-ui; background: #0a0a1a; color: #e0e0e0; padding: 20px; }
+        pre { background: #1a1a2e; padding: 20px; border-radius: 8px; overflow: auto; }
+    </style>
+</head>
+<body>
+    <h1>TrueFlow Export</h1>
+    <p>Functions: ${Object.keys(data.functions || {}).length}</p>
+    <p>Events: ${(data.recorded_events || []).length}</p>
+    <pre>${JSON.stringify(data, null, 2)}</pre>
+</body>
+</html>`;
+            }
+
+            // NOTE: Old template code moved to export_templates.js
+
+            generateFunctionListHTML(data) {
+                const functions = Object.entries(data.functions || {});
+                const coveredSet = new Set(data.call_graph ? Object.keys(data.call_graph) : []);
+                const importanceScores = data.importance_scores || {};
+
+                return functions
+                    .sort((a, b) => (importanceScores[b[0]] || 0) - (importanceScores[a[0]] || 0))
+                    .map(([name, info]) => {
+                        const importance = importanceScores[name] || 0.5;
+                        const isCovered = coveredSet.has(name);
+                        const importanceClass = importance > 0.7 ? 'high' : importance > 0.4 ? 'medium' : 'low';
+                        return `
+                            <div class="func-item ${isCovered ? 'covered' : 'dead'}" data-func="${name}">
+                                <span>${name.length > 20 ? '...' + name.slice(-18) : name}</span>
+                                <span class="importance-score importance-${importanceClass}">${importance.toFixed(2)}</span>
+                            </div>
+                        `;
+                    }).join('');
+            }
+
+            generateVisualizationSVG(data) {
+                // Generate SVG visualization from data
+                const functions = Object.entries(data.functions || {});
+                const callGraph = data.call_graph || {};
+                const importanceScores = data.importance_scores || {};
+
+                let nodesHTML = '';
+                let edgesHTML = '';
+
+                // Calculate positions
+                const positions = {};
+                let x = 100, y = 100;
+                functions.forEach(([name], i) => {
+                    positions[name] = { x: x + (i % 4) * 200, y: y + Math.floor(i / 4) * 100 };
+                });
+
+                // Generate edges
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    const callerPos = positions[caller];
+                    if (!callerPos) return;
+                    callees.forEach(callee => {
+                        const calleePos = positions[callee];
+                        if (!calleePos) return;
+                        const midX = (callerPos.x + calleePos.x) / 2;
+                        const midY = (callerPos.y + calleePos.y) / 2 - 20;
+                        edgesHTML += `<path d="M ${callerPos.x} ${callerPos.y + 15} Q ${midX} ${midY} ${calleePos.x} ${calleePos.y - 15}" fill="none" stroke="#3a3a5a" stroke-width="2" marker-end="url(#arrow)"/>`;
+                    });
+                });
+
+                // Generate nodes
+                functions.forEach(([name, info]) => {
+                    const pos = positions[name];
+                    if (!pos) return;
+                    const importance = importanceScores[name] || 0.5;
+                    const color = importance > 0.7 ? '#ef4444' : importance > 0.4 ? '#fbbf24' : '#4ade80';
+                    // Show method name for Class.method patterns
+                    let displayName = name;
+                    const dotIdx = name.lastIndexOf('.');
+                    if (dotIdx > 0) {
+                        displayName = name.substring(dotIdx + 1);
+                    }
+                    if (displayName.length > 15) {
+                        displayName = displayName.slice(0, 12) + '...';
+                    }
+                    nodesHTML += `
+                        <g class="flow-node" transform="translate(${pos.x}, ${pos.y})">
+                            <rect class="node-bg" x="-60" y="-18" width="120" height="36" rx="6" fill="#1a1a3a" stroke="${color}" stroke-width="2"/>
+                            <text text-anchor="middle" y="5" fill="#e0e0e0" font-size="10">${displayName}</text>
+                            <text x="50" y="-10" fill="${color}" font-size="8">${importance.toFixed(1)}</text>
+                        </g>
+                    `;
+                });
+
+                return `
+                    <svg viewBox="0 0 1000 600">
+                        <defs>
+                            <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                                <polygon points="0 0, 10 3.5, 0 7" fill="#4a4a6a"/>
+                            </marker>
+                        </defs>
+                        <g id="edges">${edgesHTML}</g>
+                        <g id="nodes">${nodesHTML}</g>
+                    </svg>
+                `;
+            }
+
+            generateTimelineHTML(data) {
+                const events = data.execution_trace || [];
+                if (events.length === 0) return '<div style="padding: 20px; text-align: center; color: #888;">No events recorded</div>';
+
+                const maxTime = events[events.length - 1]?.timestamp || 1;
+                const containerWidth = Math.max(events.length * 30, 1000);
+
+                return events.map((event, i) => {
+                    const left = (event.timestamp / maxTime) * (containerWidth - 50);
+                    const typeClass = event.type || 'call';
+                    const label = event.function?.split('.').pop() || 'event';
+                    return `<div class="timeline-event ${typeClass}" style="left: ${left}px; width: ${Math.max(20, label.length * 5)}px;" data-event='${JSON.stringify(event)}'>${label}</div>`;
+                }).join('');
+            }
+
+            generateDataSourcesHTML(data) {
+                const sources = data.data_sources || {};
+                let html = '';
+                Object.entries(sources).forEach(([type, funcs]) => {
+                    if (funcs.length > 0) {
+                        const icon = { video: '📹', api: '🌐', screen: '🖥️', audio: '🎤' }[type] || '📊';
+                        html += `
+                            <div class="stat-card">
+                                <span class="stat-label">${icon} ${type}</span>
+                                <span class="stat-value">${funcs.length}</span>
+                            </div>
+                        `;
+                    }
+                });
+                return html || '<div style="color: #888; font-size: 11px;">No data sources detected</div>';
+            }
+
+            generateHTMLReport(data) {
+                return `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TrueFlow Architecture Report</title>
+    <style>
+        body { font-family: system-ui; max-width: 1200px; margin: 0 auto; padding: 20px; background: #0a0a1a; color: #e0e0e0; }
+        h1 { color: #7dd3fc; }
+        h2 { color: #a78bfa; border-bottom: 1px solid #2a2a4a; padding-bottom: 10px; }
+        .section { background: #12122a; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .stat { display: inline-block; margin-right: 30px; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #4ade80; }
+        .stat-label { font-size: 12px; color: #888; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #2a2a4a; }
+        th { color: #7dd3fc; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
+        .badge.tensor { background: rgba(139, 92, 246, 0.2); color: #a78bfa; }
+        .badge.message { background: rgba(96, 165, 250, 0.2); color: #60a5fa; }
+        .badge.missing { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+        .rationale { background: rgba(59, 130, 246, 0.1); padding: 10px; border-radius: 4px; margin: 5px 0; border-left: 3px solid #3b82f6; }
+    </style>
+</head>
+<body>
+    <h1>🔍 TrueFlow Architecture Report</h1>
+    <p>Generated: ${data.metadata.exported_at}</p>
+
+    <div class="section">
+        <h2>Summary</h2>
+        <div class="stat">
+            <div class="stat-value">${data.metadata.total_functions}</div>
+            <div class="stat-label">Total Functions</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">${data.metadata.total_events}</div>
+            <div class="stat-label">Recorded Events</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">${data.missing_calls?.length || 0}</div>
+            <div class="stat-label">Missing Calls</div>
+        </div>
+    </div>
+
+    ${data.rationales ? `
+    <div class="section">
+        <h2>💡 AI Rationales</h2>
+        ${data.rationales.map(r => `
+            <div class="rationale">
+                <strong>${r.function}</strong>
+                <p>${r.rationale}</p>
+            </div>
+        `).join('')}
+    </div>
+    ` : ''}
+
+    ${data.missing_calls?.length ? `
+    <div class="section">
+        <h2>⚠️ Missing Calls Analysis</h2>
+        <table>
+            <tr><th>Function</th><th>Expected Caller</th><th>Reason</th></tr>
+            ${data.missing_calls.map(m => `
+                <tr>
+                    <td><span class="badge missing">${m.function}</span></td>
+                    <td>${m.expected_caller || 'N/A'}</td>
+                    <td>${m.reason}</td>
+                </tr>
+            `).join('')}
+        </table>
+    </div>
+    ` : ''}
+
+    ${data.data_sources ? `
+    <div class="section">
+        <h2>📊 Data Sources</h2>
+        <table>
+            <tr><th>Source Type</th><th>Functions</th></tr>
+            ${Object.entries(data.data_sources).map(([source, funcs]) => `
+                <tr>
+                    <td>${source}</td>
+                    <td>${funcs.map(f => f.function).join(', ') || 'None detected'}</td>
+                </tr>
+            `).join('')}
+        </table>
+    </div>
+    ` : ''}
+
+</body>
+</html>
+                `;
+            }
+        }
+
+        console.log('[WatchArch] Class definition completed successfully');
+
+        // Check if Three.js loaded
+        if (typeof THREE === 'undefined') {
+            console.error('[WatchArch] THREE.js failed to load from CDN!');
+            const overlay = document.getElementById('loading-overlay');
+            if (overlay) {
+                overlay.innerHTML = '<div style="color: #ef4444; text-align: center;"><div style="font-size: 24px; margin-bottom: 10px;">⚠️</div><div>Failed to load Three.js</div><div style="font-size: 12px; margin-top: 5px;">Check internet connection</div></div>';
+            }
+        } else {
+            console.log('[WatchArch] Three.js loaded successfully, version:', THREE.REVISION);
+        }
+
+        // Global instance
+        let watchArch;
+        try {
+            watchArch = new WatchArchitecture();
+            console.log('[WatchArch] Instance created successfully');
+        } catch (e) {
+            console.error('[WatchArch] Failed to create instance:', e);
+            const overlay = document.getElementById('loading-overlay');
+            if (overlay) {
+                overlay.innerHTML = '<div style="color: #ef4444; text-align: center;"><div style="font-size: 24px; margin-bottom: 10px;">⚠️</div><div>Initialization failed</div><div style="font-size: 12px; margin-top: 5px;">' + e.message + '</div></div>';
+            }
+        }
+
+        // Global functions for button handlers (with null checks)
+        function toggleRecording() {
+            if (!watchArch) { console.error('watchArch not initialized'); return; }
+            if (watchArch.recording) {
+                watchArch.stopRecording();
+            } else {
+                watchArch.startRecording();
+            }
+        }
+
+        function togglePlayback() {
+            if (!watchArch) { console.error('watchArch not initialized'); return; }
+            if (watchArch.playing) {
+                watchArch.stopPlayback();
+            } else {
+                watchArch.startPlayback();
+            }
+        }
+
+        function stepBack() {
+            if (!watchArch) return;
+            watchArch.currentEventIndex = Math.max(0, watchArch.currentEventIndex - 1);
+            watchArch.updatePlaybackDisplay();
+            watchArch.visualizeEventAtIndex(watchArch.currentEventIndex);
+        }
+
+        function stepForward() {
+            if (!watchArch) return;
+            watchArch.currentEventIndex = Math.min(
+                watchArch.traceEvents.length - 1,
+                watchArch.currentEventIndex + 1
+            );
+            watchArch.updatePlaybackDisplay();
+            watchArch.visualizeEventAtIndex(watchArch.currentEventIndex);
+        }
+
+        function seekTo(value) {
+            if (!watchArch) return;
+            watchArch.scrubToPosition(value);
+        }
+
+        // Load trace events from external code (Kotlin/TypeScript)
+        function loadTraceEvents(events) {
+            if (!watchArch) { console.error('watchArch not initialized'); return; }
+            watchArch.loadTraceEvents(events);
+        }
+
+        function showExportModal() {
+            const modal = document.getElementById('export-modal');
+            if (modal) modal.classList.remove('hidden');
+        }
+
+        function hideExportModal() {
+            const modal = document.getElementById('export-modal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        function exportData(format) {
+            if (!watchArch) { console.error('watchArch not initialized'); return; }
+            watchArch.exportWithRationales(format);
+            hideExportModal();
+        }
+
+        // Camera control
+        function setCamera(mode) {
+            if (!watchArch) return;
+            watchArch.setCameraMode(mode);
+        }
+
+        // Source filter control - show/hide nodes by data source type
+        function toggleSourceFilter(source) {
+            if (!watchArch) return;
+            watchArch.toggleSourceFilter(source);
+
+            // Update button states
+            const btn = document.querySelector(`.source-filter[data-source="${source}"]`);
+            if (btn) {
+                btn.classList.toggle('active');
+            }
+
+            // If 'all' is toggled, sync other buttons
+            if (source === 'all') {
+                const allActive = watchArch.sourceFilters.all;
+                document.querySelectorAll('.source-filter:not([data-source="all"])').forEach(b => {
+                    b.classList.toggle('active', allActive);
+                });
+            } else {
+                // Update 'all' button based on individual states
+                const allFilters = ['video', 'api', 'screen', 'audio'];
+                const allActive = allFilters.every(f => watchArch.sourceFilters[f]);
+                document.querySelector('.source-filter[data-source="all"]')?.classList.toggle('active', allActive);
+            }
+        }
+
+        // Branch display toggle - show branches not taken
+        function toggleBranchDisplay() {
+            if (!watchArch) { console.error('watchArch not initialized'); return; }
+            watchArch.showBranchesNotTaken = !watchArch.showBranchesNotTaken;
+            const btn = document.getElementById('branch-toggle');
+            if (btn) {
+                btn.classList.toggle('active', watchArch.showBranchesNotTaken);
+                btn.style.background = watchArch.showBranchesNotTaken ? 'rgba(239, 68, 68, 0.2)' : '';
+                btn.style.borderColor = watchArch.showBranchesNotTaken ? '#ef4444' : '';
+            }
+
+            // Update visualization to show/hide branch markers
+            watchArch.updateBranchMarkers();
+            watchArch.needsRender = true;
+        }
+
+        // Timeline scrubbing
+        function scrubTimeline(value) {
+            if (!watchArch) { console.error('watchArch not initialized'); return; }
+            watchArch.scrubToPosition(value);
+        }
+
+        // Set playback speed
+        function setPlaybackSpeed(speed) {
+            if (!watchArch) { console.error('watchArch not initialized'); return; }
+            watchArch.playbackSpeed = parseFloat(speed);
+        }
+
+        // Open in external browser for full-screen view
+        function openInBrowser() {
+            if (!watchArch) { console.error('watchArch not initialized'); return; }
+            // Get current HTML and data
+            const data = {
+                functions: watchArch.data?.functions || {},
+                call_graph: watchArch.data?.call_graph || {},
+                covered_functions: watchArch.data?.covered_functions || [],
+                dead_functions: watchArch.data?.dead_functions || [],
+                data_flows: watchArch.data?.data_flows || [],
+                importance_scores: Object.fromEntries(watchArch.importanceScores),
+                recorded_events: watchArch.recordedEvents,
+                recording_duration_ms: watchArch.recordDurationMs
+            };
+
+            // Use external template if available
+            let htmlContent;
+            if (window.TrueFlowExportTemplates) {
+                htmlContent = window.TrueFlowExportTemplates.generateDebugHTML(data, watchArch);
+            } else {
+                // Fallback without script tags
+                htmlContent = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>TrueFlow - Full Screen Visualization</title>
+    <style>
+        body { margin: 0; padding: 20px; background: #0a0a1a; color: #e0e0e0; font-family: system-ui; }
+        h1 { color: #7dd3fc; margin-bottom: 20px; }
+        .info { background: #12122a; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+        .stat { display: inline-block; margin-right: 30px; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #4ade80; }
+        .stat-label { font-size: 12px; color: #888; }
+        pre { background: #1a1a3a; padding: 15px; border-radius: 8px; overflow: auto; max-height: 80vh; }
+    </style>
+</head>
+<body>
+    <h1>TrueFlow Architecture Data</h1>
+    <div class="info">
+        <div class="stat">
+            <div class="stat-value">${Object.keys(data.functions).length}</div>
+            <div class="stat-label">Functions</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">${data.recorded_events?.length || 0}</div>
+            <div class="stat-label">Events</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">${watchArch.getRecordingDurationFormatted()}</div>
+            <div class="stat-label">Duration</div>
+        </div>
+    </div>
+    <pre>${JSON.stringify(data, null, 2)}</pre>
+</body>
+</html>`;
+            }
+
+            // Open in new browser window/tab
+            const blob = new Blob([htmlContent], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+
+            // Try to open in external browser by creating a download link that auto-opens
+            const newWindow = window.open(url, '_blank');
+            if (!newWindow) {
+                // Fallback: offer download
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'trueflow_fullscreen.html';
+                a.click();
+                alert('Popup blocked. Downloaded file instead - open it in your browser.');
+            }
+
+            // Cleanup after a delay
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+        }
+
+        // Load data function (called from Kotlin)
+        function loadWatchData(data) {
+            console.log('[WatchArch] loadWatchData called with', Object.keys(data.functions || {}).length, 'functions');
+            if (window.renderingMonitor) {
+                window.renderingMonitor.log('INFO', 'Loading watch data', { functions: Object.keys(data.functions || {}).length });
+            }
+            if (!watchArch) {
+                console.error('[WatchArch] watchArch not initialized, cannot load data');
+                return;
+            }
+            try {
+                watchArch.loadData(data);
+                console.log('[WatchArch] Data loaded successfully');
+            } catch (e) {
+                console.error('[WatchArch] loadData error:', e);
+                if (window.renderingMonitor) {
+                    window.renderingMonitor.log('ERROR', 'loadData failed', { error: e.message });
+                }
+            }
+        }
+
+        // Demo data for testing
+        const demoData = {
+            functions: {
+                'VideoProcessor.process_frame': { line: 10, params: [{ name: 'frame', type: 'ndarray' }], input_sample: 'Tensor[1080, 1920, 3]', output_sample: 'Tensor[512, 512, 3]', rationale: 'Resizing frame for efficient model inference while preserving aspect ratio' },
+                'VideoProcessor.extract_features': { line: 25, params: [{ name: 'frame', type: 'Tensor' }], return_type: 'Tensor', input_t: '[512,512,3]', input_t1: '[512,512,3]', temporal_diff: 'Δ pixel variance: 0.02' },
+                'ModelInference.predict': { line: 45, params: [{ name: 'features', type: 'Tensor' }], return_type: 'dict', rationale: 'Running inference on extracted features with confidence thresholding' },
+                'APIHandler.send_result': { line: 80, params: [{ name: 'prediction', type: 'dict' }] },
+                'AudioProcessor.process_audio': { line: 100, params: [{ name: 'audio', type: 'ndarray' }], expected_but_not_called: [{ function: 'SpeechRecognizer.transcribe', reason: 'Audio level below threshold' }] },
+                'ScreenCapture.grab_screen': { line: 120, params: [], return_type: 'Image' }
+            },
+            call_graph: {
+                'VideoProcessor.process_frame': ['VideoProcessor.extract_features'],
+                'VideoProcessor.extract_features': ['ModelInference.predict'],
+                'ModelInference.predict': ['APIHandler.send_result'],
+                'AudioProcessor.process_audio': []
+            },
+            covered_functions: ['VideoProcessor.process_frame', 'VideoProcessor.extract_features', 'ModelInference.predict', 'APIHandler.send_result'],
+            dead_functions: ['AudioProcessor.process_audio', 'ScreenCapture.grab_screen'],
+            data_flows: [
+                { from: 'VideoProcessor.process_frame', to: 'VideoProcessor.extract_features', type: 'tensor' },
+                { from: 'VideoProcessor.extract_features', to: 'ModelInference.predict', type: 'tensor' },
+                { from: 'ModelInference.predict', to: 'APIHandler.send_result', type: 'message' }
+            ]
+        };
+
+        // Load demo data after a short delay
+        setTimeout(() => loadWatchData(demoData), 1000);
+
+        // FALLBACK: Force hide loading overlay after 2 seconds no matter what
+        setTimeout(() => {
+            const overlay = document.getElementById('loading-overlay');
+            if (overlay) {
+                console.warn('[WatchArch] Force hiding loading overlay (fallback)');
+                overlay.style.display = 'none';
+                overlay.style.visibility = 'hidden';
+                overlay.style.opacity = '0';
+                overlay.style.pointerEvents = 'none';
+                overlay.classList.add('hidden');
+            }
+        }, 2000);
+
+        // Log any errors that might be causing issues
+        window.onerror = function(msg, url, line, col, error) {
+            console.error('[WatchArch] Global error:', msg, 'at', url, ':', line);
+            if (window.renderingMonitor) {
+                window.renderingMonitor.log('ERROR', 'Global JS error', { msg, line, col });
+            }
+            // Force hide loading on error
+            const overlay = document.getElementById('loading-overlay');
+            if (overlay) overlay.style.display = 'none';
+            return false;
+        };
+    </script>
+</body>
+</html>

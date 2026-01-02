@@ -702,6 +702,99 @@ async function createLaunchConfiguration(workspaceRoot: string, entryPoint: stri
     vscode.window.showInformationMessage('TrueFlow launch configuration created!');
 }
 
+async function openExplorerInExternalBrowser(context: vscode.ExtensionContext, data: any): Promise<void> {
+    try {
+        // Read the interactive_flow_explorer.html template
+        const htmlPath = path.join(context.extensionPath, 'resources', 'interactive_viz', 'interactive_flow_explorer.html');
+        let htmlContent: string;
+
+        if (fs.existsSync(htmlPath)) {
+            htmlContent = fs.readFileSync(htmlPath, 'utf8');
+        } else {
+            // Fallback: generate standalone HTML with embedded data
+            htmlContent = generateStandaloneExplorerHtml(data);
+        }
+
+        // Inject data into the HTML
+        const dataScript = `<script>window.TRUEFLOW_DATA = ${JSON.stringify(data)};</script>`;
+        htmlContent = htmlContent.replace('</head>', `${dataScript}</head>`);
+
+        // Add auto-load script
+        const autoLoadScript = `<script>
+            document.addEventListener('DOMContentLoaded', function() {
+                if (window.TRUEFLOW_DATA && typeof loadVisualizationData === 'function') {
+                    setTimeout(function() { loadVisualizationData(window.TRUEFLOW_DATA); }, 500);
+                }
+            });
+        </script>`;
+        htmlContent = htmlContent.replace('</body>', `${autoLoadScript}</body>`);
+
+        // Write to temp file and open in browser
+        const tempDir = path.join(context.extensionPath, '.temp');
+        if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+        }
+
+        const tempFile = path.join(tempDir, 'interactive_explorer_' + Date.now() + '.html');
+        fs.writeFileSync(tempFile, htmlContent);
+
+        // Open in default browser
+        vscode.env.openExternal(vscode.Uri.file(tempFile));
+        vscode.window.showInformationMessage('Interactive Flow Explorer opened in browser!');
+
+    } catch (error) {
+        vscode.window.showErrorMessage('Failed to open explorer in browser: ' + (error as Error).message);
+    }
+}
+
+function generateStandaloneExplorerHtml(data: any): string {
+    // Generate a standalone HTML with Three.js for the 3D explorer
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrueFlow Interactive Flow Explorer</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: system-ui, sans-serif; background: #0a0a1a; color: #e0e0e0; overflow: hidden; }
+        #container { width: 100vw; height: 100vh; }
+        #info { position: absolute; top: 10px; left: 10px; background: rgba(26,26,46,0.9); padding: 15px; border-radius: 8px; }
+        h1 { color: #7dd3fc; font-size: 18px; margin-bottom: 10px; }
+        .stat { display: inline-block; margin-right: 20px; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #4ade80; }
+        .stat-label { font-size: 11px; color: #888; }
+        .legend { margin-top: 15px; display: flex; gap: 15px; font-size: 11px; }
+        .legend span { display: flex; align-items: center; gap: 5px; }
+        .legend-dot { width: 12px; height: 12px; border-radius: 2px; }
+    </style>
+</head>
+<body>
+    <div id="container"></div>
+    <div id="info">
+        <h1>TrueFlow Interactive Flow Explorer</h1>
+        <div>
+            <span class="stat"><span class="stat-value" id="total-count">${Object.keys(data.functions || {}).length}</span><span class="stat-label"> Functions</span></span>
+            <span class="stat"><span class="stat-value" style="color: #4ade80;" id="covered-count">${(data.covered_functions || []).length}</span><span class="stat-label"> Covered</span></span>
+            <span class="stat"><span class="stat-value" style="color: #ef4444;" id="dead-count">${(data.dead_functions || []).length}</span><span class="stat-label"> Dead</span></span>
+        </div>
+        <div class="legend">
+            <span><span class="legend-dot" style="background: #4ade80;"></span>Executed</span>
+            <span><span class="legend-dot" style="background: #ef4444;"></span>Orphaned</span>
+            <span><span class="legend-dot" style="background: #a78bfa;"></span>Dead Branch</span>
+        </div>
+    </div>
+    <script>
+        const data = ${JSON.stringify(data)};
+        console.log('TrueFlow Explorer Data:', data);
+        // Three.js visualization would be initialized here
+        // For now, show data summary
+    </script>
+</body>
+</html>`;
+}
+
 function showTraceViewer(context: vscode.ExtensionContext, initialTab?: string): void {
     const needsTabSelection = traceViewerPanel && initialTab;
 
@@ -763,6 +856,27 @@ function showTraceViewer(context: vscode.ExtensionContext, initialTab?: string):
                 break;
             case 'info':
                 vscode.window.showInformationMessage(message.message);
+                break;
+            case 'openExplorerInBrowser':
+                // Open interactive flow explorer in external browser
+                openExplorerInExternalBrowser(context, message.data);
+                break;
+            case 'getExplorerHtml':
+                // Load the Three.js interactive flow explorer HTML for iframe embedding
+                try {
+                    const htmlPath = path.join(context.extensionPath, 'resources', 'interactive_viz', 'interactive_flow_explorer.html');
+                    if (fs.existsSync(htmlPath)) {
+                        const htmlContent = fs.readFileSync(htmlPath, 'utf8');
+                        traceViewerPanel?.webview.postMessage({
+                            type: 'explorerHtml',
+                            html: htmlContent
+                        });
+                    } else {
+                        console.error('[TrueFlow] Explorer HTML not found at:', htmlPath);
+                    }
+                } catch (error) {
+                    console.error('[TrueFlow] Failed to load explorer HTML:', error);
+                }
                 break;
         }
     });
@@ -1478,8 +1592,31 @@ function getTraceViewerHtml(initialTab?: string): string {
             border: 1px solid #f87171;
             color: #fca5a5;
         }
+        .explorer-node.dead-orphan {
+            background: #7f1d1d;
+            border: 1px solid #ef4444;
+            color: #fca5a5;
+        }
+        .explorer-node.dead-branch {
+            background: #4c1d95;
+            border: 1px solid #a78bfa;
+            color: #ddd6fe;
+        }
         .explorer-node.selected {
             box-shadow: 0 0 0 2px #7dd3fc;
+        }
+        .explorer-branch-marker {
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            background: #fbbf24;
+            transform: rotate(45deg);
+            z-index: 5;
+            cursor: pointer;
+        }
+        .explorer-branch-marker:hover {
+            background: #fcd34d;
+            box-shadow: 0 0 8px rgba(251, 191, 36, 0.6);
         }
         .explorer-edge {
             position: absolute;
@@ -1881,6 +2018,7 @@ function getTraceViewerHtml(initialTab?: string): string {
         <div class="sub-tab-container">
             <div class="sub-tab active" data-subtab="video-list">Video List</div>
             <div class="sub-tab" data-subtab="interactive-explorer">Interactive Explorer</div>
+            <div class="sub-tab" data-subtab="watch-architecture">📹 Watch Architecture</div>
         </div>
 
         <!-- Video List Sub-tab -->
@@ -1895,30 +2033,189 @@ function getTraceViewerHtml(initialTab?: string): string {
 
         <!-- Interactive Explorer Sub-tab -->
         <div class="sub-content" id="interactive-explorer-subcontent">
-            <div class="explorer-toolbar">
-                <button onclick="refreshInteractiveExplorer()">Refresh Visualization</button>
-                <span class="explorer-stats">
+            <div class="explorer-toolbar" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px; background: var(--vscode-editor-lineHighlightBackground); border-radius: 4px; margin-bottom: 8px;">
+                <button onclick="refreshInteractiveExplorer()" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">Refresh</button>
+                <button onclick="openExplorerInBrowser()" title="Open in external browser with 3D view" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">🌐 Open in Browser</button>
+                <select id="explorer-filter-coverage" onchange="applyExplorerFilters()" style="background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 5px 8px; border-radius: 4px; font-size: 11px;">
+                    <option value="all">All Functions</option>
+                    <option value="covered">Covered Only</option>
+                    <option value="dead">Dead Only</option>
+                    <option value="orphan">Orphaned Only</option>
+                    <option value="branch">Dead Branch Only</option>
+                </select>
+                <input type="text" id="explorer-filter-module" placeholder="Filter by module..." oninput="applyExplorerFilters()" style="background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 5px 8px; border-radius: 4px; font-size: 11px; width: 150px;" />
+                <span class="explorer-stats" style="margin-left: auto; font-size: 11px;">
                     Functions: <span id="explorer-total">0</span> |
                     Covered: <span id="explorer-covered" style="color: #4ade80;">0</span> |
                     Dead: <span id="explorer-dead" style="color: #f87171;">0</span>
                 </span>
             </div>
-            <div id="interactive-explorer-container">
-                <div id="explorer-canvas" style="width: 100%; height: calc(100vh - 250px); background: #1a1a2e; border-radius: 8px; position: relative;">
-                    <div id="explorer-loading" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #888;">
-                        Run your code to generate visualization data
-                    </div>
-                    <canvas id="explorer-3d-canvas" style="width: 100%; height: 100%;"></canvas>
+            <div id="interactive-explorer-container" style="width: 100%; height: calc(100vh - 250px); position: relative;">
+                <div id="explorer-loading" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #888; z-index: 10; pointer-events: none;">
+                    Run your code to generate visualization data
                 </div>
-                <div id="explorer-info-panel" style="display: none; position: absolute; top: 10px; right: 10px; width: 300px; max-height: 400px; background: rgba(26, 26, 46, 0.95); border: 1px solid #4a4a6a; border-radius: 8px; padding: 15px; overflow-y: auto; z-index: 100;">
-                    <h4 id="explorer-info-title" style="color: #7dd3fc; margin-bottom: 10px; font-size: 14px;">Select a node</h4>
-                    <div id="explorer-info-content"></div>
+                <iframe id="explorer-3d-iframe" style="width: 100%; height: 100%; border: none; border-radius: 8px; background: #1a1a2e;"></iframe>
+            </div>
+            <div class="explorer-legend" style="margin-top: 10px; display: flex; gap: 15px; font-size: 11px; color: #888; flex-wrap: wrap;">
+                <span><span style="display: inline-block; width: 12px; height: 12px; background: #4ade80; border-radius: 2px; margin-right: 5px;"></span>Executed</span>
+                <span><span style="display: inline-block; width: 12px; height: 12px; background: #ef4444; border-radius: 2px; margin-right: 5px;"></span>Orphaned (No Callers)</span>
+                <span><span style="display: inline-block; width: 12px; height: 12px; background: #a78bfa; border-radius: 2px; margin-right: 5px;"></span>Dead Branch</span>
+                <span><span style="display: inline-block; width: 12px; height: 12px; background: #fbbf24; transform: rotate(45deg); margin-right: 5px;"></span>Branch Divergence</span>
+            </div>
+        </div>
+
+        <!-- Watch Architecture Sub-tab - Football-style data flow visualization -->
+        <div class="sub-content" id="watch-architecture-subcontent">
+            <!-- Controls Bar -->
+            <div class="watch-controls" style="display: flex; align-items: center; gap: 10px; padding: 10px; background: var(--vscode-editor-lineHighlightBackground); border-radius: 4px; margin-bottom: 10px; flex-wrap: wrap;">
+                <button id="watch-record-btn" onclick="toggleWatchRecording()" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">
+                    ⏺ Record
+                </button>
+                <button onclick="toggleWatchPlayback()" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">
+                    ▶ Play
+                </button>
+                <input type="range" id="watch-timeline" min="0" max="100" value="0" style="width: 150px;">
+                <span id="watch-time-display" style="font-size: 11px; font-family: monospace; color: var(--vscode-descriptionForeground);">00:00.000</span>
+
+                <!-- Camera Controls -->
+                <div style="display: flex; gap: 4px; margin-left: 15px; border-left: 1px solid var(--vscode-panel-border); padding-left: 15px;">
+                    <span style="font-size: 10px; color: var(--vscode-descriptionForeground); margin-right: 5px;">Camera:</span>
+                    <button class="camera-btn active" data-camera="overview" onclick="setWatchCamera('overview')" title="Overview">🎥</button>
+                    <button class="camera-btn" data-camera="flyby" onclick="setWatchCamera('flyby')" title="Fly-by">✈️</button>
+                    <button class="camera-btn" data-camera="tele" onclick="setWatchCamera('tele')" title="Telephoto">🔭</button>
+                    <button class="camera-btn" data-camera="follow" onclick="setWatchCamera('follow')" title="Follow Data">⚽</button>
+                </div>
+
+                <!-- Recording Duration -->
+                <div id="watch-recording-duration" style="display: none; margin-left: auto; background: rgba(239, 68, 68, 0.2); padding: 4px 10px; border-radius: 4px;">
+                    <span style="color: #ef4444; font-size: 11px;">⏱️ <span id="watch-duration">00:00:00</span></span>
+                </div>
+
+                <!-- Export/Open Buttons -->
+                <button onclick="showWatchExportModal()" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; margin-left: 10px;">
+                    📤 Export
+                </button>
+                <button onclick="openWatchInBrowser()" title="Open in external browser" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">
+                    🌐 Open in Browser
+                </button>
+            </div>
+
+            <!-- Main Visualization Container -->
+            <div style="display: flex; gap: 10px; height: calc(100vh - 280px);">
+                <!-- Left Panel - Data Sources -->
+                <div id="watch-sources-panel" style="width: 180px; background: var(--vscode-editor-lineHighlightBackground); border-radius: 8px; padding: 10px; overflow-y: auto;">
+                    <h4 style="font-size: 11px; color: var(--vscode-descriptionForeground); margin-bottom: 10px; text-transform: uppercase;">Data Sources</h4>
+                    <div class="watch-source-item video" onclick="filterWatchBySource('video')" style="padding: 8px; margin-bottom: 6px; background: var(--vscode-input-background); border-radius: 4px; border-left: 3px solid #f472b6; cursor: pointer;">
+                        <span>📹 Video Frame</span>
+                        <div style="font-size: 9px; color: var(--vscode-descriptionForeground);">Camera Feed</div>
+                    </div>
+                    <div class="watch-source-item api" onclick="filterWatchBySource('api')" style="padding: 8px; margin-bottom: 6px; background: var(--vscode-input-background); border-radius: 4px; border-left: 3px solid #60a5fa; cursor: pointer;">
+                        <span>🌐 API Request</span>
+                        <div style="font-size: 9px; color: var(--vscode-descriptionForeground);">REST/WebSocket</div>
+                    </div>
+                    <div class="watch-source-item screen" onclick="filterWatchBySource('screen')" style="padding: 8px; margin-bottom: 6px; background: var(--vscode-input-background); border-radius: 4px; border-left: 3px solid #a78bfa; cursor: pointer;">
+                        <span>🖥️ Screen Data</span>
+                        <div style="font-size: 9px; color: var(--vscode-descriptionForeground);">Display Capture</div>
+                    </div>
+                    <div class="watch-source-item audio" onclick="filterWatchBySource('audio')" style="padding: 8px; margin-bottom: 6px; background: var(--vscode-input-background); border-radius: 4px; border-left: 3px solid #fbbf24; cursor: pointer;">
+                        <span>🎤 Audio Input</span>
+                        <div style="font-size: 9px; color: var(--vscode-descriptionForeground);">Microphone</div>
+                    </div>
+
+                    <h4 style="font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 20px; margin-bottom: 10px; text-transform: uppercase; border-top: 1px solid var(--vscode-panel-border); padding-top: 10px;">Importance</h4>
+                    <div id="watch-importance-list" style="font-size: 10px; color: var(--vscode-descriptionForeground);">
+                        <!-- Populated dynamically with importance scores -->
+                    </div>
+
+                    <div style="margin-top: 15px; padding-top: 10px; border-top: 1px solid var(--vscode-panel-border);">
+                        <div style="font-size: 9px; color: var(--vscode-descriptionForeground); margin-bottom: 5px;">LLM Status:</div>
+                        <div id="watch-llm-status" style="font-size: 10px; color: #888;">Checking...</div>
+                    </div>
+                </div>
+
+                <!-- Center - Main Visualization SVG -->
+                <div id="watch-viz-container" style="flex: 1; background: #0d0d20; border-radius: 8px; position: relative; overflow: hidden;">
+                    <svg id="watch-flow-svg" viewBox="0 0 800 500" style="width: 100%; height: 100%;">
+                        <defs>
+                            <marker id="watch-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                                <polygon points="0 0, 10 3.5, 0 7" fill="#4a4a6a" />
+                            </marker>
+                            <filter id="watch-glow">
+                                <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+                                <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+                            </filter>
+                        </defs>
+                        <g id="watch-grid"></g>
+                        <g id="watch-edges"></g>
+                        <g id="watch-nodes"></g>
+                        <g id="watch-particles"></g>
+                    </svg>
+                    <div id="watch-loading" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #888;">
+                        <div style="font-size: 14px; margin-bottom: 10px;">🔍 Watch Architecture</div>
+                        <div style="font-size: 11px;">Run code to visualize data flow</div>
+                    </div>
+                </div>
+
+                <!-- Right Panel - Details -->
+                <div id="watch-details-panel" style="width: 280px; background: var(--vscode-editor-lineHighlightBackground); border-radius: 8px; padding: 10px; overflow-y: auto;">
+                    <h4 style="font-size: 12px; margin-bottom: 10px;">Select a node</h4>
+                    <div id="watch-details-content" style="font-size: 11px; color: var(--vscode-descriptionForeground);">
+                        Click on any function to see data flow details, importance score, and transformation info.
+                    </div>
                 </div>
             </div>
-            <div class="explorer-legend" style="margin-top: 10px; display: flex; gap: 20px; font-size: 11px; color: #888;">
-                <span><span style="display: inline-block; width: 12px; height: 12px; background: #4ade80; border-radius: 2px; margin-right: 5px;"></span>Executed</span>
-                <span><span style="display: inline-block; width: 12px; height: 12px; background: #f87171; border-radius: 2px; margin-right: 5px;"></span>Not Executed (Dead)</span>
-                <span><span style="display: inline-block; width: 12px; height: 12px; background: #60a5fa; border-radius: 2px; margin-right: 5px;"></span>Branch Point</span>
+
+            <!-- Bottom Timeline -->
+            <div id="watch-timeline-panel" style="height: 80px; background: var(--vscode-editor-lineHighlightBackground); border-radius: 8px; margin-top: 10px; padding: 10px;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                    <span style="font-size: 10px; color: var(--vscode-descriptionForeground); text-transform: uppercase;">Execution Timeline</span>
+                    <span id="watch-event-count" style="font-size: 10px; color: var(--vscode-descriptionForeground);">0 events</span>
+                </div>
+                <div id="watch-timeline-view" style="height: 45px; background: var(--vscode-input-background); border-radius: 4px; position: relative; overflow-x: auto;">
+                    <!-- Timeline events rendered here -->
+                </div>
+            </div>
+
+            <!-- Legend -->
+            <div style="display: flex; gap: 15px; margin-top: 10px; font-size: 10px; color: var(--vscode-descriptionForeground); flex-wrap: wrap;">
+                <span><span style="display: inline-block; width: 10px; height: 10px; background: #a78bfa; border-radius: 2px; margin-right: 4px;"></span>Tensor</span>
+                <span><span style="display: inline-block; width: 10px; height: 10px; background: #60a5fa; border-radius: 2px; margin-right: 4px;"></span>Message</span>
+                <span><span style="display: inline-block; width: 10px; height: 10px; background: #4ade80; border-radius: 2px; margin-right: 4px;"></span>Class</span>
+                <span><span style="display: inline-block; width: 10px; height: 10px; background: #fbbf24; border-radius: 2px; margin-right: 4px;"></span>Primitive</span>
+                <span style="margin-left: auto;"><span style="color: #ef4444;">●</span> High Importance | <span style="color: #fbbf24;">●</span> Medium | <span style="color: #4ade80;">●</span> Low</span>
+            </div>
+        </div>
+
+        <!-- Watch Architecture Export Modal -->
+        <div id="watch-export-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; align-items: center; justify-content: center;">
+            <div style="background: var(--vscode-editor-background); border-radius: 12px; padding: 20px; width: 450px; max-height: 80vh; overflow-y: auto;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                    <h3 style="font-size: 14px;">Export with Rationales</h3>
+                    <button onclick="hideWatchExportModal()" style="background: none; border: none; color: var(--vscode-descriptionForeground); font-size: 18px; cursor: pointer;">&times;</button>
+                </div>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: flex; align-items: center; gap: 8px; padding: 10px; background: var(--vscode-input-background); border-radius: 6px; cursor: pointer; margin-bottom: 6px;">
+                        <input type="checkbox" id="watch-export-trace" checked>
+                        <div><div style="font-size: 12px;">Execution Trace</div><div style="font-size: 10px; color: var(--vscode-descriptionForeground);">Complete call graph with timing</div></div>
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 8px; padding: 10px; background: var(--vscode-input-background); border-radius: 6px; cursor: pointer; margin-bottom: 6px;">
+                        <input type="checkbox" id="watch-export-importance" checked>
+                        <div><div style="font-size: 12px;">Importance Scores</div><div style="font-size: 10px; color: var(--vscode-descriptionForeground);">LLM or fallback importance analysis</div></div>
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 8px; padding: 10px; background: var(--vscode-input-background); border-radius: 6px; cursor: pointer; margin-bottom: 6px;">
+                        <input type="checkbox" id="watch-export-missing" checked>
+                        <div><div style="font-size: 12px;">Missing Calls Analysis</div><div style="font-size: 10px; color: var(--vscode-descriptionForeground);">Expected calls that didn't happen</div></div>
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 8px; padding: 10px; background: var(--vscode-input-background); border-radius: 6px; cursor: pointer; margin-bottom: 6px;">
+                        <input type="checkbox" id="watch-export-standalone" checked>
+                        <div><div style="font-size: 12px;">Standalone HTML</div><div style="font-size: 10px; color: var(--vscode-descriptionForeground);">Self-contained file with embedded data</div></div>
+                    </label>
+                </div>
+                <div style="display: flex; gap: 8px; margin-top: 15px;">
+                    <button onclick="exportWatchData('json')" style="flex: 1; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 8px; border-radius: 4px; cursor: pointer;">JSON</button>
+                    <button onclick="exportWatchData('html')" style="flex: 1; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 8px; border-radius: 4px; cursor: pointer;">HTML Report</button>
+                    <button onclick="exportWatchData('standalone')" style="flex: 1; background: #059669; color: white; border: none; padding: 8px; border-radius: 4px; cursor: pointer;">Standalone</button>
+                </div>
             </div>
         </div>
     </div>
@@ -2014,11 +2311,14 @@ function getTraceViewerHtml(initialTab?: string): string {
             whyNotCovered: {}
         };
         let selectedExplorerNode = null;
+        let explorerDataSignature = '';  // Cache signature to skip recreation
 
         // Registry data for "Why Not Covered" with actual branch conditions
         let functionRegistryData = new Map(); // funcKey -> {file, line}
         let callSitesData = []; // Call sites with branch info
         let functionBranchesData = new Map(); // funcKey -> branches[]
+        let resolvedCallGraphData = {}; // Resolved static call graph for cross-class connections
+        let classAttributesData = {}; // Class attribute types for display
 
         // Build Interactive Explorer data from trace
         function buildExplorerData() {
@@ -2055,6 +2355,59 @@ function getTraceViewerHtml(initialTab?: string): string {
                     }
                 }
             });
+
+            // Merge resolved static call graph for cross-class connections
+            // This adds edges AND ensures all static functions exist as nodes
+            if (resolvedCallGraphData && Object.keys(resolvedCallGraphData).length > 0) {
+                const staticFuncsAdded = new Set();
+
+                Object.entries(resolvedCallGraphData).forEach(([caller, callees]) => {
+                    // Ensure caller exists in functions
+                    if (!functions[caller]) {
+                        functions[caller] = {
+                            name: caller.split('.').pop(),
+                            module: caller.split('.').slice(0, -1).join('.') || '__static__',
+                            line: 0,
+                            file: '',
+                            callCount: 0,
+                            branches: [],
+                            isStatic: true  // Mark as from static analysis
+                        };
+                        staticFuncsAdded.add(caller);
+                    }
+
+                    if (!callGraph[caller]) {
+                        callGraph[caller] = [];
+                    }
+
+                    (callees as string[]).forEach(callee => {
+                        // Ensure callee exists in functions
+                        if (!functions[callee]) {
+                            functions[callee] = {
+                                name: callee.split('.').pop(),
+                                module: callee.split('.').slice(0, -1).join('.') || '__static__',
+                                line: 0,
+                                file: '',
+                                callCount: 0,
+                                branches: [],
+                                isStatic: true
+                            };
+                            staticFuncsAdded.add(callee);
+                        }
+
+                        if (!callGraph[caller].includes(callee)) {
+                            callGraph[caller].push(callee);
+                        }
+                    });
+                });
+
+                console.log('[TrueFlow] Merged resolved call graph:',
+                    Object.keys(callGraph).length, 'callers,',
+                    staticFuncsAdded.size, 'static functions added');
+
+                // Add static functions to allDefinedFunctions for dead code analysis
+                staticFuncsAdded.forEach(func => allDefinedFunctions.add(func));
+            }
 
             // Build reverse call graph (callee -> callers) for root cause tracing
             const reverseCallGraph = {};
@@ -2193,225 +2546,1384 @@ function getTraceViewerHtml(initialTab?: string): string {
             return explorerData;
         }
 
-        // Refresh Interactive Explorer visualization
+        // Debounce timer for explorer rendering
+        let explorerRenderDebounceTimer = null;
+        let explorerRenderPending = false;
+
+        // Refresh Interactive Explorer visualization (debounced)
         function refreshInteractiveExplorer() {
             buildExplorerData();
-            renderExplorerVisualization();
-            updateExplorerStats();
+            scheduleExplorerRender(true);
         }
 
-        // Update stats display
+        // Apply explorer filters and re-render (debounced)
+        function applyExplorerFilters() {
+            scheduleExplorerRender(true);
+        }
+
+        // Schedule a debounced render to avoid blocking UI
+        function scheduleExplorerRender(forceRecreate = false) {
+            if (explorerRenderDebounceTimer) {
+                clearTimeout(explorerRenderDebounceTimer);
+            }
+            explorerRenderPending = true;
+
+            // Show loading state immediately
+            const loading = document.getElementById('explorer-loading');
+            if (loading) {
+                loading.style.display = 'block';
+                loading.textContent = 'Rendering...';
+            }
+
+            // Debounce the actual render
+            explorerRenderDebounceTimer = setTimeout(() => {
+                requestAnimationFrame(() => {
+                    renderExplorerVisualization(forceRecreate);
+                    updateExplorerStats();
+                    explorerRenderPending = false;
+                });
+            }, 100);  // 100ms debounce
+        }
+
+        // Get filtered function names based on current filter settings
+        function getFilteredFunctions() {
+            const coverageFilter = (document.getElementById('explorer-filter-coverage') as HTMLSelectElement)?.value || 'all';
+            const moduleFilter = (document.getElementById('explorer-filter-module') as HTMLInputElement)?.value?.toLowerCase() || '';
+
+            const coveredSet = new Set(explorerData.coveredFunctions);
+            const deadSet = new Set(explorerData.deadFunctions);
+
+            return Object.keys(explorerData.functions).filter(funcName => {
+                // Apply module filter
+                if (moduleFilter && !funcName.toLowerCase().includes(moduleFilter)) {
+                    return false;
+                }
+
+                // Apply coverage filter
+                const isCovered = coveredSet.has(funcName);
+                const isDead = deadSet.has(funcName);
+                const why = explorerData.whyNotCovered[funcName];
+                const isOrphan = isDead && why && why.rootCause === 'NO_CALL_SITES';
+                const isBranch = isDead && why && (why.rootCause === 'BRANCH_NOT_TAKEN' || why.rootCause === 'UNREACHABLE_FROM_ENTRY');
+
+                switch (coverageFilter) {
+                    case 'covered':
+                        return isCovered;
+                    case 'dead':
+                        return isDead;
+                    case 'orphan':
+                        return isOrphan;
+                    case 'branch':
+                        return isBranch;
+                    case 'all':
+                    default:
+                        return true;
+                }
+            });
+        }
+
+        // Update stats display (respects filters)
         function updateExplorerStats() {
-            const total = Object.keys(explorerData.functions).length;
-            const covered = explorerData.coveredFunctions.length;
-            const dead = explorerData.deadFunctions.length;
-            document.getElementById('explorer-total').textContent = total;
-            document.getElementById('explorer-covered').textContent = covered;
-            document.getElementById('explorer-dead').textContent = dead;
+            const filteredFuncs = getFilteredFunctions();
+            const coveredSet = new Set(explorerData.coveredFunctions);
+            const deadSet = new Set(explorerData.deadFunctions);
+
+            const total = filteredFuncs.length;
+            const covered = filteredFuncs.filter(f => coveredSet.has(f)).length;
+            const dead = filteredFuncs.filter(f => deadSet.has(f)).length;
+
+            document.getElementById('explorer-total').textContent = String(total);
+            document.getElementById('explorer-covered').textContent = String(covered);
+            document.getElementById('explorer-dead').textContent = String(dead);
         }
 
-        // Render 2D visualization (simpler than Three.js for webview compatibility)
-        function renderExplorerVisualization() {
-            const canvas = document.getElementById('explorer-canvas');
+        // Three.js iframe state
+        let explorerIframeInitialized = false;
+        let explorerIframeReady = false;
+        let pendingExplorerData = null;
+
+        // Render visualization using Three.js iframe (parity with PyCharm)
+        function renderExplorerVisualization(forceRecreate = false) {
+            const iframe = document.getElementById('explorer-3d-iframe') as HTMLIFrameElement;
             const loading = document.getElementById('explorer-loading');
 
-            // Clear previous nodes
-            canvas.querySelectorAll('.explorer-node, .explorer-edge').forEach(el => el.remove());
+            if (!iframe) {
+                console.error('[Explorer] Iframe not found');
+                return;
+            }
 
-            const functions = explorerData.functions;
-            const funcNames = Object.keys(functions);
+            // Get current filter state
+            const coverageFilter = (document.getElementById('explorer-filter-coverage') as HTMLSelectElement)?.value || 'all';
+            const moduleFilter = (document.getElementById('explorer-filter-module') as HTMLInputElement)?.value || '';
 
-            if (funcNames.length === 0) {
+            // Build data object for Three.js visualization
+            const vizData = {
+                functions: explorerData.functions,
+                call_graph: explorerData.callGraph,
+                resolved_call_graph: resolvedCallGraphData || {},
+                covered_functions: explorerData.coveredFunctions,
+                dead_functions: explorerData.deadFunctions,
+                why_not_covered: explorerData.whyNotCovered
+            };
+
+            const funcCount = Object.keys(vizData.functions).length;
+
+            // Create signature to detect if data changed
+            const newSignature = JSON.stringify({
+                functions: Object.keys(vizData.functions).sort(),
+                callGraph: Object.keys(vizData.call_graph).sort(),
+                covered: vizData.covered_functions.slice().sort(),
+                dead: vizData.dead_functions.slice().sort(),
+                filters: { coverage: coverageFilter, module: moduleFilter }
+            });
+
+            // Skip if data hasn't changed
+            if (!forceRecreate && explorerDataSignature === newSignature && explorerIframeReady) {
+                console.log('[Explorer] Data unchanged, sending filter update only');
+                // Just send filter update
+                iframe.contentWindow?.postMessage({
+                    type: 'applyFilters',
+                    filters: { coverage: coverageFilter, module: moduleFilter }
+                }, '*');
+                loading.style.display = 'none';
+                return;
+            }
+
+            console.log('[Explorer] Updating Three.js visualization with', funcCount, 'functions');
+            explorerDataSignature = newSignature;
+
+            if (funcCount === 0) {
                 loading.style.display = 'block';
-                loading.textContent = 'Run your code to generate visualization data';
+                loading.textContent = coverageFilter === 'all' ? 'Run your code to generate visualization data' : 'No functions match the current filter';
+                loading.style.color = '';
                 return;
             }
 
             loading.style.display = 'none';
 
-            // Layout: hierarchical based on call depth
-            const levels = {};
-            const callGraph = explorerData.callGraph;
-            const allCallees = new Set();
-            Object.values(callGraph).forEach(callees => callees.forEach(c => allCallees.add(c)));
+            // Initialize iframe if not done yet
+            if (!explorerIframeInitialized) {
+                initializeExplorerIframe(iframe, vizData);
+                explorerIframeInitialized = true;
+            } else if (explorerIframeReady) {
+                // Send data to iframe
+                iframe.contentWindow?.postMessage({
+                    type: 'loadData',
+                    data: vizData
+                }, '*');
+            } else {
+                // Iframe not ready yet, store data for later
+                pendingExplorerData = vizData;
+            }
+        }
 
-            // Find roots (functions not called by anyone)
-            const roots = funcNames.filter(f => !allCallees.has(f));
-            const processed = new Set();
-            const queue = roots.map(r => ({ name: r, level: 0 }));
-            roots.forEach(r => { levels[r] = 0; processed.add(r); });
+        // Initialize the Three.js iframe with HTML content
+        function initializeExplorerIframe(iframe: HTMLIFrameElement, initialData: any) {
+            // Request the Three.js HTML content from extension
+            vscode.postMessage({ type: 'getExplorerHtml' });
 
-            while (queue.length > 0) {
-                const { name, level } = queue.shift();
-                const callees = callGraph[name] || [];
-                callees.forEach(callee => {
-                    if (!processed.has(callee)) {
-                        levels[callee] = level + 1;
-                        processed.add(callee);
-                        queue.push({ name: callee, level: level + 1 });
+            // Store initial data to send once iframe is ready
+            pendingExplorerData = initialData;
+
+            // Listen for iframe ready message
+            window.addEventListener('message', function handleIframeReady(event) {
+                if (event.data && event.data.type === 'explorerReady') {
+                    explorerIframeReady = true;
+                    if (pendingExplorerData) {
+                        iframe.contentWindow?.postMessage({
+                            type: 'loadData',
+                            data: pendingExplorerData
+                        }, '*');
+                        pendingExplorerData = null;
                     }
-                });
+                }
+            });
+        }
+
+        // Handle response from extension with HTML content
+        function handleExplorerHtmlResponse(htmlContent: string) {
+            const iframe = document.getElementById('explorer-3d-iframe') as HTMLIFrameElement;
+            if (!iframe) return;
+
+            // Inject ready signal into HTML
+            const readyScript = '<script>window.parent.postMessage({type: "explorerReady"}, "*");</script>';
+            const modifiedHtml = htmlContent.replace('</body>', readyScript + '</body>');
+
+            // Set iframe content via srcdoc
+            iframe.srcdoc = modifiedHtml;
+        }
+
+        // Legacy function stubs for compatibility (2D functions no longer used)
+        function selectExplorerNode(funcName: string) {
+            // Node selection now handled inside iframe
+            console.log('[Explorer] Node selected:', funcName);
+        }
+
+        function showExplorerNodeDetails(funcName: string) {
+            // Details panel now handled inside iframe
+            console.log('[Explorer] Show details for:', funcName);
+        }
+
+        // Note: Legacy 2D helper functions removed - visualization now handled by Three.js iframe
+        // The centerOnExplorerNode function is kept for potential future use but not actively called
+
+        // Center the explorer view on a node with smooth animation (legacy - not used with iframe)
+        function centerOnExplorerNode(node) {
+            const container = document.getElementById('interactive-explorer-container');
+            if (!container || !node) return;
+
+            const canvas = document.getElementById('explorer-canvas');
+            if (!canvas) return;
+
+            // Get node position
+            const nodeLeft = parseInt(node.style.left) || 0;
+            const nodeTop = parseInt(node.style.top) || 0;
+            const nodeWidth = node.offsetWidth || 100;
+            const nodeHeight = node.offsetHeight || 30;
+
+            // Calculate center position
+            const containerWidth = container.clientWidth;
+            const containerHeight = container.clientHeight;
+
+            const targetScrollLeft = nodeLeft - (containerWidth / 2) + (nodeWidth / 2);
+            const targetScrollTop = nodeTop - (containerHeight / 2) + (nodeHeight / 2);
+
+            // Smooth scroll animation
+            const startScrollLeft = container.scrollLeft;
+            const startScrollTop = container.scrollTop;
+            const duration = 300;
+            const startTime = performance.now();
+
+            function animateScroll() {
+                const elapsed = performance.now() - startTime;
+                const progress = Math.min(elapsed / duration, 1);
+                const easeProgress = 1 - Math.pow(1 - progress, 3); // Ease out cubic
+
+                container.scrollLeft = startScrollLeft + (targetScrollLeft - startScrollLeft) * easeProgress;
+                container.scrollTop = startScrollTop + (targetScrollTop - startScrollTop) * easeProgress;
+
+                if (progress < 1) {
+                    requestAnimationFrame(animateScroll);
+                }
             }
 
-            // Assign unprocessed
-            funcNames.forEach(f => { if (!processed.has(f)) levels[f] = 0; });
+            animateScroll();
+        }
 
-            // Group by level
-            const levelGroups = {};
-            Object.entries(levels).forEach(([name, level]) => {
-                if (!levelGroups[level]) levelGroups[level] = [];
-                levelGroups[level].push(name);
+        // Show class details when clicking on a class container
+        function showExplorerClassDetails(className, methods, allDead) {
+            const panel = document.getElementById('explorer-info-panel');
+            const title = document.getElementById('explorer-info-title');
+            const content = document.getElementById('explorer-info-content');
+
+            if (title) title.textContent = className;
+
+            const coveredMethods = methods.filter(m => explorerData.coveredFunctions.includes(m));
+            const deadMethods = methods.filter(m => explorerData.deadFunctions.includes(m));
+
+            let html = '<div style="font-size: 12px; margin-bottom: 8px;">';
+            html += '<div><span style="color: #888; width: 80px; display: inline-block;">Type:</span>';
+            html += '<span style="color: #7dd3fc;">Class</span></div>';
+            html += '<div><span style="color: #888; width: 80px; display: inline-block;">Methods:</span>' + methods.length + '</div>';
+            html += '<div><span style="color: #888; width: 80px; display: inline-block;">Covered:</span>';
+            html += '<span style="color: #4ade80;">' + coveredMethods.length + '</span></div>';
+            html += '<div><span style="color: #888; width: 80px; display: inline-block;">Dead:</span>';
+            html += '<span style="color: #f87171;">' + deadMethods.length + '</span></div>';
+            html += '<div><span style="color: #888; width: 80px; display: inline-block;">Status:</span>';
+            html += '<span style="color: ' + (allDead ? '#f87171' : '#4ade80') + ';">' + (allDead ? 'FULLY DEAD' : 'ACTIVE') + '</span></div>';
+            html += '</div>';
+
+            html += '<div style="margin-top: 12px; padding-top: 8px; border-top: 1px solid #333;">';
+            html += '<div style="color: #888; font-size: 11px; margin-bottom: 6px;">Methods:</div>';
+            html += '<ul style="margin: 0; padding-left: 16px; font-size: 11px;">';
+            methods.forEach(m => {
+                const methodName = m.split('.').pop();
+                const isAlive = explorerData.coveredFunctions.includes(m);
+                const color = isAlive ? '#4ade80' : '#f87171';
+                html += '<li style="color: ' + color + '; margin-bottom: 2px;">' + methodName + '</li>';
             });
+            html += '</ul></div>';
+
+            if (content) content.innerHTML = html;
+            if (panel) panel.style.display = 'block';
+        }
+
+        // ============================================================
+        // WATCH ARCHITECTURE - Football-style data flow visualization
+        // ============================================================
+        let watchData = {
+            functions: {},
+            callGraph: {},
+            coveredFunctions: [],
+            deadFunctions: [],
+            dataFlows: []
+        };
+        let watchDataSignature = '';  // Cache signature to skip recreation
+        let watchRecording = false;
+        let watchPlaying = false;
+        let watchRecordedEvents = [];
+        let watchRecordStartTime = null;
+        let watchRecordDurationMs = 0;
+        let watchDurationTimer = null;
+        let watchCameraMode = 'auto';  // auto (intelligent follow + zoom), follow (just follow), overview (static)
+        let watchLastDataPosition = null;
+        let watchLastDataTime = 0;
+        let watchDataVelocity = 0;
+        let watchImportanceScores = new Map();
+        let watchSelectedNode = null;
+        let watchLlmEndpoint = null;
+
+        // Playback state (viewer mode - not recording)
+        let watchTraceEvents = [];  // All events from socket since start
+        let watchCurrentEventIndex = 0;
+        let watchPlaybackSpeed = 1.0;
+
+        // Source filters (show/hide by type)
+        let watchSourceFilters = {
+            all: true,
+            video: true,
+            api: true,
+            screen: true,
+            audio: true
+        };
+        let watchShowBranchesNotTaken = false;
+
+        // Importance scoring patterns (fallback when no LLM)
+        const watchImportancePatterns = {
+            high: ['api', 'request', 'response', 'model', 'inference', 'predict', 'forward', 'train', 'loss', 'gradient'],
+            medium: ['process', 'encode', 'decode', 'parse', 'convert', 'extract', 'filter', 'validate'],
+            low: ['log', 'debug', 'print', 'helper', 'util', 'init', '__', 'get_', 'set_']
+        };
+
+        // Data type classifiers
+        const watchDataTypes = {
+            tensor: ['ndarray', 'Tensor', 'tensor', 'np.array', 'torch.Tensor'],
+            message: ['Message', 'Request', 'Response', 'Event', 'Packet'],
+            primitive: ['int', 'float', 'str', 'bool', 'list', 'dict']
+        };
+
+        // Source patterns
+        const watchSourcePatterns = {
+            video: ['frame', 'camera', 'video', 'image', 'cv2', 'PIL'],
+            api: ['request', 'response', 'http', 'websocket', 'api', 'fetch'],
+            screen: ['screen', 'display', 'monitor', 'screenshot'],
+            audio: ['audio', 'sound', 'microphone', 'wav', 'speech']
+        };
+
+        function initWatchArchitecture() {
+            // Try to connect to local LLM
+            tryConnectWatchLLM();
+            // Draw grid
+            drawWatchGrid();
+            // Build data from existing trace
+            buildWatchData();
+        }
+
+        async function tryConnectWatchLLM() {
+            const endpoints = [
+                'http://localhost:11434/api/generate',
+                'http://localhost:8080/v1/completions',
+                'http://localhost:1234/v1/completions'
+            ];
+
+            for (const endpoint of endpoints) {
+                try {
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 2000);
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ prompt: 'test', max_tokens: 1 }),
+                        signal: controller.signal
+                    });
+                    clearTimeout(timeoutId);
+                    if (response.ok || response.status === 400) {
+                        watchLlmEndpoint = endpoint;
+                        document.getElementById('watch-llm-status').innerHTML = '<span style="color: #4ade80;">● Connected</span>';
+                        return;
+                    }
+                } catch (e) {
+                    // Try next endpoint
+                }
+            }
+            document.getElementById('watch-llm-status').innerHTML = '<span style="color: #fbbf24;">● Using fallback rules</span>';
+        }
+
+        function drawWatchGrid() {
+            const grid = document.getElementById('watch-grid');
+            if (!grid) return;
+            grid.innerHTML = '';
+
+            for (let x = 0; x <= 800; x += 50) {
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', x);
+                line.setAttribute('y1', 0);
+                line.setAttribute('x2', x);
+                line.setAttribute('y2', 500);
+                line.setAttribute('stroke', '#1a1a3a');
+                line.setAttribute('stroke-width', '1');
+                grid.appendChild(line);
+            }
+            for (let y = 0; y <= 500; y += 50) {
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', 0);
+                line.setAttribute('y1', y);
+                line.setAttribute('x2', 800);
+                line.setAttribute('y2', y);
+                line.setAttribute('stroke', '#1a1a3a');
+                line.setAttribute('stroke-width', '1');
+                grid.appendChild(line);
+            }
+        }
+
+        function buildWatchData() {
+            // Use existing explorer data
+            watchData.functions = explorerData.functions;
+            // Use resolved call graph for complete picture (static analysis), fallback to runtime
+            watchData.callGraph = (resolvedCallGraphData && Object.keys(resolvedCallGraphData).length > 0)
+                ? resolvedCallGraphData
+                : explorerData.callGraph;
+            watchData.runtimeCallGraph = explorerData.callGraph;  // Keep runtime for comparison
+            watchData.coveredFunctions = explorerData.coveredFunctions;
+            watchData.deadFunctions = explorerData.deadFunctions;
+            watchData.whyNotCovered = explorerData.whyNotCovered;
+
+            console.log('[Watch] Built data with', Object.keys(watchData.functions).length, 'functions,',
+                Object.keys(watchData.callGraph).length, 'call graph entries');
+
+            // Calculate importance scores
+            Object.entries(watchData.functions).forEach(([name, info]) => {
+                const importance = calculateWatchImportance(name, info);
+                watchImportanceScores.set(name, importance);
+            });
+
+            // Update visualization
+            renderWatchVisualization();
+            updateWatchImportanceList();
+        }
+
+        function calculateWatchImportance(funcName, info) {
+            const nameLower = funcName.toLowerCase();
+            let importance = 0.5;
+
+            // Check pattern matches
+            for (const pattern of watchImportancePatterns.high) {
+                if (nameLower.includes(pattern)) {
+                    importance = Math.max(importance, 0.8 + Math.random() * 0.2);
+                    break;
+                }
+            }
+            for (const pattern of watchImportancePatterns.medium) {
+                if (nameLower.includes(pattern)) {
+                    importance = Math.max(importance, 0.5 + Math.random() * 0.2);
+                    break;
+                }
+            }
+            for (const pattern of watchImportancePatterns.low) {
+                if (nameLower.includes(pattern)) {
+                    importance = Math.min(importance, 0.2 + Math.random() * 0.1);
+                    break;
+                }
+            }
+
+            // Data type bonus
+            const dataType = classifyWatchDataType(info);
+            if (dataType === 'tensor') importance += 0.3;
+            else if (dataType === 'message') importance += 0.2;
+
+            // Connectivity bonus
+            const callees = (watchData.callGraph[funcName] || []).length;
+            const callers = Object.values(watchData.callGraph).filter(c => c.includes(funcName)).length;
+            importance += Math.min((callees + callers) * 0.05, 0.2);
+
+            return Math.min(Math.max(importance, 0), 1);
+        }
+
+        function classifyWatchDataType(info) {
+            if (!info) return 'primitive';
+            const typeStr = JSON.stringify(info).toLowerCase();
+            for (const [type, patterns] of Object.entries(watchDataTypes)) {
+                if (patterns.some(p => typeStr.includes(p.toLowerCase()))) {
+                    return type;
+                }
+            }
+            return 'primitive';
+        }
+
+        function classifyWatchSource(name, info) {
+            const nameStr = (name + ' ' + JSON.stringify(info || {})).toLowerCase();
+            for (const [source, patterns] of Object.entries(watchSourcePatterns)) {
+                if (patterns.some(p => nameStr.includes(p))) {
+                    return source;
+                }
+            }
+            return null;
+        }
+
+        function renderWatchVisualization(forceRecreate = false) {
+            const nodesGroup = document.getElementById('watch-nodes');
+            const edgesGroup = document.getElementById('watch-edges');
+            if (!nodesGroup || !edgesGroup) return;
+
+            const functions = Object.keys(watchData.functions);
+
+            // Create signature to detect if data changed
+            const newSignature = JSON.stringify({
+                functions: functions.slice().sort(),
+                callGraph: Object.keys(watchData.callGraph).sort(),
+                covered: watchData.coveredFunctions.slice().sort(),
+                dead: watchData.deadFunctions.slice().sort()
+            });
+
+            // Skip recreation if data hasn't changed and we have nodes
+            if (!forceRecreate && watchDataSignature === newSignature && nodesGroup.children.length > 0) {
+                console.log('[Watch] Data unchanged, skipping recreation');
+                document.getElementById('watch-loading').style.display = 'none';
+                return;
+            }
+
+            console.log('[Watch] Creating visualization...');
+            watchDataSignature = newSignature;
+
+            nodesGroup.innerHTML = '';
+            edgesGroup.innerHTML = '';
+
+            if (functions.length === 0) {
+                document.getElementById('watch-loading').style.display = 'block';
+                return;
+            }
+            document.getElementById('watch-loading').style.display = 'none';
 
             // Calculate positions
-            const canvasRect = canvas.getBoundingClientRect();
-            const levelHeight = 80;
-            const nodeWidth = 140;
-            const nodeHeight = 30;
             const positions = {};
-
-            Object.entries(levelGroups).forEach(([level, funcs]) => {
-                const y = 20 + parseInt(level) * levelHeight;
-                const startX = (canvasRect.width - funcs.length * nodeWidth) / 2;
-                funcs.forEach((name, i) => {
-                    positions[name] = { x: startX + i * nodeWidth + 20, y };
-                });
+            functions.forEach((name, i) => {
+                positions[name] = {
+                    x: 100 + (i % 4) * 180,
+                    y: 60 + Math.floor(i / 4) * 90
+                };
             });
 
-            // Draw edges first
-            Object.entries(callGraph).forEach(([caller, callees]) => {
+            // Draw edges
+            Object.entries(watchData.callGraph).forEach(([caller, callees]) => {
                 const callerPos = positions[caller];
                 if (!callerPos) return;
                 callees.forEach(callee => {
                     const calleePos = positions[callee];
                     if (!calleePos) return;
 
-                    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-                    svg.classList.add('explorer-edge');
-                    svg.style.position = 'absolute';
-                    svg.style.left = '0';
-                    svg.style.top = '0';
-                    svg.style.width = '100%';
-                    svg.style.height = '100%';
-                    svg.style.pointerEvents = 'none';
-
-                    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-                    line.setAttribute('x1', callerPos.x + nodeWidth/2 - 20);
-                    line.setAttribute('y1', callerPos.y + nodeHeight);
-                    line.setAttribute('x2', calleePos.x + nodeWidth/2 - 20);
-                    line.setAttribute('y2', calleePos.y);
-                    line.setAttribute('stroke', '#4a4a6a');
-                    line.setAttribute('stroke-width', '1');
-
-                    svg.appendChild(line);
-                    canvas.appendChild(svg);
+                    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                    const midX = (callerPos.x + calleePos.x) / 2;
+                    const midY = (callerPos.y + calleePos.y) / 2 - 20;
+                    path.setAttribute('d', 'M ' + callerPos.x + ' ' + (callerPos.y + 15) + ' Q ' + midX + ' ' + midY + ' ' + calleePos.x + ' ' + (calleePos.y - 15));
+                    path.setAttribute('fill', 'none');
+                    path.setAttribute('stroke', '#3a3a5a');
+                    path.setAttribute('stroke-width', '2');
+                    path.setAttribute('marker-end', 'url(#watch-arrowhead)');
+                    edgesGroup.appendChild(path);
                 });
             });
 
             // Draw nodes
-            funcNames.forEach(name => {
+            functions.forEach(name => {
                 const pos = positions[name];
                 if (!pos) return;
 
-                const func = functions[name];
-                const isAlive = explorerData.coveredFunctions.includes(name);
+                const importance = watchImportanceScores.get(name) || 0.5;
+                const isAlive = watchData.coveredFunctions.includes(name);
+                const color = importance > 0.7 ? '#ef4444' : importance > 0.4 ? '#fbbf24' : '#4ade80';
 
-                const node = document.createElement('div');
-                node.className = 'explorer-node ' + (isAlive ? 'alive' : 'dead');
-                node.style.left = pos.x + 'px';
-                node.style.top = pos.y + 'px';
-                node.textContent = func.name || name.split('.').pop();
-                node.title = name;
-                node.dataset.funcName = name;
+                const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                group.setAttribute('class', 'watch-node');
+                group.setAttribute('transform', 'translate(' + pos.x + ', ' + pos.y + ')');
+                group.setAttribute('data-name', name);
+                group.style.cursor = 'pointer';
 
-                node.addEventListener('click', () => selectExplorerNode(name));
+                const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+                rect.setAttribute('x', -60);
+                rect.setAttribute('y', -18);
+                rect.setAttribute('width', 120);
+                rect.setAttribute('height', 36);
+                rect.setAttribute('rx', 6);
+                rect.setAttribute('fill', isAlive ? '#1a3a1a' : '#3a1a1a');
+                rect.setAttribute('stroke', color);
+                rect.setAttribute('stroke-width', importance > 0.7 ? 3 : 2);
 
-                canvas.appendChild(node);
+                const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                text.setAttribute('text-anchor', 'middle');
+                text.setAttribute('y', 4);
+                text.setAttribute('fill', '#e0e0e0');
+                text.setAttribute('font-size', '10');
+                // Show method name for Class.method patterns
+                let displayName = name;
+                const dotIdx = name.lastIndexOf('.');
+                if (dotIdx > 0) {
+                    displayName = name.substring(dotIdx + 1);
+                }
+                if (displayName.length > 14) {
+                    displayName = displayName.slice(0, 11) + '...';
+                }
+                text.textContent = displayName;
+
+                const badge = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                badge.setAttribute('x', 50);
+                badge.setAttribute('y', -10);
+                badge.setAttribute('font-size', '8');
+                badge.setAttribute('fill', color);
+                badge.textContent = importance.toFixed(1);
+
+                group.appendChild(rect);
+                group.appendChild(text);
+                group.appendChild(badge);
+
+                group.addEventListener('click', () => selectWatchNode(name));
+                nodesGroup.appendChild(group);
+            });
+
+            // Update event count
+            document.getElementById('watch-event-count').textContent = watchRecordedEvents.length + ' events';
+        }
+
+        function updateWatchImportanceList() {
+            const container = document.getElementById('watch-importance-list');
+            if (!container) return;
+
+            const sorted = Array.from(watchImportanceScores.entries())
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 8);
+
+            container.innerHTML = sorted.map(([name, score]) => {
+                const colorClass = score > 0.7 ? '#ef4444' : score > 0.4 ? '#fbbf24' : '#4ade80';
+                const shortName = name.length > 15 ? '...' + name.slice(-13) : name;
+                return '<div style="display: flex; justify-content: space-between; padding: 4px; margin-bottom: 3px; background: var(--vscode-input-background); border-radius: 3px; border-left: 2px solid ' + colorClass + ';">' +
+                    '<span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">' + shortName + '</span>' +
+                    '<span style="color: ' + colorClass + ';">' + score.toFixed(2) + '</span></div>';
+            }).join('');
+        }
+
+        function selectWatchNode(name) {
+            watchSelectedNode = name;
+
+            // Update selection visual
+            document.querySelectorAll('.watch-node rect').forEach(rect => {
+                rect.setAttribute('stroke-width', '2');
+            });
+            const selectedNode = document.querySelector('.watch-node[data-name="' + name + '"] rect');
+            if (selectedNode) selectedNode.setAttribute('stroke-width', '4');
+
+            // Update details panel
+            const func = watchData.functions[name] || {};
+            const importance = watchImportanceScores.get(name) || 0.5;
+            const isAlive = watchData.coveredFunctions.includes(name);
+            const source = classifyWatchSource(name, func);
+            const dataType = classifyWatchDataType(func);
+
+            let html = '<div style="margin-bottom: 12px;">';
+            html += '<div style="font-size: 13px; font-weight: bold; margin-bottom: 8px;">' + name + '</div>';
+            html += '<div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px;">';
+            html += '<span style="padding: 2px 6px; border-radius: 4px; font-size: 9px; background: rgba(' + (isAlive ? '74, 222, 128' : '248, 113, 113') + ', 0.2); color: ' + (isAlive ? '#4ade80' : '#f87171') + ';">' + (isAlive ? 'ALIVE' : 'DEAD') + '</span>';
+            html += '<span style="padding: 2px 6px; border-radius: 4px; font-size: 9px; background: rgba(' + (importance > 0.7 ? '239, 68, 68' : importance > 0.4 ? '251, 191, 36' : '74, 222, 128') + ', 0.2); color: ' + (importance > 0.7 ? '#ef4444' : importance > 0.4 ? '#fbbf24' : '#4ade80') + ';">Importance: ' + importance.toFixed(2) + '</span>';
+            if (source) html += '<span style="padding: 2px 6px; border-radius: 4px; font-size: 9px; background: rgba(255,255,255,0.1);">' + source + '</span>';
+            html += '</div></div>';
+
+            html += '<div style="margin-bottom: 12px; padding: 8px; background: var(--vscode-input-background); border-radius: 4px;">';
+            html += '<div style="font-size: 10px; color: var(--vscode-descriptionForeground); margin-bottom: 4px;">Data Type</div>';
+            html += '<div style="font-size: 11px;">' + dataType + '</div>';
+            html += '</div>';
+
+            if (func.line) {
+                html += '<div style="font-size: 10px; color: var(--vscode-descriptionForeground);">Line: ' + func.line + '</div>';
+            }
+
+            document.getElementById('watch-details-content').innerHTML = html;
+
+            // Camera: tele mode zooms to selected node
+            if (watchCameraMode === 'tele') {
+                zoomWatchToNode(name);
+            }
+        }
+
+        function toggleWatchRecording() {
+            if (watchRecording) {
+                stopWatchRecording();
+            } else {
+                startWatchRecording();
+            }
+        }
+
+        function startWatchRecording() {
+            watchRecording = true;
+            watchRecordedEvents = [];
+            watchRecordStartTime = Date.now();
+            watchRecordDurationMs = 0;
+
+            document.getElementById('watch-record-btn').innerHTML = '⏹ Stop';
+            document.getElementById('watch-record-btn').style.background = 'rgba(239, 68, 68, 0.3)';
+            document.getElementById('watch-recording-duration').style.display = 'block';
+
+            watchDurationTimer = setInterval(() => {
+                watchRecordDurationMs = Date.now() - watchRecordStartTime;
+                updateWatchDurationDisplay();
+            }, 100);
+        }
+
+        function stopWatchRecording() {
+            watchRecording = false;
+            watchRecordDurationMs = Date.now() - watchRecordStartTime;
+
+            document.getElementById('watch-record-btn').innerHTML = '⏺ Record';
+            document.getElementById('watch-record-btn').style.background = '';
+
+            if (watchDurationTimer) {
+                clearInterval(watchDurationTimer);
+                watchDurationTimer = null;
+            }
+            updateWatchDurationDisplay();
+        }
+
+        function updateWatchDurationDisplay() {
+            const totalSeconds = Math.floor(watchRecordDurationMs / 1000);
+            const hours = Math.floor(totalSeconds / 3600);
+            const minutes = Math.floor((totalSeconds % 3600) / 60);
+            const seconds = totalSeconds % 60;
+            const display = String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+            document.getElementById('watch-duration').textContent = display;
+        }
+
+        function getWatchDurationFormatted() {
+            const totalSeconds = Math.floor(watchRecordDurationMs / 1000);
+            const hours = Math.floor(totalSeconds / 3600);
+            const minutes = Math.floor((totalSeconds % 3600) / 60);
+            const seconds = totalSeconds % 60;
+            if (hours > 0) return hours + 'h ' + minutes + 'm ' + seconds + 's';
+            if (minutes > 0) return minutes + 'm ' + seconds + 's';
+            return seconds + 's';
+        }
+
+        function toggleWatchPlayback() {
+            if (watchPlaying) {
+                stopWatchPlayback();
+            } else {
+                startWatchPlayback();
+            }
+        }
+
+        function startWatchPlayback() {
+            // Use trace events if available, otherwise use recorded events
+            if (watchTraceEvents.length === 0 && watchRecordedEvents.length > 0) {
+                watchTraceEvents = watchRecordedEvents;
+            }
+            if (watchTraceEvents.length === 0) {
+                console.log('No events to play back');
+                return;
+            }
+
+            watchPlaying = true;
+            const playIcon = document.getElementById('watch-play-icon');
+            if (playIcon) playIcon.textContent = '⏸';
+            watchPlaybackLoop();
+        }
+
+        function stopWatchPlayback() {
+            watchPlaying = false;
+            const playIcon = document.getElementById('watch-play-icon');
+            if (playIcon) playIcon.textContent = '▶';
+        }
+
+        function watchPlaybackLoop() {
+            if (!watchPlaying) return;
+
+            const event = watchTraceEvents[watchCurrentEventIndex];
+            if (!event) {
+                stopWatchPlayback();
+                return;
+            }
+
+            // Get importance-adjusted delay
+            const funcName = event.function || event.module || '';
+            const importance = watchImportanceScores.get(funcName) || 0.5;
+            const baseDelay = 100;
+            const importanceMultiplier = importance > 0.7 ? 3 : importance > 0.4 ? 1.5 : 1;
+            const delay = (baseDelay * importanceMultiplier) / watchPlaybackSpeed;
+
+            // Visualize current event
+            visualizeWatchEventAtIndex(watchCurrentEventIndex);
+            updateWatchPlaybackDisplay();
+
+            // Move to next event
+            watchCurrentEventIndex++;
+
+            if (watchCurrentEventIndex >= watchTraceEvents.length) {
+                stopWatchPlayback();
+                return;
+            }
+
+            setTimeout(() => watchPlaybackLoop(), delay);
+        }
+
+        function visualizeWatchEventAtIndex(index) {
+            if (index < 0 || index >= watchTraceEvents.length) return;
+
+            const event = watchTraceEvents[index];
+            const funcName = event.function || event.module || '';
+
+            // Highlight the current node
+            highlightWatchNode(funcName, true);
+
+            // Auto-camera: focus on action
+            if (watchCameraMode === 'auto' || watchCameraMode === 'follow') {
+                autoWatchCameraFocusOn(funcName, event);
+            }
+        }
+
+        function highlightWatchNode(name, active) {
+            const node = document.querySelector('.watch-node[data-name="' + name + '"] rect');
+            if (!node) return;
+
+            if (active) {
+                node.setAttribute('fill', 'rgba(74, 222, 128, 0.3)');
+                setTimeout(() => highlightWatchNode(name, false), 500);
+            } else {
+                const isAlive = watchData.coveredFunctions.includes(name);
+                node.setAttribute('fill', isAlive ? '#1a3a1a' : '#3a1a1a');
+            }
+        }
+
+        function autoWatchCameraFocusOn(funcName, event) {
+            const node = document.querySelector('.watch-node[data-name="' + funcName + '"]');
+            if (!node) return;
+
+            const transform = node.getAttribute('transform');
+            const match = transform.match(/translate\\((\\d+(?:\\.\\d+)?),\\s*(\\d+(?:\\.\\d+)?)\\)/);
+            if (!match) return;
+
+            const x = parseFloat(match[1]);
+            const y = parseFloat(match[2]);
+            const now = performance.now();
+
+            // Calculate data velocity (how fast data is moving between nodes)
+            if (watchLastDataPosition) {
+                const dx = x - watchLastDataPosition.x;
+                const dy = y - watchLastDataPosition.y;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                const timeDelta = now - watchLastDataTime;
+                watchDataVelocity = timeDelta > 0 ? distance / timeDelta : 0;
+            }
+            watchLastDataPosition = { x, y };
+            watchLastDataTime = now;
+
+            const importance = watchImportanceScores.get(funcName) || 0.5;
+
+            // AUTO MODE: Intelligent zoom based on importance & velocity
+            let viewWidth, viewHeight;
+
+            if (watchCameraMode === 'auto') {
+                const velocityFactor = Math.min(watchDataVelocity * 50, 1);  // 0-1 scale
+
+                if (importance > 0.7) {
+                    // Critical call - zoom in tight
+                    viewWidth = 150 + velocityFactor * 50;
+                    viewHeight = viewWidth * 0.75;
+                } else if (importance > 0.4 || velocityFactor > 0.5) {
+                    // Medium importance or fast movement
+                    viewWidth = 250 + velocityFactor * 100;
+                    viewHeight = viewWidth * 0.75;
+                } else {
+                    // Normal follow
+                    viewWidth = 350;
+                    viewHeight = 260;
+                }
+
+                // Fast data movement = zoom out to show trajectory
+                if (velocityFactor > 0.7) {
+                    viewWidth = Math.min(viewWidth + 150, 600);
+                    viewHeight = viewWidth * 0.75;
+                }
+            } else if (watchCameraMode === 'follow') {
+                // Simple follow - consistent zoom
+                viewWidth = 300;
+                viewHeight = 225;
+            } else {
+                // Overview - don't move
+                return;
+            }
+
+            document.getElementById('watch-flow-svg').setAttribute('viewBox',
+                (x - viewWidth/2) + ' ' + (y - viewHeight/2) + ' ' + viewWidth + ' ' + viewHeight);
+
+            // Show importance indicator for important events
+            const indicator = document.getElementById('watch-branch-indicator');
+            if (indicator && importance > 0.7) {
+                indicator.style.display = 'block';
+                indicator.style.background = importance > 0.8 ? '#ef4444' : '#fbbf24';
+                indicator.style.color = importance > 0.8 ? 'white' : 'black';
+                indicator.textContent = 'Important: ' + funcName.split('.').pop();
+                setTimeout(() => { indicator.style.display = 'none'; }, 2000);
+            }
+        }
+
+        function updateWatchPlaybackDisplay() {
+            const current = watchCurrentEventIndex;
+            const total = watchTraceEvents.length;
+
+            // Update event counter
+            const eventIndex = document.getElementById('watch-event-index');
+            const totalEvents = document.getElementById('watch-total-events');
+            if (eventIndex) eventIndex.textContent = current.toString();
+            if (totalEvents) totalEvents.textContent = total.toString();
+
+            // Update timeline scrubber
+            const scrubber = document.getElementById('watch-timeline-scrubber');
+            if (scrubber && total > 0) {
+                scrubber.value = ((current / total) * 100).toString();
+            }
+        }
+
+        function scrubWatchTimeline(value) {
+            const percent = parseFloat(value) / 100;
+            const totalEvents = watchTraceEvents.length;
+            if (totalEvents === 0) return;
+
+            watchCurrentEventIndex = Math.floor(percent * totalEvents);
+            updateWatchPlaybackDisplay();
+            visualizeWatchEventAtIndex(watchCurrentEventIndex);
+        }
+
+        function setWatchPlaybackSpeed(speed) {
+            watchPlaybackSpeed = parseFloat(speed);
+        }
+
+        function watchStepBack() {
+            watchCurrentEventIndex = Math.max(0, watchCurrentEventIndex - 1);
+            updateWatchPlaybackDisplay();
+            visualizeWatchEventAtIndex(watchCurrentEventIndex);
+        }
+
+        function watchStepForward() {
+            watchCurrentEventIndex = Math.min(
+                watchTraceEvents.length - 1,
+                watchCurrentEventIndex + 1
+            );
+            updateWatchPlaybackDisplay();
+            visualizeWatchEventAtIndex(watchCurrentEventIndex);
+        }
+
+        // Source filter functions
+        function toggleWatchSourceFilter(source) {
+            if (source === 'all') {
+                const newState = !watchSourceFilters.all;
+                watchSourceFilters = {
+                    all: newState,
+                    video: newState,
+                    api: newState,
+                    screen: newState,
+                    audio: newState
+                };
+            } else {
+                watchSourceFilters[source] = !watchSourceFilters[source];
+                watchSourceFilters.all = ['video', 'api', 'screen', 'audio']
+                    .every(s => watchSourceFilters[s]);
+            }
+
+            // Update button states
+            const btn = document.querySelector('.watch-source-filter[data-source="' + source + '"]');
+            if (btn) btn.classList.toggle('active');
+
+            if (source === 'all') {
+                document.querySelectorAll('.watch-source-filter:not([data-source="all"])').forEach(b => {
+                    b.classList.toggle('active', watchSourceFilters.all);
+                });
+            } else {
+                const allBtn = document.querySelector('.watch-source-filter[data-source="all"]');
+                if (allBtn) allBtn.classList.toggle('active', watchSourceFilters.all);
+            }
+
+            updateWatchNodeVisibilityBySource();
+        }
+
+        function updateWatchNodeVisibilityBySource() {
+            document.querySelectorAll('.watch-node').forEach(node => {
+                const name = node.getAttribute('data-name');
+                const source = classifyWatchSource(name, watchData.functions[name] || {});
+                const visible = watchSourceFilters.all ||
+                    (source && watchSourceFilters[source]) ||
+                    (!source && watchSourceFilters.all);
+
+                node.style.display = visible ? '' : 'none';
             });
         }
 
-        // Select a node and show info panel
-        function selectExplorerNode(funcName) {
-            // Deselect previous
-            document.querySelectorAll('.explorer-node.selected').forEach(n => n.classList.remove('selected'));
-
-            // Select new
-            const node = document.querySelector('.explorer-node[data-func-name="' + funcName + '"]');
-            if (node) node.classList.add('selected');
-            selectedExplorerNode = funcName;
-
-            // Show info panel
-            const panel = document.getElementById('explorer-info-panel');
-            const title = document.getElementById('explorer-info-title');
-            const content = document.getElementById('explorer-info-content');
-
-            const func = explorerData.functions[funcName];
-            const isAlive = explorerData.coveredFunctions.includes(funcName);
-            const why = explorerData.whyNotCovered[funcName];
-
-            title.textContent = funcName;
-
-            let html = '<div style="font-size: 12px; margin-bottom: 8px;">';
-            html += '<div><span style="color: #888; width: 60px; display: inline-block;">Status:</span>';
-            html += '<span style="color: ' + (isAlive ? '#4ade80' : '#f87171') + ';">' + (isAlive ? 'ALIVE' : 'DEAD') + '</span></div>';
-            if (func) {
-                html += '<div><span style="color: #888; width: 60px; display: inline-block;">Calls:</span>' + (func.callCount || 0) + '</div>';
-                if (func.line) html += '<div><span style="color: #888; width: 60px; display: inline-block;">Line:</span>' + func.line + '</div>';
-            }
-            html += '</div>';
-
-            if (!isAlive && why) {
-                html += '<div class="why-not-covered">';
-                html += '<h5>Why Not Covered?</h5>';
-                if (why.rootCause === 'NO_CALL_SITES') {
-                    html += '<div class="reason" style="color: #fbbf24;">&#9888; No call sites found</div>';
-                    html += '<div style="color: #888; font-size: 11px; margin-top: 4px;">This function is never called anywhere in the codebase. It may be dead code or only called externally.</div>';
-                } else if (why.rootCause === 'UNREACHABLE_FROM_ENTRY') {
-                    html += '<div class="reason" style="color: #f87171;">&#10060; Unreachable from entry points</div>';
-                    html += '<div style="color: #888; font-size: 11px; margin-top: 4px;">The entire call chain is orphaned - no executed function leads to this code.</div>';
-                } else if (why.rootCause === 'BRANCH_NOT_TAKEN') {
-                    const detail = why.rootCauseDetail;
-                    html += '<div class="reason" style="color: #60a5fa;">&#128279; Root Cause Found</div>';
-                    html += '<div style="margin: 8px 0; padding: 8px; background: rgba(96, 165, 250, 0.1); border-radius: 4px;">';
-                    html += '<div style="font-weight: bold; color: #60a5fa;">Branch in: ' + (detail?.caller || 'unknown') + '</div>';
-                    if (detail?.branchCondition && detail.branchCondition !== 'condition was False') {
-                        html += '<div style="font-family: monospace; font-size: 11px; margin: 6px 0; padding: 6px; background: rgba(0,0,0,0.2); border-radius: 4px; color: #fde68a;">';
-                        html += detail.branchType + ' ' + detail.branchCondition;
-                        html += '</div>';
-                    }
-                    if (detail?.branchLine) {
-                        html += '<div style="color: #888; font-size: 11px;">Line ' + detail.branchLine + ' - branch condition not satisfied</div>';
-                    } else {
-                        html += '<div style="color: #888; font-size: 11px;">A conditional branch in this executed function prevented the call.</div>';
-                    }
-                    html += '</div>';
-                }
-
-                // Show call chain if available
-                if (why.callChain && why.callChain.length > 1) {
-                    html += '<div style="margin-top: 12px; padding-top: 8px; border-top: 1px solid #333;">';
-                    html += '<div style="color: #888; font-size: 11px; margin-bottom: 6px;">Call Chain (dead functions blocked by root):</div>';
-                    html += '<div style="font-family: monospace; font-size: 11px; color: #e5e7eb; background: #1f2937; padding: 8px; border-radius: 4px; overflow-x: auto;">';
-                    // Show chain from root to dead function
-                    const chainReversed = why.callChain.slice().reverse();
-                    chainReversed.forEach((fn, i) => {
-                        const isRoot = i === 0 && why.rootCause === 'BRANCH_NOT_TAKEN';
-                        const isTarget = i === chainReversed.length - 1;
-                        const color = isRoot ? '#60a5fa' : (isTarget ? '#f87171' : '#888');
-                        const label = isRoot ? ' (ROOT)' : (isTarget ? ' (DEAD)' : '');
-                        html += '<span style="color: ' + color + ';">' + fn + label + '</span>';
-                        if (i < chainReversed.length - 1) {
-                            html += ' <span style="color: #666;">→</span> ';
-                        }
-                    });
-                    html += '</div></div>';
-                }
-                html += '</div>';
+        // Branch display toggle
+        function toggleWatchBranchDisplay() {
+            watchShowBranchesNotTaken = !watchShowBranchesNotTaken;
+            const btn = document.getElementById('watch-branch-toggle');
+            if (btn) {
+                btn.classList.toggle('active', watchShowBranchesNotTaken);
+                btn.style.background = watchShowBranchesNotTaken ? 'rgba(239, 68, 68, 0.2)' : '';
+                btn.style.borderColor = watchShowBranchesNotTaken ? '#ef4444' : '';
             }
 
-            content.innerHTML = html;
-            panel.style.display = 'block';
+            updateWatchBranchMarkers();
         }
+
+        function updateWatchBranchMarkers() {
+            // Remove existing branch markers
+            document.querySelectorAll('.watch-branch-marker').forEach(m => m.remove());
+
+            if (!watchShowBranchesNotTaken) return;
+
+            const nodesGroup = document.getElementById('watch-nodes');
+            if (!nodesGroup) return;
+
+            // Add markers for dead functions
+            watchData.deadFunctions.forEach(funcName => {
+                const node = document.querySelector('.watch-node[data-name="' + funcName + '"]');
+                if (!node) return;
+
+                const transform = node.getAttribute('transform');
+                const match = transform.match(/translate\\((\\d+(?:\\.\\d+)?),\\s*(\\d+(?:\\.\\d+)?)\\)/);
+                if (!match) return;
+
+                const x = parseFloat(match[1]);
+                const y = parseFloat(match[2]);
+
+                // Create X marker
+                const marker = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                marker.setAttribute('class', 'watch-branch-marker');
+                marker.setAttribute('transform', 'translate(' + x + ', ' + (y - 25) + ')');
+
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('r', '10');
+                circle.setAttribute('fill', 'rgba(239, 68, 68, 0.3)');
+                circle.setAttribute('stroke', '#ef4444');
+                circle.setAttribute('stroke-width', '2');
+
+                const line1 = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line1.setAttribute('x1', '-5'); line1.setAttribute('y1', '-5');
+                line1.setAttribute('x2', '5'); line1.setAttribute('y2', '5');
+                line1.setAttribute('stroke', '#ef4444'); line1.setAttribute('stroke-width', '2');
+
+                const line2 = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line2.setAttribute('x1', '5'); line2.setAttribute('y1', '-5');
+                line2.setAttribute('x2', '-5'); line2.setAttribute('y2', '5');
+                line2.setAttribute('stroke', '#ef4444'); line2.setAttribute('stroke-width', '2');
+
+                marker.appendChild(circle);
+                marker.appendChild(line1);
+                marker.appendChild(line2);
+                nodesGroup.appendChild(marker);
+            });
+
+            // Add dashed lines for expected but not called
+            Object.entries(watchData.functions).forEach(([name, info]) => {
+                if (info.expected_but_not_called) {
+                    const fromNode = document.querySelector('.watch-node[data-name="' + name + '"]');
+                    if (!fromNode) return;
+
+                    const fromTransform = fromNode.getAttribute('transform');
+                    const fromMatch = fromTransform.match(/translate\\((\\d+(?:\\.\\d+)?),\\s*(\\d+(?:\\.\\d+)?)\\)/);
+                    if (!fromMatch) return;
+
+                    info.expected_but_not_called.forEach(expected => {
+                        const targetFunc = expected.function || expected;
+                        const toNode = document.querySelector('.watch-node[data-name="' + targetFunc + '"]');
+                        if (!toNode) return;
+
+                        const toTransform = toNode.getAttribute('transform');
+                        const toMatch = toTransform.match(/translate\\((\\d+(?:\\.\\d+)?),\\s*(\\d+(?:\\.\\d+)?)\\)/);
+                        if (!toMatch) return;
+
+                        const path = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                        path.setAttribute('class', 'watch-branch-marker');
+                        path.setAttribute('x1', fromMatch[1]);
+                        path.setAttribute('y1', fromMatch[2]);
+                        path.setAttribute('x2', toMatch[1]);
+                        path.setAttribute('y2', toMatch[2]);
+                        path.setAttribute('stroke', '#ef4444');
+                        path.setAttribute('stroke-width', '2');
+                        path.setAttribute('stroke-dasharray', '5,5');
+                        path.setAttribute('opacity', '0.6');
+                        document.getElementById('watch-edges').appendChild(path);
+                    });
+                }
+            });
+        }
+
+        // Load trace events from external source
+        function loadWatchTraceEvents(events) {
+            watchTraceEvents = events;
+            const totalEl = document.getElementById('watch-total-events');
+            if (totalEl) totalEl.textContent = events.length.toString();
+            const countEl = document.getElementById('watch-event-count');
+            if (countEl) countEl.textContent = events.length + ' events';
+            console.log('Loaded ' + events.length + ' trace events for playback');
+        }
+
+        function setWatchCamera(mode) {
+            watchCameraMode = mode;
+
+            // Update button states
+            document.querySelectorAll('.camera-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.getAttribute('data-camera') === mode);
+            });
+
+            // Handle camera modes
+            switch (mode) {
+                case 'overview':
+                    document.getElementById('watch-flow-svg').setAttribute('viewBox', '0 0 800 500');
+                    break;
+                case 'flyby':
+                    // Animate through nodes
+                    animateWatchFlyby();
+                    break;
+                case 'tele':
+                    if (watchSelectedNode) {
+                        zoomWatchToNode(watchSelectedNode);
+                    }
+                    break;
+                case 'follow':
+                    // Follow mode activates during playback
+                    break;
+            }
+        }
+
+        function animateWatchFlyby() {
+            const nodes = document.querySelectorAll('.watch-node');
+            if (nodes.length === 0) return;
+
+            let currentIndex = 0;
+            const flyToNext = () => {
+                if (watchCameraMode !== 'flyby') return;
+
+                const node = nodes[currentIndex];
+                const transform = node.getAttribute('transform');
+                const match = transform.match(/translate\\((\\d+(?:\\.\\d+)?),\\s*(\\d+(?:\\.\\d+)?)\\)/);
+                if (match) {
+                    const x = parseFloat(match[1]);
+                    const y = parseFloat(match[2]);
+                    document.getElementById('watch-flow-svg').setAttribute('viewBox', (x - 150) + ' ' + (y - 100) + ' 300 200');
+                }
+
+                currentIndex = (currentIndex + 1) % nodes.length;
+                setTimeout(flyToNext, 2000);
+            };
+            flyToNext();
+        }
+
+        function zoomWatchToNode(name) {
+            const node = document.querySelector('.watch-node[data-name="' + name + '"]');
+            if (!node) return;
+
+            const transform = node.getAttribute('transform');
+            const match = transform.match(/translate\\((\\d+(?:\\.\\d+)?),\\s*(\\d+(?:\\.\\d+)?)\\)/);
+            if (match) {
+                const x = parseFloat(match[1]);
+                const y = parseFloat(match[2]);
+                document.getElementById('watch-flow-svg').setAttribute('viewBox', (x - 100) + ' ' + (y - 75) + ' 200 150');
+            }
+        }
+
+        function filterWatchBySource(source) {
+            // Highlight nodes matching source
+            document.querySelectorAll('.watch-node').forEach(node => {
+                const name = node.getAttribute('data-name');
+                const func = watchData.functions[name];
+                const nodeSource = classifyWatchSource(name, func);
+                node.style.opacity = (!source || nodeSource === source) ? 1 : 0.3;
+            });
+        }
+
+        function showWatchExportModal() {
+            document.getElementById('watch-export-modal').style.display = 'flex';
+        }
+
+        function hideWatchExportModal() {
+            document.getElementById('watch-export-modal').style.display = 'none';
+        }
+
+        function exportWatchData(format) {
+            const includeTrace = document.getElementById('watch-export-trace').checked;
+            const includeImportance = document.getElementById('watch-export-importance').checked;
+            const includeMissing = document.getElementById('watch-export-missing').checked;
+            const includeStandalone = document.getElementById('watch-export-standalone').checked;
+
+            const exportData = {
+                metadata: {
+                    exported_at: new Date().toISOString(),
+                    total_events: watchRecordedEvents.length,
+                    total_functions: Object.keys(watchData.functions).length,
+                    recording_duration_ms: watchRecordDurationMs,
+                    recording_duration_formatted: getWatchDurationFormatted(),
+                    camera_mode: watchCameraMode,
+                    llm_available: !!watchLlmEndpoint
+                }
+            };
+
+            if (includeTrace) {
+                exportData.execution_trace = watchRecordedEvents;
+                exportData.call_graph = watchData.callGraph;
+                exportData.functions = watchData.functions;
+            }
+
+            if (includeImportance) {
+                exportData.importance_scores = Object.fromEntries(watchImportanceScores);
+            }
+
+            if (includeMissing) {
+                exportData.missing_calls = watchData.deadFunctions.map(f => ({
+                    function: f,
+                    reason: 'Not called during execution'
+                }));
+            }
+
+            if (format === 'json') {
+                downloadWatchJSON(exportData);
+            } else if (format === 'standalone') {
+                downloadWatchStandalone(exportData);
+            } else {
+                downloadWatchHTMLReport(exportData);
+            }
+
+            hideWatchExportModal();
+        }
+
+        function downloadWatchJSON(data) {
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'trueflow_watch_' + new Date().toISOString().slice(0, 19).replace(/[:-]/g, '') + '.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function downloadWatchHTMLReport(data) {
+            var html = '<!DOCTYPE html><html><head><title>TrueFlow Watch Report</title>';
+            html += '<style>body{font-family:system-ui;background:#0a0a1a;color:#e0e0e0;padding:20px;max-width:1200px;margin:0 auto;}';
+            html += 'h1{color:#7dd3fc;}h2{color:#a78bfa;border-bottom:1px solid #2a2a4a;padding-bottom:10px;}';
+            html += '.section{background:#12122a;padding:20px;border-radius:8px;margin-bottom:20px;}';
+            html += '.stat{display:inline-block;margin-right:30px;}.stat-value{font-size:24px;font-weight:bold;color:#4ade80;}';
+            html += '.stat-label{font-size:12px;color:#888;}</style></head><body>';
+            html += '<h1>TrueFlow Watch Architecture Report</h1>';
+            html += '<p>Generated: ' + data.metadata.exported_at + '</p>';
+            html += '<div class="section"><h2>Summary</h2>';
+            html += '<div class="stat"><div class="stat-value">' + data.metadata.total_functions + '</div><div class="stat-label">Functions</div></div>';
+            html += '<div class="stat"><div class="stat-value">' + data.metadata.total_events + '</div><div class="stat-label">Events</div></div>';
+            html += '<div class="stat"><div class="stat-value">' + data.metadata.recording_duration_formatted + '</div><div class="stat-label">Duration</div></div>';
+            html += '</div>';
+            html += '<div class="section"><h2>Data</h2><pre style="overflow:auto;max-height:500px;background:#0d0d20;padding:15px;border-radius:4px;">' + JSON.stringify(data, null, 2) + '</pre></div>';
+            html += '</body></html>';
+
+            const blob = new Blob([html], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'trueflow_watch_report_' + new Date().toISOString().slice(0, 19).replace(/[:-]/g, '') + '.html';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function downloadWatchStandalone(data) {
+            var html = '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>TrueFlow Standalone</title>';
+            html += '<style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:system-ui;background:#0a0a1a;color:#e0e0e0;}';
+            html += '.header{background:linear-gradient(90deg,#1a1a3a,#2a2a5a);padding:15px 20px;border-bottom:2px solid #3b82f6;display:flex;justify-content:space-between;align-items:center;}';
+            html += '.header h1{font-size:18px;color:#7dd3fc;}.meta{font-size:11px;color:#888;display:flex;gap:20px;}';
+            html += '.container{display:flex;height:calc(100vh-60px);}.sidebar{width:280px;background:#12122a;padding:15px;overflow-y:auto;}';
+            html += '.main{flex:1;padding:20px;overflow:auto;}.section{margin-bottom:20px;}';
+            html += '.section h3{font-size:12px;color:#7dd3fc;margin-bottom:10px;text-transform:uppercase;}';
+            html += '.card{background:#1a1a3a;padding:12px;border-radius:8px;margin-bottom:8px;}';
+            html += '.stat-value{font-size:20px;font-weight:bold;color:#4ade80;}.stat-label{font-size:11px;color:#888;}';
+            html += 'pre{background:#0d0d20;padding:15px;border-radius:8px;overflow:auto;font-size:11px;}</style></head>';
+            html += '<body><div class="header"><h1>TrueFlow Watch Architecture</h1>';
+            html += '<div class="meta"><span>Exported: ' + data.metadata.exported_at + '</span>';
+            html += '<span>Duration: ' + data.metadata.recording_duration_formatted + '</span>';
+            html += '<span>Functions: ' + data.metadata.total_functions + '</span>';
+            html += '<span>Events: ' + data.metadata.total_events + '</span></div></div>';
+            html += '<div class="container"><div class="sidebar">';
+            html += '<div class="section"><h3>Stats</h3>';
+            html += '<div class="card"><div class="stat-value">' + data.metadata.recording_duration_formatted + '</div><div class="stat-label">Recording Duration</div></div>';
+            html += '<div class="card"><div class="stat-value">' + data.metadata.total_functions + '</div><div class="stat-label">Functions Traced</div></div>';
+            html += '<div class="card"><div class="stat-value">' + (data.metadata.llm_available ? 'Yes' : 'Fallback') + '</div><div class="stat-label">LLM Used</div></div>';
+            html += '</div></div><div class="main">';
+            html += '<h2 style="color:#7dd3fc;margin-bottom:20px;">Embedded Data</h2>';
+            html += '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            html += '</div></div>';
+            html += '<script>const TRUEFLOW_DATA = ' + JSON.stringify(data) + ';console.log("TrueFlow Standalone loaded", TRUEFLOW_DATA);<\\/script>';
+            html += '</body></html>';
+
+            const blob = new Blob([html], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'trueflow_standalone_' + new Date().toISOString().slice(0, 19).replace(/[:-]/g, '') + '.html';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function openExplorerInBrowser() {
+            // Build data for the 3D explorer
+            const data = {
+                functions: explorerData.functions,
+                call_graph: explorerData.callGraph,
+                resolved_call_graph: resolvedCallGraphData,
+                covered_functions: explorerData.coveredFunctions,
+                dead_functions: explorerData.deadFunctions,
+                why_not_covered: explorerData.whyNotCovered
+            };
+
+            // Request the HTML template from the extension
+            vscode.postMessage({
+                type: 'openExplorerInBrowser',
+                data: data
+            });
+        }
+
+        function openWatchInBrowser() {
+            const data = {
+                functions: watchData.functions,
+                call_graph: watchData.callGraph,
+                resolved_call_graph: resolvedCallGraphData,
+                runtime_call_graph: watchData.runtimeCallGraph || explorerData.callGraph,
+                covered_functions: watchData.coveredFunctions,
+                dead_functions: watchData.deadFunctions,
+                why_not_covered: watchData.whyNotCovered || explorerData.whyNotCovered,
+                importance_scores: Object.fromEntries(watchImportanceScores),
+                recorded_events: watchRecordedEvents,
+                recording_duration_ms: watchRecordDurationMs
+            };
+
+            var html = '<!DOCTYPE html><html><head><title>TrueFlow Full Screen</title>';
+            html += '<style>body{margin:0;padding:20px;background:#0a0a1a;color:#e0e0e0;font-family:system-ui;}';
+            html += 'h1{color:#7dd3fc;}.info{background:#12122a;padding:15px;border-radius:8px;margin-bottom:20px;}';
+            html += '.stat{display:inline-block;margin-right:30px;}.stat-value{font-size:24px;font-weight:bold;color:#4ade80;}';
+            html += '.stat-label{font-size:12px;color:#888;}pre{background:#1a1a3a;padding:15px;border-radius:8px;overflow:auto;max-height:80vh;}</style></head>';
+            html += '<body><h1>TrueFlow Watch Architecture Data</h1>';
+            html += '<div class="info"><div class="stat"><div class="stat-value">' + Object.keys(data.functions).length + '</div><div class="stat-label">Functions</div></div>';
+            html += '<div class="stat"><div class="stat-value">' + (data.recorded_events?.length || 0) + '</div><div class="stat-label">Events</div></div>';
+            html += '<div class="stat"><div class="stat-value">' + getWatchDurationFormatted() + '</div><div class="stat-label">Duration</div></div></div>';
+            html += '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            html += '<script>console.log("TrueFlow data:", ' + JSON.stringify(data) + ');<\\/script></body></html>';
+
+            const blob = new Blob([html], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const newWindow = window.open(url, '_blank');
+            if (!newWindow) {
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'trueflow_fullscreen.html';
+                a.click();
+                vscode.postMessage({ type: 'info', message: 'Popup blocked. File downloaded instead.' });
+            }
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+        }
+
+        // Initialize Watch Architecture when its tab is shown
+        document.querySelectorAll('.sub-tab').forEach(subtab => {
+            subtab.addEventListener('click', () => {
+                if (subtab.dataset.subtab === 'watch-architecture') {
+                    initWatchArchitecture();
+                }
+            });
+        });
 
         // Diagram functions
         function updateDiagramType() {
@@ -2804,7 +4316,11 @@ function getTraceViewerHtml(initialTab?: string): string {
                         for (const [funcKey, data] of Object.entries(funcBranches)) {
                             functionBranchesData.set(funcKey, data.branches || []);
                         }
-                        console.log('[TrueFlow] Received branch registry:', callSitesData.length, 'call sites');
+                        // Store resolved call graph for cross-class connection visualization
+                        resolvedCallGraphData = message.data.resolved_call_graph || {};
+                        classAttributesData = message.data.class_attributes || {};
+                        console.log('[TrueFlow] Received branch registry:', callSitesData.length, 'call sites,',
+                            Object.keys(resolvedCallGraphData).length, 'resolved call graph entries');
                         refreshInteractiveExplorer();
                     }
                     break;
@@ -2825,6 +4341,13 @@ function getTraceViewerHtml(initialTab?: string): string {
 
                         // Show zoom controls only for diagram tab
                         document.getElementById('zoom-controls').classList.toggle('visible', targetTab === 'diagram');
+                    }
+                    break;
+
+                case 'explorerHtml':
+                    // Received Three.js HTML for iframe embedding
+                    if (message.html && typeof handleExplorerHtmlResponse === 'function') {
+                        handleExplorerHtmlResponse(message.html);
                     }
                     break;
             }

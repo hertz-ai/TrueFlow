@@ -1,0 +1,2177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrueFlow Interactive Explorer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            overflow: hidden;
+        }
+
+        #container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Info Panel - Shows details on hover/click */
+        #info-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 350px;
+            max-height: calc(100vh - 20px);
+            background: rgba(26, 26, 46, 0.95);
+            border: 1px solid #4a4a6a;
+            border-radius: 8px;
+            padding: 15px;
+            overflow-y: auto;
+            display: none;
+            z-index: 100;
+        }
+
+        #info-panel.visible {
+            display: block;
+        }
+
+        #info-panel h3 {
+            color: #7dd3fc;
+            margin-bottom: 10px;
+            font-size: 14px;
+            border-bottom: 1px solid #4a4a6a;
+            padding-bottom: 8px;
+        }
+
+        #info-panel .info-row {
+            display: flex;
+            margin-bottom: 6px;
+            font-size: 12px;
+        }
+
+        #info-panel .info-label {
+            color: #888;
+            width: 80px;
+            flex-shrink: 0;
+        }
+
+        #info-panel .info-value {
+            color: #ddd;
+            word-break: break-all;
+        }
+
+        /* Why Not Covered Section */
+        .why-section {
+            margin-top: 15px;
+            padding: 12px;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            border-radius: 6px;
+        }
+
+        .why-section h4 {
+            color: #f87171;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+
+        .why-section .reason {
+            font-size: 11px;
+            color: #fca5a5;
+            margin-bottom: 6px;
+            padding-left: 10px;
+            border-left: 2px solid #f87171;
+        }
+
+        .why-section .condition {
+            font-family: 'Consolas', 'Monaco', monospace;
+            background: rgba(0,0,0,0.3);
+            padding: 4px 8px;
+            border-radius: 4px;
+            margin-top: 4px;
+            font-size: 11px;
+            color: #fde68a;
+        }
+
+        /* Legend */
+        #legend {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(26, 26, 46, 0.9);
+            border: 1px solid #4a4a6a;
+            border-radius: 8px;
+            padding: 12px;
+            z-index: 100;
+        }
+
+        #legend h4 {
+            font-size: 12px;
+            margin-bottom: 8px;
+            color: #888;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 3px;
+            margin-right: 8px;
+        }
+
+        /* Stats Bar */
+        #stats-bar {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(26, 26, 46, 0.9);
+            border: 1px solid #4a4a6a;
+            border-radius: 8px;
+            padding: 10px 15px;
+            z-index: 100;
+            font-size: 12px;
+        }
+
+        #stats-bar .stat {
+            display: inline-block;
+            margin-right: 20px;
+        }
+
+        #stats-bar .stat-value {
+            font-weight: bold;
+            color: #7dd3fc;
+        }
+
+        #stats-bar .stat-value.dead {
+            color: #f87171;
+        }
+
+        #stats-bar .stat-value.alive {
+            color: #4ade80;
+        }
+
+        #stats-bar .stat-value.partial {
+            color: #fbbf24;
+        }
+
+        /* Controls hint */
+        #controls-hint {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            background: rgba(26, 26, 46, 0.9);
+            border: 1px solid #4a4a6a;
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 11px;
+            color: #888;
+            z-index: 100;
+        }
+
+        /* Loading overlay */
+        #loading {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #1a1a2e;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        #loading.hidden {
+            display: none;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 3px solid #4a4a6a;
+            border-top-color: #7dd3fc;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Tooltip */
+        #tooltip {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.9);
+            color: #fff;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 200;
+            display: none;
+            max-width: 300px;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="canvas-container"></div>
+
+        <div id="loading">
+            <div class="spinner"></div>
+        </div>
+
+        <div id="stats-bar">
+            <span class="stat">Functions: <span class="stat-value" id="stat-total">0</span></span>
+            <span class="stat">Covered: <span class="stat-value alive" id="stat-covered">0</span></span>
+            <span class="stat">Partial: <span class="stat-value partial" id="stat-partial">0</span></span>
+            <span class="stat">Dead: <span class="stat-value dead" id="stat-dead">0</span></span>
+            <span class="stat" style="margin-left: 15px; border-left: 1px solid #4a4a6a; padding-left: 15px;">Classes: <span class="stat-value" id="stat-classes">0</span></span>
+            <span class="stat">Dead Classes: <span class="stat-value dead" id="stat-dead-classes">0</span></span>
+            <span class="stat">Coverage: <span class="stat-value" id="stat-coverage">0%</span></span>
+        </div>
+
+        <div id="info-panel">
+            <h3 id="info-title">Select a node</h3>
+            <div id="info-content"></div>
+        </div>
+
+        <div id="legend">
+            <h4>Legend</h4>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #4ade80;"></div>
+                <span>Executed (Alive)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ef4444;"></div>
+                <span>Orphaned (No Callers)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #a78bfa;"></div>
+                <span>Dead Branch (Not Taken)</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #fbbf24;"></div>
+                <span>Partially Covered</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #6b7280;"></div>
+                <span>Cascading Dead</span>
+            </div>
+            <div style="border-top: 1px solid #4a4a6a; margin: 8px 0; padding-top: 8px;">
+                <div style="font-size: 10px; color: #888; margin-bottom: 4px;">MARKERS</div>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #fbbf24; clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);"></div>
+                <span>Branch Divergence Point</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #4ade80; clip-path: polygon(50% 100%, 0% 30%, 50% 0%, 100% 30%);"></div>
+                <span>Entry Point (Called from outside)</span>
+            </div>
+            <div style="border-top: 1px solid #4a4a6a; margin: 8px 0; padding-top: 8px;">
+                <div style="font-size: 10px; color: #888; margin-bottom: 4px;">CLASS CONTAINERS</div>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: rgba(74, 222, 128, 0.3); border: 1px solid #4ade80;"></div>
+                <span>Fully Covered Class</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: rgba(251, 191, 36, 0.3); border: 1px solid #fbbf24;"></div>
+                <span>Partially Covered Class</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: rgba(239, 68, 68, 0.3); border: 1px solid #ef4444;"></div>
+                <span>Dead Class</span>
+            </div>
+        </div>
+
+        <div id="controls-hint">
+            <div><strong>Pan:</strong> Middle-drag, Right-drag, or WASD/Arrows</div>
+            <div>Scroll: Zoom | Left-drag: Rotate | Click: Details</div>
+            <div style="margin-top: 4px; font-size: 10px; color: #666;">Double-click node to focus</div>
+        </div>
+
+        <div id="tooltip"></div>
+    </div>
+
+    <!-- Rendering Monitor - logs white screens and rendering issues -->
+    <script src="rendering_monitor.js"></script>
+
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <script>
+        // TrueFlow Interactive Flow Explorer
+        // Visualizes code execution with dead branch analysis
+
+        class InteractiveFlowExplorer {
+            constructor(container) {
+                this.container = container;
+                this.scene = null;
+                this.camera = null;
+                this.renderer = null;
+                this.controls = null;
+                this.nodes = new Map();  // function name -> mesh
+                this.edges = [];
+                this.raycaster = new THREE.Raycaster();
+                this.mouse = new THREE.Vector2();
+                this.selectedNode = null;
+                this.hoveredNode = null;
+                this.data = null;
+
+                // Incremental update signatures
+                this.lastStructureSignature = null;
+                this.lastCoverageSignature = null;
+
+                // Performance optimization flags
+                this.needsRender = true;
+                this.isInteracting = false;
+                this.lastRenderTime = 0;
+                this.targetFPS = 60;
+                this.minFrameTime = 1000 / this.targetFPS;
+                this.lowPowerMode = false;
+                this.animationId = null;
+                this.isVisible = true;
+
+                // Right-click drag state
+                this.isPanning = false;
+                this.panStart = new THREE.Vector2();
+                this.panDelta = new THREE.Vector2();
+
+                this.init();
+            }
+
+            init() {
+                // Scene
+                this.scene = new THREE.Scene();
+                this.scene.background = new THREE.Color(0x1a1a2e);
+
+                // Camera with extended clipping planes
+                const aspect = window.innerWidth / window.innerHeight;
+                this.camera = new THREE.PerspectiveCamera(60, aspect, 0.1, 2000);
+                this.camera.position.set(0, 10, 30);
+
+                // Renderer with performance optimizations
+                this.renderer = new THREE.WebGLRenderer({
+                    antialias: !this.lowPowerMode,
+                    powerPreference: 'high-performance',
+                    stencil: false,
+                    depth: true,
+                    alpha: true,
+                    logarithmicDepthBuffer: true  // Better depth precision to prevent z-fighting
+                });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                // Cap pixel ratio at 2 for performance
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                this.renderer.sortObjects = true;  // Ensure proper transparency sorting
+                this.container.appendChild(this.renderer.domElement);
+
+                // Controls with improved panning
+                this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+                this.controls.enableDamping = true;
+                this.controls.dampingFactor = 0.08;  // Snappier response
+                this.controls.minDistance = 5;
+                this.controls.maxDistance = 100;
+                this.controls.enablePan = true;
+                this.controls.panSpeed = 3.0;  // Much faster panning
+                this.controls.screenSpacePanning = true;  // Pan in screen space
+                this.controls.zoomSpeed = 1.2;  // Slightly faster zoom
+                // Configure mouse buttons: LEFT=rotate, MIDDLE=pan (more intuitive), RIGHT=pan
+                this.controls.mouseButtons = {
+                    LEFT: THREE.MOUSE.ROTATE,
+                    MIDDLE: THREE.MOUSE.PAN,
+                    RIGHT: THREE.MOUSE.PAN
+                };
+                // Touch controls - two finger pan/zoom
+                this.controls.touches = {
+                    ONE: THREE.TOUCH.ROTATE,
+                    TWO: THREE.TOUCH.DOLLY_PAN
+                };
+
+                // Add keyboard pan support (WASD and arrow keys)
+                this.keyPanSpeed = 0.5;
+                this.keysPressed = {};
+                document.addEventListener('keydown', (e) => {
+                    this.keysPressed[e.key.toLowerCase()] = true;
+                    // Shift+drag enables pan mode (handled by OrbitControls internally)
+                });
+                document.addEventListener('keyup', (e) => {
+                    this.keysPressed[e.key.toLowerCase()] = false;
+                });
+
+                // Request render when controls change
+                this.controls.addEventListener('change', () => {
+                    this.needsRender = true;
+                });
+                this.controls.addEventListener('start', () => {
+                    this.isInteracting = true;
+                    this.needsRender = true;
+                });
+                this.controls.addEventListener('end', () => {
+                    this.isInteracting = false;
+                });
+
+                // Lighting
+                const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+                this.scene.add(ambientLight);
+
+                const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+                directionalLight.position.set(10, 20, 10);
+                this.scene.add(directionalLight);
+
+                // Grid helper
+                const gridHelper = new THREE.GridHelper(50, 50, 0x4a4a6a, 0x2a2a4a);
+                gridHelper.position.y = -5;
+                this.scene.add(gridHelper);
+
+                // Event listeners
+                window.addEventListener('resize', () => this.onResize());
+                this.renderer.domElement.addEventListener('click', (e) => this.onClick(e));
+                this.renderer.domElement.addEventListener('dblclick', (e) => this.onDoubleClick(e));
+                this.renderer.domElement.addEventListener('mousemove', (e) => this.onMouseMove(e));
+
+                // Prevent context menu on right-click (allows smooth right-drag)
+                this.renderer.domElement.addEventListener('contextmenu', (e) => {
+                    e.preventDefault();
+                });
+
+                // Visibility change - pause rendering when tab not visible
+                document.addEventListener('visibilitychange', () => {
+                    this.isVisible = !document.hidden;
+                    if (this.isVisible) {
+                        this.needsRender = true;
+                        this.animate();
+                    }
+                });
+
+                // Detect system load - reduce quality if needed
+                this.setupPerformanceMonitor();
+
+                // Start render loop
+                this.animate();
+            }
+
+            setupPerformanceMonitor() {
+                let frameCount = 0;
+                let lastCheck = performance.now();
+
+                const checkPerformance = () => {
+                    const now = performance.now();
+                    const elapsed = now - lastCheck;
+
+                    if (elapsed >= 1000) {
+                        const fps = (frameCount * 1000) / elapsed;
+                        frameCount = 0;
+                        lastCheck = now;
+
+                        // Auto-adjust quality based on FPS
+                        if (fps < 20 && !this.lowPowerMode) {
+                            this.enableLowPowerMode();
+                        } else if (fps > 50 && this.lowPowerMode) {
+                            this.disableLowPowerMode();
+                        }
+                    }
+
+                    frameCount++;
+                    if (this.isVisible) {
+                        requestAnimationFrame(checkPerformance);
+                    }
+                };
+
+                requestAnimationFrame(checkPerformance);
+            }
+
+            enableLowPowerMode() {
+                this.lowPowerMode = true;
+                this.targetFPS = 30;
+                this.minFrameTime = 1000 / this.targetFPS;
+                // Note: Don't change pixel ratio - it can cause white screen flashing
+                console.log('TrueFlow: Low power mode enabled for better performance');
+            }
+
+            disableLowPowerMode() {
+                this.lowPowerMode = false;
+                this.targetFPS = 60;
+                this.minFrameTime = 1000 / this.targetFPS;
+                // Note: Don't change pixel ratio - it can cause white screen flashing
+                console.log('TrueFlow: Normal quality mode restored');
+            }
+
+            loadData(data, forceRecreate = false) {
+                // Create separate signatures for structure vs coverage
+                const structureSignature = JSON.stringify({
+                    functions: Object.keys(data.functions || {}).sort(),
+                    callGraph: Object.keys(data.call_graph || {}).sort()
+                });
+                const coverageSignature = JSON.stringify({
+                    covered: (data.covered_functions || []).sort(),
+                    dead: (data.dead_functions || []).sort()
+                });
+
+                // Check if only coverage changed (not structure)
+                const structureChanged = this.lastStructureSignature !== structureSignature;
+                const coverageChanged = this.lastCoverageSignature !== coverageSignature;
+
+                // Skip if nothing changed
+                if (!forceRecreate && !structureChanged && !coverageChanged && this.nodes.size > 0) {
+                    console.log('[Explorer] Data unchanged, skipping update');
+                    document.getElementById('loading').classList.add('hidden');
+                    this.needsRender = true;
+                    return;
+                }
+
+                this.data = data;
+
+                // Normalize: prefer resolved_call_graph over raw call_graph for better cross-class connections
+                if (data.resolved_call_graph && Object.keys(data.resolved_call_graph).length > 0) {
+                    console.log('[Explorer] Using resolved_call_graph for cross-class connections');
+                    this.data.call_graph = data.resolved_call_graph;
+                } else if (data.global_resolved_call_graph && Object.keys(data.global_resolved_call_graph).length > 0) {
+                    console.log('[Explorer] Using global_resolved_call_graph for cross-class connections');
+                    this.data.call_graph = data.global_resolved_call_graph;
+                }
+
+                // Ensure ALL functions from call graph exist in functions object
+                // Note: Call graph is already filtered at source (Python analyzer) to only include project functions
+                const callGraph = this.data.call_graph || {};
+                const functions = this.data.functions || {};
+                const coveredSet = new Set(this.data.covered_functions || []);
+                const deadList = this.data.dead_functions || [];
+                let staticAdded = 0;
+
+                // Add any functions from call graph that aren't in functions object
+                // (These are project functions discovered by static analysis but not yet in the functions list)
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    // Add caller if not exists
+                    if (!functions[caller]) {
+                        functions[caller] = {
+                            name: caller.split('.').pop() || caller,
+                            line: 0,
+                            file: '',
+                            branches: [],
+                            isStatic: true
+                        };
+                        if (!coveredSet.has(caller) && !deadList.includes(caller)) {
+                            deadList.push(caller);
+                        }
+                        staticAdded++;
+                    }
+                    // Add callees if not exist
+                    callees.forEach(callee => {
+                        if (!functions[callee]) {
+                            functions[callee] = {
+                                name: callee.split('.').pop() || callee,
+                                line: 0,
+                                file: '',
+                                branches: [],
+                                isStatic: true
+                            };
+                            if (!coveredSet.has(callee) && !deadList.includes(callee)) {
+                                deadList.push(callee);
+                            }
+                            staticAdded++;
+                        }
+                    });
+                });
+
+                this.data.functions = functions;
+                this.data.dead_functions = deadList;
+                if (staticAdded > 0) {
+                    console.log('[Explorer] Added', staticAdded, 'static functions from call graph');
+                }
+
+                // Debug: Log data state
+                console.log('[Explorer] Functions:', Object.keys(this.data.functions).length);
+                console.log('[Explorer] Call graph callers:', Object.keys(this.data.call_graph || {}).length);
+                console.log('[Explorer] Call graph:', this.data.call_graph);
+                console.log('[Explorer] Covered:', this.data.covered_functions?.length || 0);
+                console.log('[Explorer] Dead:', this.data.dead_functions?.length || 0);
+                console.log('[Explorer] WhyNotCovered:', Object.keys(this.data.why_not_covered || {}).length);
+
+                // If only coverage changed, do incremental update (repaint ALL changed elements)
+                if (!forceRecreate && !structureChanged && coverageChanged && this.nodes.size > 0) {
+                    console.log('[Explorer] Coverage changed, repainting all changed elements...');
+                    this.lastCoverageSignature = coverageSignature;
+                    this.repaintAllElements();
+                    this.updateStats();
+                    document.getElementById('loading').classList.add('hidden');
+                    this.needsRender = true;
+                    console.log('[Explorer] Incremental repaint complete');
+                    return;
+                }
+
+                // Full recreation needed (structure changed or first load)
+                console.log('[Explorer] Creating visualization...');
+                this.lastStructureSignature = structureSignature;
+                this.lastCoverageSignature = coverageSignature;
+                this.clearScene();
+                this.createVisualization();
+                this.updateStats();
+                document.getElementById('loading').classList.add('hidden');
+                this.needsRender = true;
+                console.log('[Explorer] Visualization ready');
+            }
+
+            // Repaint ALL nodes, edges, and containers without recreating geometry
+            repaintAllElements() {
+                const coveredFunctions = new Set(this.data.covered_functions || []);
+                const deadFunctions = new Set(this.data.dead_functions || []);
+                const callGraph = this.data.call_graph || {};
+                const functions = this.data.functions || {};
+                const whyNotCovered = this.data.why_not_covered || {};
+                const prevCovered = this.prevCoveredFunctions || new Set();
+
+                let nodesRepainted = 0;
+                let edgesRepainted = 0;
+
+                // Repaint ALL nodes
+                this.nodes.forEach((node, name) => {
+                    const wasAlive = prevCovered.has(name);
+                    const isAlive = coveredFunctions.has(name);
+                    const isDead = deadFunctions.has(name);
+                    const statusChanged = wasAlive !== isAlive;
+
+                    // Analyze why not covered if dead
+                    let whyInfo = whyNotCovered[name] || null;
+                    if (isDead && !whyInfo) {
+                        whyInfo = this.analyzeDisconnection(name, callGraph, coveredFunctions, deadFunctions, functions);
+                    }
+                    const deadType = isDead && whyInfo ? (whyInfo.root_cause || whyInfo.rootCause) : null;
+
+                    // Determine color
+                    let color;
+                    let opacity = 1.0;
+                    if (isDead) {
+                        color = deadType === 'NO_CALL_SITES' ? 0xef4444 : 0xa78bfa;
+                        opacity = 0.7;
+                    } else if (isAlive) {
+                        color = 0x4ade80;
+                    } else {
+                        color = 0x888888;
+                        opacity = 0.5;
+                    }
+
+                    // Always repaint
+                    node.material.color.setHex(color);
+                    node.material.opacity = opacity;
+                    node.material.needsUpdate = true;
+
+                    // Update userData
+                    node.userData.isAlive = isAlive;
+                    node.userData.isDead = isDead;
+                    node.userData.deadType = deadType;
+                    node.userData.whyNotCovered = whyInfo;
+                    node.userData.statusChanged = statusChanged;
+
+                    if (statusChanged) nodesRepainted++;
+                });
+
+                // Repaint ALL edges
+                let edgeIndex = 0;
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    const callerNode = this.nodes.get(caller);
+                    if (!callerNode) return;
+
+                    callees.forEach((callee) => {
+                        const calleeNode = this.nodes.get(callee);
+                        if (!calleeNode || edgeIndex >= this.edges.length) return;
+
+                        const edge = this.edges[edgeIndex];
+                        const calleeData = calleeNode.userData;
+                        const callerData = callerNode.userData;
+
+                        let edgeColor = 0x4a4a6a;
+                        let edgeOpacity = 0.4;
+
+                        if (callerData.isAlive && calleeData.isAlive) {
+                            edgeColor = 0x4ade80;  // Green for active path
+                            edgeOpacity = 0.9;
+                        } else if (callerData.isAlive && calleeData.isDead) {
+                            edgeColor = 0xa78bfa;  // Purple for dead branch
+                            edgeOpacity = 0.8;
+                        } else if (!callerData.isAlive && !calleeData.isAlive) {
+                            edgeColor = 0x4a4a6a;  // Gray for inactive
+                            edgeOpacity = 0.3;
+                        }
+
+                        edge.material.color.setHex(edgeColor);
+                        edge.material.opacity = edgeOpacity;
+                        edge.material.needsUpdate = true;
+                        edgesRepainted++;
+                        edgeIndex++;
+                    });
+                });
+
+                // Repaint ALL class containers
+                if (this.classContainers) {
+                    this.classContainers.forEach(container => {
+                        const className = container.userData?.className;
+                        if (!className || !this.classInfo[className]) return;
+
+                        const methods = this.classInfo[className].methods || [];
+                        const coveredMethods = methods.filter(m => coveredFunctions.has(m.fullName));
+                        const nonInitCovered = coveredMethods.filter(m =>
+                            m.methodName !== '__init__' && m.methodName !== 'constructor'
+                        );
+                        const totalNonInit = methods.filter(m =>
+                            m.methodName !== '__init__' && m.methodName !== 'constructor'
+                        ).length;
+
+                        const isFullyDead = nonInitCovered.length === 0 && totalNonInit > 0;
+                        const isPartiallyDead = nonInitCovered.length < totalNonInit && nonInitCovered.length > 0;
+
+                        let containerColor;
+                        if (isFullyDead) {
+                            containerColor = 0xef4444;
+                        } else if (isPartiallyDead) {
+                            containerColor = 0xfbbf24;
+                        } else {
+                            containerColor = 0x4ade80;
+                        }
+
+                        container.material.color.setHex(containerColor);
+                        container.material.needsUpdate = true;
+                        // Update wireframe color too
+                        if (container.children[0] && container.children[0].material) {
+                            container.children[0].material.color.setHex(containerColor);
+                            container.children[0].material.needsUpdate = true;
+                        }
+                    });
+                }
+
+                // Store current coverage for next comparison
+                this.prevCoveredFunctions = new Set(coveredFunctions);
+
+                console.log(`[Explorer] Repainted ${nodesRepainted} changed nodes, ${edgesRepainted} edges`);
+            }
+
+            clearScene() {
+                // Remove existing nodes and edges
+                this.nodes.forEach((mesh) => {
+                    this.scene.remove(mesh);
+                });
+                this.nodes.clear();
+
+                this.edges.forEach((line) => {
+                    this.scene.remove(line);
+                });
+                this.edges = [];
+
+                // Remove class containers
+                if (this.classContainers) {
+                    this.classContainers.forEach((container) => {
+                        this.scene.remove(container);
+                    });
+                    this.classContainers = [];
+                }
+
+                // Remove branch point markers
+                if (this.branchPointMarkers) {
+                    this.branchPointMarkers.forEach((marker) => {
+                        this.scene.remove(marker);
+                    });
+                    this.branchPointMarkers = [];
+                }
+
+                // Remove entry point markers
+                if (this.entryPointMarkers) {
+                    this.entryPointMarkers.forEach((marker) => {
+                        this.scene.remove(marker);
+                    });
+                    this.entryPointMarkers = [];
+                }
+
+                this.classInfo = {};
+                this.entryPoints = new Set();
+            }
+
+            // Analyze why a dead function is not being called by tracing the call graph
+            analyzeDisconnection(funcName, callGraph, coveredFunctions, deadFunctions, functions) {
+                // Build reverse call graph (who calls whom)
+                const reverseGraph = {};
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    callees.forEach(callee => {
+                        if (!reverseGraph[callee]) reverseGraph[callee] = [];
+                        reverseGraph[callee].push(caller);
+                    });
+                });
+
+                console.log('[analyzeDisconnection] funcName:', funcName);
+                console.log('[analyzeDisconnection] reverseGraph keys:', Object.keys(reverseGraph));
+                console.log('[analyzeDisconnection] callers for', funcName, ':', reverseGraph[funcName]);
+
+                const analysis = {
+                    root_cause: null,
+                    root_cause_detail: null,
+                    reasons: [],
+                    chain: []
+                };
+
+                // Find potential callers
+                const potentialCallers = reverseGraph[funcName] || [];
+
+                if (potentialCallers.length === 0) {
+                    // No one calls this function
+                    analysis.root_cause = 'NO_CALL_SITES';
+                    analysis.reasons.push({
+                        type: 'orphan',
+                        explanation: `No call sites found for ${funcName}. This function is never called anywhere in the traced code.`
+                    });
+                    return analysis;
+                }
+
+                // Check if any caller is covered
+                const coveredCallers = potentialCallers.filter(c => coveredFunctions.has(c));
+                const deadCallers = potentialCallers.filter(c => deadFunctions.has(c));
+
+                if (coveredCallers.length > 0) {
+                    // A covered function should have called us but didn't - this is a branch decision
+                    analysis.root_cause = 'BRANCH_NOT_TAKEN';
+                    const caller = coveredCallers[0];
+                    const callerInfo = functions[caller] || {};
+
+                    // Try to find branch information
+                    let branchInfo = '';
+                    let branchLine = callerInfo.line || 'unknown';
+                    if (callerInfo.branches && callerInfo.branches.length > 0) {
+                        const branch = callerInfo.branches.find(b =>
+                            b.target === funcName || (b.false_branch && b.false_branch.includes(funcName))
+                        );
+                        if (branch) {
+                            branchInfo = branch.condition || 'conditional check';
+                            branchLine = branch.line || branchLine;
+                        } else {
+                            branchInfo = `conditional in ${caller}`;
+                        }
+                    } else {
+                        branchInfo = `call to ${funcName} not reached`;
+                    }
+
+                    analysis.root_cause_detail = {
+                        caller: caller,
+                        branch_condition: branchInfo,
+                        branch_line: branchLine,
+                        covered_callers: coveredCallers
+                    };
+
+                    analysis.reasons.push({
+                        type: 'branch_not_taken',
+                        explanation: `${caller} (covered) could call ${funcName}, but the branch was not taken. Chain: ${caller} → ${funcName}`
+                    });
+
+                    analysis.chain = [caller, funcName];
+                    return analysis;
+                }
+
+                // All callers are also dead - trace up the chain to find root cause
+                // BFS to find the closest covered ancestor or entry point
+                const visited = new Set();
+                const queue = [[funcName]];  // Each item is a path
+
+                while (queue.length > 0) {
+                    const path = queue.shift();
+                    const current = path[0];
+
+                    if (visited.has(current)) continue;
+                    visited.add(current);
+
+                    const callers = reverseGraph[current] || [];
+
+                    if (callers.length === 0) {
+                        // This is an entry point that was never called
+                        analysis.root_cause = 'UNREACHABLE_FROM_ENTRY';
+                        analysis.reasons.push({
+                            type: 'unreachable',
+                            explanation: `Entry point ${current} was never executed. Chain: ${path.reverse().join(' → ')}`
+                        });
+                        analysis.chain = path;
+                        return analysis;
+                    }
+
+                    for (const caller of callers) {
+                        if (coveredFunctions.has(caller)) {
+                            // Found the disconnection point!
+                            const fullPath = [caller, ...path];
+                            analysis.root_cause = 'BRANCH_NOT_TAKEN';
+                            const callerInfo = functions[caller] || {};
+
+                            let branchInfo = `conditional call to ${current}`;
+                            let branchLine = callerInfo.line || 'unknown';
+
+                            if (callerInfo.branches && callerInfo.branches.length > 0) {
+                                const branch = callerInfo.branches[0];
+                                branchInfo = branch.condition || branchInfo;
+                                branchLine = branch.line || branchLine;
+                            }
+
+                            analysis.root_cause_detail = {
+                                caller: caller,
+                                target: current,
+                                branch_condition: branchInfo,
+                                branch_line: branchLine
+                            };
+
+                            analysis.reasons.push({
+                                type: 'branch_not_taken',
+                                explanation: `${caller} (covered) did not call ${current}. Chain: ${fullPath.join(' → ')}`
+                            });
+
+                            analysis.chain = fullPath;
+                            return analysis;
+                        }
+
+                        if (!visited.has(caller)) {
+                            queue.push([caller, ...path]);
+                        }
+                    }
+                }
+
+                // Couldn't determine root cause
+                analysis.root_cause = 'UNKNOWN';
+                analysis.reasons.push({
+                    type: 'unknown',
+                    explanation: `Could not trace why ${funcName} is not covered.`
+                });
+                return analysis;
+            }
+
+            createVisualization() {
+                if (!this.data) return;
+
+                const functions = this.data.functions || {};
+                const callGraph = this.data.call_graph || {};
+                const coveredFunctions = new Set(this.data.covered_functions || []);
+                const deadFunctions = new Set(this.data.dead_functions || []);
+                const whyNotCovered = this.data.why_not_covered || {};
+
+                // Build reverse call graph to find callers for each function
+                const reverseCallGraph = {};
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    callees.forEach(callee => {
+                        if (!reverseCallGraph[callee]) {
+                            reverseCallGraph[callee] = [];
+                        }
+                        reverseCallGraph[callee].push(caller);
+                    });
+                });
+
+                // Identify "entry points" - covered functions with no covered caller
+                // These are either true entry points or have filtered-out callers
+                this.entryPoints = new Set();
+                coveredFunctions.forEach(func => {
+                    const callers = reverseCallGraph[func] || [];
+                    const hasCoveredCaller = callers.some(c => coveredFunctions.has(c));
+                    if (!hasCoveredCaller) {
+                        this.entryPoints.add(func);
+                    }
+                });
+                console.log('[Explorer] Entry points (covered with no covered caller):', this.entryPoints.size);
+
+                // Group functions by class (detect ClassName.method pattern)
+                const classFunctions = {};  // className -> [functionNames]
+                const standaloneFunctions = [];
+
+                Object.keys(functions).forEach(name => {
+                    const dotIndex = name.lastIndexOf('.');
+                    if (dotIndex > 0) {
+                        const className = name.substring(0, dotIndex);
+                        const methodName = name.substring(dotIndex + 1);
+                        if (!classFunctions[className]) {
+                            classFunctions[className] = [];
+                        }
+                        classFunctions[className].push({ fullName: name, methodName });
+                    } else {
+                        standaloneFunctions.push(name);
+                    }
+                });
+
+                // Calculate class coverage status
+                this.classInfo = {};  // Store for stats
+                Object.entries(classFunctions).forEach(([className, methods]) => {
+                    const coveredMethods = methods.filter(m => coveredFunctions.has(m.fullName));
+                    const nonInitCovered = coveredMethods.filter(m =>
+                        m.methodName !== '__init__' && m.methodName !== 'constructor'
+                    );
+                    const totalNonInit = methods.filter(m =>
+                        m.methodName !== '__init__' && m.methodName !== 'constructor'
+                    ).length;
+
+                    this.classInfo[className] = {
+                        methods: methods,
+                        totalMethods: methods.length,
+                        coveredMethods: coveredMethods.length,
+                        isFullyDead: nonInitCovered.length === 0 && totalNonInit > 0,
+                        isPartiallyDead: nonInitCovered.length < totalNonInit && nonInitCovered.length > 0
+                    };
+                });
+
+                // Layout: hierarchical based on call depth, but group classes
+                const positions = this.calculateLayoutWithClasses(functions, callGraph, classFunctions);
+
+                // Create nodes
+                Object.entries(functions).forEach(([name, info]) => {
+                    const pos = positions[name] || { x: 0, y: 0, z: 0 };
+                    const isAlive = coveredFunctions.has(name);
+                    const isDead = deadFunctions.has(name);
+                    const hasBranches = (info.branches || []).length > 0;
+
+                    // For dead functions, analyze why they're not covered if server didn't provide info
+                    let whyInfo = whyNotCovered[name] || null;
+                    if (isDead && !whyInfo) {
+                        whyInfo = this.analyzeDisconnection(name, callGraph, coveredFunctions, deadFunctions, functions);
+                    }
+
+                    // Determine dead code type for coloring
+                    // RED: no callers at all (NO_CALL_SITES)
+                    // PURPLE: dead due to branch not taken or unreachable chain
+                    let deadType = null;
+                    if (isDead && whyInfo) {
+                        deadType = whyInfo.root_cause || whyInfo.rootCause;
+                        console.log('[Node]', name, '-> deadType:', deadType, 'whyInfo:', whyInfo);
+                    }
+
+                    if (isDead) {
+                        console.log('[DeadNode]', name, 'deadType:', deadType, 'hasWhyInfo:', !!whyInfo);
+                    }
+
+                    const node = this.createNode(name, info, pos, isAlive, isDead, hasBranches, deadType);
+                    node.userData = {
+                        name,
+                        info,
+                        isAlive,
+                        isDead,
+                        deadType,
+                        whyNotCovered: whyInfo
+                    };
+
+                    this.nodes.set(name, node);
+                    this.scene.add(node);
+                });
+
+                // Create class containers (transparent boxes around class methods)
+                this.classContainers = [];
+                Object.entries(classFunctions).forEach(([className, methods]) => {
+                    if (methods.length >= 1) {
+                        const container = this.createClassContainer(className, methods, positions);
+                        if (container) {
+                            this.classContainers.push(container);
+                            this.scene.add(container);
+                        }
+                    }
+                });
+
+                // Create edges (call relationships)
+                this.branchPointMarkers = [];  // Track branch divergence points
+
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    const callerNode = this.nodes.get(caller);
+                    if (!callerNode) return;
+
+                    callees.forEach((callee) => {
+                        const calleeNode = this.nodes.get(callee);
+                        if (!calleeNode) return;
+
+                        // Determine edge color based on callee status
+                        const calleeData = calleeNode.userData;
+                        const callerData = callerNode.userData;
+                        let edgeColor = 0x4a4a6a;  // Default gray
+                        let isBranchPoint = false;
+
+                        if (callerData.isAlive && calleeData.isDead) {
+                            // BRANCH POINT: Caller executed but didn't call this path
+                            edgeColor = 0xa78bfa;  // Purple for dead branch edges
+                            isBranchPoint = true;
+                        } else if (calleeData.isDead && !callerData.isAlive) {
+                            // Both dead - cascade from another dead branch
+                            edgeColor = 0x6b7280;  // Darker gray for cascading dead
+                        } else if (callerData.isAlive && calleeData.isAlive) {
+                            edgeColor = 0x4ade80;  // Green for active call paths
+                        }
+
+                        const edge = this.createEdge(callerNode, calleeNode, edgeColor);
+                        this.edges.push(edge);
+                        this.scene.add(edge);
+
+                        // Add branch point marker (diamond) where execution diverged
+                        if (isBranchPoint) {
+                            const branchMarker = this.createBranchPointMarker(callerNode, calleeNode);
+                            this.branchPointMarkers.push(branchMarker);
+                            this.scene.add(branchMarker);
+                        }
+                    });
+                });
+
+                // Add entry point markers - incoming arrows for covered functions with no covered callers
+                this.entryPointMarkers = [];
+                this.entryPoints.forEach(funcName => {
+                    const node = this.nodes.get(funcName);
+                    if (node) {
+                        const marker = this.createEntryPointMarker(node);
+                        this.entryPointMarkers.push(marker);
+                        this.scene.add(marker);
+                    }
+                });
+                console.log('[Explorer] Created', this.entryPointMarkers.length, 'entry point markers');
+
+                // Center camera on scene
+                this.centerCamera();
+            }
+
+            // Create an entry point marker (downward arrow indicating function was called from outside)
+            createEntryPointMarker(node) {
+                const group = new THREE.Group();
+                const pos = node.position;
+
+                // Create a vertical line coming down to the node
+                const lineGeometry = new THREE.BufferGeometry();
+                const lineHeight = 2.5;
+                const points = [
+                    new THREE.Vector3(pos.x, pos.y + lineHeight, pos.z),
+                    new THREE.Vector3(pos.x, pos.y + 0.8, pos.z)  // Stop just above node
+                ];
+                lineGeometry.setFromPoints(points);
+
+                const lineMaterial = new THREE.LineBasicMaterial({
+                    color: 0x4ade80,  // Green
+                    linewidth: 2,
+                    transparent: true,
+                    opacity: 0.9
+                });
+                const line = new THREE.Line(lineGeometry, lineMaterial);
+                group.add(line);
+
+                // Create arrow head (cone pointing down)
+                const coneGeometry = new THREE.ConeGeometry(0.15, 0.4, 8);
+                const coneMaterial = new THREE.MeshBasicMaterial({
+                    color: 0x4ade80,
+                    transparent: true,
+                    opacity: 0.9
+                });
+                const cone = new THREE.Mesh(coneGeometry, coneMaterial);
+                cone.position.set(pos.x, pos.y + 0.7, pos.z);
+                cone.rotation.x = Math.PI;  // Point downward
+                group.add(cone);
+
+                // Add small "entry" label or circle at top
+                const circleGeometry = new THREE.CircleGeometry(0.2, 16);
+                const circleMaterial = new THREE.MeshBasicMaterial({
+                    color: 0x4ade80,
+                    transparent: true,
+                    opacity: 0.8,
+                    side: THREE.DoubleSide
+                });
+                const circle = new THREE.Mesh(circleGeometry, circleMaterial);
+                circle.position.set(pos.x, pos.y + lineHeight + 0.3, pos.z);
+                group.add(circle);
+
+                return group;
+            }
+
+            createClassContainer(className, methods, positions) {
+                // Calculate bounding box for class methods
+                let minX = Infinity, maxX = -Infinity;
+                let minY = Infinity, maxY = -Infinity;
+                let minZ = Infinity, maxZ = -Infinity;
+
+                methods.forEach(m => {
+                    const pos = positions[m.fullName];
+                    if (pos) {
+                        minX = Math.min(minX, pos.x - 1);
+                        maxX = Math.max(maxX, pos.x + 1);
+                        minY = Math.min(minY, pos.y - 1);
+                        maxY = Math.max(maxY, pos.y + 1);
+                        minZ = Math.min(minZ, pos.z - 0.5);
+                        maxZ = Math.max(maxZ, pos.z + 0.5);
+                    }
+                });
+
+                if (minX === Infinity) return null;
+
+                // Add padding
+                const padding = 1.5;
+                minX -= padding; maxX += padding;
+                minY -= padding; maxY += padding;
+                minZ -= padding; maxZ += padding;
+
+                const width = maxX - minX;
+                const height = maxY - minY;
+                const depth = maxZ - minZ;
+
+                // Determine container color based on class status
+                const classStatus = this.classInfo[className];
+                let containerColor, opacity;
+                if (classStatus && classStatus.isFullyDead) {
+                    containerColor = 0xef4444;  // Red for fully dead class
+                    opacity = 0.15;
+                } else if (classStatus && classStatus.isPartiallyDead) {
+                    containerColor = 0xfbbf24;  // Yellow for partially dead
+                    opacity = 0.1;
+                } else {
+                    containerColor = 0x4ade80;  // Green for fully covered
+                    opacity = 0.08;
+                }
+
+                // Create transparent box
+                const geometry = new THREE.BoxGeometry(width, height, depth);
+                const material = new THREE.MeshBasicMaterial({
+                    color: containerColor,
+                    transparent: true,
+                    opacity: opacity,
+                    side: THREE.DoubleSide,
+                    depthWrite: false  // Prevent z-fighting with nodes inside container
+                });
+
+                const container = new THREE.Mesh(geometry, material);
+                container.position.set(
+                    (minX + maxX) / 2,
+                    (minY + maxY) / 2,
+                    (minZ + maxZ) / 2
+                );
+                container.frustumCulled = false;  // Prevent container disappearing
+                container.renderOrder = -1;  // Render containers first (behind nodes)
+
+                // Add wireframe edges
+                const edgesGeometry = new THREE.EdgesGeometry(geometry);
+                const edgesMaterial = new THREE.LineBasicMaterial({
+                    color: containerColor,
+                    transparent: true,
+                    opacity: 0.5
+                });
+                const wireframe = new THREE.LineSegments(edgesGeometry, edgesMaterial);
+                wireframe.frustumCulled = false;
+                container.add(wireframe);
+
+                // Add class label above the container
+                const canvas = document.createElement('canvas');
+                const context = canvas.getContext('2d');
+                canvas.width = 512;
+                canvas.height = 64;
+
+                // Extract just the class name (last part after dots)
+                const displayClassName = className.includes('.')
+                    ? className.split('.').pop()
+                    : className;
+
+                context.fillStyle = classStatus && classStatus.isFullyDead ? '#ef4444' : '#7dd3fc';
+                // Adjust font size based on name length
+                const fontSize = displayClassName.length > 15 ? 22 : 28;
+                context.font = `bold ${fontSize}px sans-serif`;
+                context.textAlign = 'center';
+                context.textBaseline = 'middle';
+                context.fillText(displayClassName, 256, 32);
+
+                const texture = new THREE.CanvasTexture(canvas);
+                const spriteMaterial = new THREE.SpriteMaterial({ map: texture, transparent: true });
+                const sprite = new THREE.Sprite(spriteMaterial);
+                sprite.position.set(0, height / 2 + 2, 0);
+                sprite.scale.set(8, 1, 1);  // Larger label
+                sprite.frustumCulled = false;  // Prevent label disappearing
+                container.add(sprite);
+
+                // Store class info in userData
+                container.userData = {
+                    isClassContainer: true,
+                    className: className,
+                    classInfo: classStatus
+                };
+
+                return container;
+            }
+
+            calculateLayoutWithClasses(functions, callGraph, classFunctions) {
+                const positions = {};
+
+                // First, group by class and calculate class positions
+                let classIndex = 0;
+                const classWidth = 12;  // Space for each class horizontally
+
+                Object.entries(classFunctions).forEach(([className, methods]) => {
+                    const classX = classIndex * classWidth;
+
+                    // Arrange methods vertically within the class (deterministic positions)
+                    methods.forEach((m, methodIndex) => {
+                        positions[m.fullName] = {
+                            x: classX + (methodIndex % 2) * 3,  // 2 columns
+                            y: -Math.floor(methodIndex / 2) * 3,  // Stack vertically
+                            z: 0  // Fixed Z position within class
+                        };
+                    });
+
+                    classIndex++;
+                });
+
+                // Place standalone functions after classes
+                const standaloneStartX = classIndex * classWidth + 5;
+                Object.keys(functions).forEach((name, index) => {
+                    if (!positions[name]) {
+                        positions[name] = {
+                            x: standaloneStartX + (index % 4) * 4,
+                            y: -Math.floor(index / 4) * 4,
+                            z: 0  // Fixed Z position
+                        };
+                    }
+                });
+
+                return positions;
+            }
+
+            calculateLayout(functions, callGraph) {
+                const positions = {};
+                const levels = {};  // function -> depth level
+                const processed = new Set();
+
+                // Find root functions (not called by anyone)
+                const allCallees = new Set();
+                Object.values(callGraph).forEach(callees => {
+                    callees.forEach(c => allCallees.add(c));
+                });
+
+                const roots = Object.keys(functions).filter(f => !allCallees.has(f));
+
+                // BFS to assign levels
+                const queue = roots.map(r => ({ name: r, level: 0 }));
+                roots.forEach(r => { levels[r] = 0; processed.add(r); });
+
+                while (queue.length > 0) {
+                    const { name, level } = queue.shift();
+                    const callees = callGraph[name] || [];
+
+                    callees.forEach(callee => {
+                        if (!processed.has(callee)) {
+                            levels[callee] = level + 1;
+                            processed.add(callee);
+                            queue.push({ name: callee, level: level + 1 });
+                        }
+                    });
+                }
+
+                // Assign unprocessed functions
+                Object.keys(functions).forEach(f => {
+                    if (!processed.has(f)) {
+                        levels[f] = 0;
+                    }
+                });
+
+                // Group by level
+                const levelGroups = {};
+                Object.entries(levels).forEach(([name, level]) => {
+                    if (!levelGroups[level]) levelGroups[level] = [];
+                    levelGroups[level].push(name);
+                });
+
+                // Calculate positions
+                const levelSpacing = 5;
+                const nodeSpacing = 4;
+
+                Object.entries(levelGroups).forEach(([level, funcs]) => {
+                    const y = -parseInt(level) * levelSpacing;
+                    const startX = -(funcs.length - 1) * nodeSpacing / 2;
+
+                    funcs.forEach((name, i) => {
+                        positions[name] = {
+                            x: startX + i * nodeSpacing,
+                            y: y,
+                            z: (Math.random() - 0.5) * 2  // Slight z variation
+                        };
+                    });
+                });
+
+                return positions;
+            }
+
+            createNode(name, info, position, isAlive, isDead, hasBranches, deadType = null) {
+                // Determine color based on status
+                // Partially covered = alive + has branches (some branches may not have been taken)
+                const isPartial = isAlive && hasBranches;
+
+                let color;
+                let colorName;
+                if (isDead) {
+                    // RED (0xef4444): No callers at all - truly orphaned/unused code
+                    // PURPLE (0xa78bfa): Dead due to branch not taken or unreachable chain
+                    if (deadType === 'NO_CALL_SITES') {
+                        color = 0xef4444;  // Red - no one calls this function at all
+                        colorName = 'RED (NO_CALL_SITES)';
+                    } else if (deadType === 'BRANCH_NOT_TAKEN' || deadType === 'UNREACHABLE_FROM_ENTRY') {
+                        color = 0xa78bfa;  // Purple - dead branch (parent was covered but didn't call)
+                        colorName = 'PURPLE (BRANCH_NOT_TAKEN)';
+                    } else {
+                        color = 0xa78bfa;  // Default to purple for analyzed dead code
+                        colorName = 'PURPLE (default dead)';
+                    }
+                    console.log('[createNode]', name, '-> color:', colorName, 'deadType:', deadType);
+                } else if (isPartial) {
+                    color = 0xfbbf24;  // Yellow/amber for partially covered
+                    colorName = 'AMBER (partial)';
+                } else if (isAlive) {
+                    color = 0x4ade80;  // Green for fully covered (no branches)
+                    colorName = 'GREEN (alive)';
+                } else {
+                    color = 0x888888;  // Gray for unknown
+                    colorName = 'GRAY (unknown)';
+                }
+
+                // Create geometry (box for regular, octahedron for branch points)
+                let geometry;
+                if (hasBranches) {
+                    geometry = new THREE.OctahedronGeometry(0.8);
+                } else {
+                    geometry = new THREE.BoxGeometry(1.5, 0.8, 0.8);
+                }
+
+                const material = new THREE.MeshLambertMaterial({
+                    color: color,
+                    transparent: true,
+                    opacity: isDead ? 0.7 : 1.0
+                });
+
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.position.set(position.x, position.y, position.z);
+                mesh.frustumCulled = false;  // Prevent disappearing at certain angles
+                mesh.renderOrder = 1;  // Render nodes after containers
+
+                // Add text label
+                const canvas = document.createElement('canvas');
+                const context = canvas.getContext('2d');
+                canvas.width = 256;
+                canvas.height = 64;
+
+                context.fillStyle = '#1a1a2e';
+                context.fillRect(0, 0, canvas.width, canvas.height);
+
+                context.font = '24px sans-serif';
+                context.fillStyle = '#ffffff';
+                context.textAlign = 'center';
+                context.textBaseline = 'middle';
+
+                // Show method name for Class.method patterns, otherwise truncate
+                let displayName = name;
+                const dotIndex = name.lastIndexOf('.');
+                if (dotIndex > 0) {
+                    // Show just the method name for class methods
+                    displayName = name.substring(dotIndex + 1);
+                }
+                // Truncate if still too long
+                if (displayName.length > 18) {
+                    displayName = displayName.slice(0, 15) + '...';
+                }
+                context.fillText(displayName, 128, 32);
+
+                const texture = new THREE.CanvasTexture(canvas);
+                const spriteMaterial = new THREE.SpriteMaterial({ map: texture });
+                const sprite = new THREE.Sprite(spriteMaterial);
+                sprite.position.set(0, 1.2, 0);
+                sprite.scale.set(3, 0.75, 1);
+                sprite.frustumCulled = false;  // Prevent label disappearing
+                mesh.add(sprite);
+
+                return mesh;
+            }
+
+            createEdge(fromNode, toNode, edgeColor = 0x4a4a6a) {
+                // Orthogonal edge routing - only horizontal and vertical lines (no diagonals)
+                const from = fromNode.position.clone();
+                const to = toNode.position.clone();
+
+                // Calculate midpoint Y for orthogonal routing
+                const midY = from.y + (to.y - from.y) / 2;
+
+                // Create orthogonal path: down -> horizontal -> down
+                const points = [
+                    new THREE.Vector3(from.x, from.y, from.z),
+                    new THREE.Vector3(from.x, midY, from.z),
+                    new THREE.Vector3(to.x, midY, to.z),
+                    new THREE.Vector3(to.x, to.y, to.z)
+                ];
+
+                const geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+                const material = new THREE.LineBasicMaterial({
+                    color: edgeColor,
+                    transparent: true,
+                    opacity: edgeColor === 0x4a4a6a ? 0.6 : 0.8  // More visible for colored edges
+                });
+
+                const line = new THREE.Line(geometry, material);
+                line.frustumCulled = false;  // Prevent edge disappearing
+                return line;
+            }
+
+            createBranchPointMarker(fromNode, toNode) {
+                // Create a diamond marker at the branch divergence point
+                // Position at the first bend of the orthogonal path (where caller goes down then horizontal)
+                const from = fromNode.position.clone();
+                const to = toNode.position.clone();
+                const midY = from.y + (to.y - from.y) / 2;
+
+                const position = new THREE.Vector3(from.x, midY, from.z);
+                position.z += 0.5;  // Lift slightly above edge
+
+                // Diamond shape (octahedron scaled flat)
+                const geometry = new THREE.OctahedronGeometry(0.3);
+                geometry.scale(1, 0.5, 1);
+
+                const material = new THREE.MeshLambertMaterial({
+                    color: 0xfbbf24,  // Amber for branch point warning
+                    transparent: true,
+                    opacity: 0.9,
+                    emissive: 0xfbbf24,
+                    emissiveIntensity: 0.3
+                });
+
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.position.copy(position);
+                mesh.frustumCulled = false;  // Prevent marker disappearing
+
+                // Store reference to connected nodes for tooltip
+                mesh.userData = {
+                    type: 'branchPoint',
+                    caller: fromNode.userData.name,
+                    deadCallee: toNode.userData.name,
+                    whyNotCovered: toNode.userData.whyNotCovered
+                };
+
+                return mesh;
+            }
+
+            centerCamera() {
+                if (this.nodes.size === 0) return;
+
+                // Calculate bounding box
+                let minX = Infinity, maxX = -Infinity;
+                let minY = Infinity, maxY = -Infinity;
+
+                this.nodes.forEach(node => {
+                    minX = Math.min(minX, node.position.x);
+                    maxX = Math.max(maxX, node.position.x);
+                    minY = Math.min(minY, node.position.y);
+                    maxY = Math.max(maxY, node.position.y);
+                });
+
+                const centerX = (minX + maxX) / 2;
+                const centerY = (minY + maxY) / 2;
+                const width = maxX - minX;
+                const height = maxY - minY;
+
+                this.camera.position.set(centerX, centerY + 10, Math.max(width, height) + 15);
+                this.controls.target.set(centerX, centerY, 0);
+                this.controls.update();
+                this.needsRender = true;  // Request render after camera move
+            }
+
+            updateStats() {
+                if (!this.data) return;
+
+                const functions = this.data.functions || {};
+                const coveredSet = new Set(this.data.covered_functions || []);
+
+                const total = Object.keys(functions).length;
+                const dead = (this.data.dead_functions || []).length;
+
+                // Count partially covered (covered + has branches) vs fully covered (covered + no branches)
+                let partial = 0;
+                let fullyCovered = 0;
+                coveredSet.forEach(name => {
+                    const info = functions[name];
+                    if (info && (info.branches || []).length > 0) {
+                        partial++;
+                    } else {
+                        fullyCovered++;
+                    }
+                });
+
+                const coverage = total > 0 ? Math.round(((fullyCovered + partial) / total) * 100) : 0;
+
+                document.getElementById('stat-total').textContent = total;
+                document.getElementById('stat-covered').textContent = fullyCovered;
+                document.getElementById('stat-partial').textContent = partial;
+                document.getElementById('stat-dead').textContent = dead;
+                document.getElementById('stat-coverage').textContent = coverage + '%';
+
+                // Class statistics
+                if (this.classInfo) {
+                    const totalClasses = Object.keys(this.classInfo).length;
+                    const deadClasses = Object.values(this.classInfo).filter(c => c.isFullyDead).length;
+                    document.getElementById('stat-classes').textContent = totalClasses;
+                    document.getElementById('stat-dead-classes').textContent = deadClasses;
+                }
+            }
+
+            onClick(event) {
+                this.updateMouse(event);
+                this.raycaster.setFromCamera(this.mouse, this.camera);
+
+                // Check for node clicks first
+                const meshes = Array.from(this.nodes.values());
+                const nodeIntersects = this.raycaster.intersectObjects(meshes);
+
+                if (nodeIntersects.length > 0) {
+                    const node = nodeIntersects[0].object;
+                    this.selectNode(node);
+                    // Center camera on clicked node
+                    this.focusOnNode(node);
+                    return;
+                }
+
+                // Check for class container clicks
+                if (this.classContainers && this.classContainers.length > 0) {
+                    const containerIntersects = this.raycaster.intersectObjects(this.classContainers);
+                    if (containerIntersects.length > 0) {
+                        const container = containerIntersects[0].object;
+                        // Center camera on class container
+                        this.focusOnNode(container);
+                        // Show class info in details panel
+                        if (container.userData && container.userData.className) {
+                            this.showClassDetails(container.userData.className);
+                        }
+                        return;
+                    }
+                }
+
+                this.deselectNode();
+            }
+
+            showClassDetails(className) {
+                const classData = this.classInfo[className];
+                if (!classData) return;
+
+                const panel = document.getElementById('details-panel');
+                panel.innerHTML = `
+                    <h3>${className}</h3>
+                    <p><strong>Methods:</strong> ${classData.totalMethods}</p>
+                    <p><strong>Covered:</strong> ${classData.coveredMethods}</p>
+                    <p><strong>Status:</strong> ${classData.isFullyDead ? 'Fully Dead' : classData.isPartiallyDead ? 'Partially Dead' : 'Active'}</p>
+                    <div style="margin-top: 10px;">
+                        <strong>Methods:</strong>
+                        <ul style="margin-top: 5px; padding-left: 20px;">
+                            ${classData.methods.map(m => `<li>${m.methodName}</li>`).join('')}
+                        </ul>
+                    </div>
+                `;
+            }
+
+            onDoubleClick(event) {
+                this.updateMouse(event);
+                this.raycaster.setFromCamera(this.mouse, this.camera);
+
+                const meshes = Array.from(this.nodes.values());
+                const intersects = this.raycaster.intersectObjects(meshes);
+
+                if (intersects.length > 0) {
+                    const node = intersects[0].object;
+                    this.focusOnNode(node);
+                }
+            }
+
+            onMouseMove(event) {
+                this.updateMouse(event);
+                this.raycaster.setFromCamera(this.mouse, this.camera);
+
+                const meshes = Array.from(this.nodes.values());
+                const intersects = this.raycaster.intersectObjects(meshes);
+
+                const tooltip = document.getElementById('tooltip');
+
+                if (intersects.length > 0) {
+                    const node = intersects[0].object;
+                    if (node !== this.hoveredNode) {
+                        this.hoveredNode = node;
+                        this.highlightNode(node, true);
+                    }
+
+                    // Show tooltip
+                    const data = node.userData;
+                    tooltip.innerHTML = data.name;
+                    tooltip.style.display = 'block';
+                    tooltip.style.left = event.clientX + 15 + 'px';
+                    tooltip.style.top = event.clientY + 15 + 'px';
+                } else {
+                    if (this.hoveredNode) {
+                        this.highlightNode(this.hoveredNode, false);
+                        this.hoveredNode = null;
+                    }
+                    tooltip.style.display = 'none';
+                }
+            }
+
+            updateMouse(event) {
+                const rect = this.renderer.domElement.getBoundingClientRect();
+                this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+                this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            }
+
+            selectNode(node) {
+                if (this.selectedNode) {
+                    this.selectedNode.material.emissive.setHex(0x000000);
+                }
+
+                this.selectedNode = node;
+                node.material.emissive.setHex(0x333333);
+
+                this.showInfoPanel(node.userData);
+            }
+
+            deselectNode() {
+                if (this.selectedNode) {
+                    this.selectedNode.material.emissive.setHex(0x000000);
+                    this.selectedNode = null;
+                }
+
+                document.getElementById('info-panel').classList.remove('visible');
+            }
+
+            highlightNode(node, highlight) {
+                if (node === this.selectedNode) return;
+
+                if (highlight) {
+                    node.material.emissive.setHex(0x222222);
+                } else {
+                    node.material.emissive.setHex(0x000000);
+                }
+            }
+
+            focusOnNode(node) {
+                const targetPosition = node.position.clone();
+                targetPosition.z += 8;
+
+                // Animate camera
+                const startPos = this.camera.position.clone();
+                const startTarget = this.controls.target.clone();
+                const endTarget = node.position.clone();
+
+                let t = 0;
+                const animate = () => {
+                    t += 0.05;
+                    if (t >= 1) t = 1;
+
+                    const easeT = 1 - Math.pow(1 - t, 3);  // Ease out cubic
+
+                    this.camera.position.lerpVectors(startPos, targetPosition, easeT);
+                    this.controls.target.lerpVectors(startTarget, endTarget, easeT);
+                    this.controls.update();
+
+                    if (t < 1) {
+                        requestAnimationFrame(animate);
+                    }
+                };
+
+                animate();
+            }
+
+            showInfoPanel(data) {
+                const panel = document.getElementById('info-panel');
+                const title = document.getElementById('info-title');
+                const content = document.getElementById('info-content');
+
+                title.textContent = data.name;
+
+                let html = '';
+
+                // Basic info - determine status (partial = alive + has branches)
+                const hasBranches = data.info && (data.info.branches || []).length > 0;
+                const isPartial = data.isAlive && hasBranches;
+                let statusText, statusColor;
+                if (data.isDead) {
+                    // Different status for orphaned vs dead branch
+                    if (data.deadType === 'NO_CALL_SITES') {
+                        statusText = 'ORPHANED';
+                        statusColor = '#ef4444';  // Red - no callers at all
+                    } else {
+                        statusText = 'DEAD BRANCH';
+                        statusColor = '#a78bfa';  // Purple - branch not taken
+                    }
+                } else if (isPartial) {
+                    statusText = 'PARTIAL';
+                    statusColor = '#fbbf24';
+                } else if (data.isAlive) {
+                    statusText = 'COVERED';
+                    statusColor = '#4ade80';
+                } else {
+                    statusText = 'UNKNOWN';
+                    statusColor = '#888888';
+                }
+                html += '<div class="info-row"><span class="info-label">Status:</span>';
+                html += `<span class="info-value" style="color: ${statusColor}">${statusText}</span></div>`;
+
+                if (data.info) {
+                    html += `<div class="info-row"><span class="info-label">Line:</span><span class="info-value">${data.info.line || 'N/A'}</span></div>`;
+
+                    if (data.info.call_count !== undefined) {
+                        html += `<div class="info-row"><span class="info-label">Calls:</span><span class="info-value">${data.info.call_count}</span></div>`;
+                    }
+
+                    if (data.info.branches && data.info.branches.length > 0) {
+                        html += `<div class="info-row"><span class="info-label">Branches:</span><span class="info-value">${data.info.branches.length}</span></div>`;
+                    }
+                }
+
+                // Why Not Covered section - with ROOT CAUSE TRACING
+                if (data.isDead && data.whyNotCovered) {
+                    html += '<div class="why-section">';
+                    html += '<h4>Why Not Covered?</h4>';
+
+                    const why = data.whyNotCovered;
+
+                    if (why.root_cause === 'NO_CALL_SITES') {
+                        html += '<div class="reason" style="color: #fbbf24;">&#9888; No call sites found</div>';
+                        html += '<div style="font-size: 10px; color: #888; margin-top: 4px;">This function is never called anywhere in the codebase.</div>';
+                    } else if (why.root_cause === 'UNREACHABLE_FROM_ENTRY') {
+                        html += '<div class="reason" style="color: #f87171;">&#10060; Unreachable from entry points</div>';
+                        html += '<div style="font-size: 10px; color: #888; margin-top: 4px;">The entire call chain is orphaned.</div>';
+                    } else if (why.root_cause === 'BRANCH_NOT_TAKEN') {
+                        const detail = why.root_cause_detail;
+                        html += '<div class="reason" style="color: #60a5fa;">&#128279; Root Cause Found</div>';
+                        html += '<div style="margin: 8px 0; padding: 8px; background: rgba(96, 165, 250, 0.15); border-radius: 4px;">';
+                        html += `<div style="font-weight: bold; color: #60a5fa;">Branch in: ${detail.caller}</div>`;
+                        html += `<div class="condition">${detail.branch_condition}</div>`;
+                        html += `<div style="font-size: 10px; color: #888; margin-top: 4px;">at line ${detail.branch_line}</div>`;
+                        html += '</div>';
+                    }
+
+                    // Show call chain if available (traced up to root cause)
+                    if (why.reasons && why.reasons.length > 0) {
+                        const reason = why.reasons[0];
+                        if (reason.explanation && reason.explanation.includes('Chain:')) {
+                            const chainMatch = reason.explanation.match(/Chain: (.+)$/);
+                            if (chainMatch) {
+                                const chainStr = chainMatch[1];
+                                const chainParts = chainStr.split(' → ');
+                                if (chainParts.length > 1) {
+                                    html += '<div style="margin-top: 12px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.1);">';
+                                    html += '<div style="font-size: 10px; color: #888; margin-bottom: 6px;">Call Chain (root to dead):</div>';
+                                    html += '<div style="font-family: monospace; font-size: 10px; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 4px;">';
+                                    chainParts.forEach((fn, i) => {
+                                        const isRoot = i === 0 && why.root_cause === 'BRANCH_NOT_TAKEN';
+                                        const isTarget = i === chainParts.length - 1;
+                                        const color = isRoot ? '#60a5fa' : (isTarget ? '#f87171' : '#888');
+                                        const label = isRoot ? ' (ROOT)' : (isTarget ? ' (DEAD)' : '');
+                                        html += `<span style="color: ${color};">${fn}${label}</span>`;
+                                        if (i < chainParts.length - 1) {
+                                            html += ' <span style="color: #444;">→</span> ';
+                                        }
+                                    });
+                                    html += '</div></div>';
+                                }
+                            }
+                        }
+                    }
+
+                    html += '</div>';
+                }
+
+                content.innerHTML = html;
+                panel.classList.add('visible');
+            }
+
+            onResize() {
+                const width = window.innerWidth;
+                const height = window.innerHeight;
+
+                this.camera.aspect = width / height;
+                this.camera.updateProjectionMatrix();
+                this.renderer.setSize(width, height);
+                this.needsRender = true;  // Request render after resize
+            }
+
+            animate() {
+                // Don't render if page not visible
+                if (!this.isVisible) {
+                    return;
+                }
+
+                this.animationId = requestAnimationFrame(() => this.animate());
+
+                const now = performance.now();
+                const elapsed = now - this.lastRenderTime;
+
+                // Handle keyboard panning (WASD or arrow keys)
+                let keyboardPan = false;
+                if (this.keysPressed) {
+                    const panAmount = this.keyPanSpeed * (elapsed / 16);  // Normalize to 60fps
+                    if (this.keysPressed['w'] || this.keysPressed['arrowup']) {
+                        this.controls.target.y += panAmount;
+                        this.camera.position.y += panAmount;
+                        keyboardPan = true;
+                    }
+                    if (this.keysPressed['s'] || this.keysPressed['arrowdown']) {
+                        this.controls.target.y -= panAmount;
+                        this.camera.position.y -= panAmount;
+                        keyboardPan = true;
+                    }
+                    if (this.keysPressed['a'] || this.keysPressed['arrowleft']) {
+                        this.controls.target.x -= panAmount;
+                        this.camera.position.x -= panAmount;
+                        keyboardPan = true;
+                    }
+                    if (this.keysPressed['d'] || this.keysPressed['arrowright']) {
+                        this.controls.target.x += panAmount;
+                        this.camera.position.x += panAmount;
+                        keyboardPan = true;
+                    }
+                    if (keyboardPan) {
+                        this.needsRender = true;
+                    }
+                }
+
+                // Frame rate limiting - skip if not enough time passed
+                if (elapsed < this.minFrameTime && !this.isInteracting && !keyboardPan) {
+                    return;
+                }
+
+                // Update controls (needed for damping)
+                const controlsChanged = this.controls.update();
+
+                // Only render if needed (on-demand rendering)
+                if (this.needsRender || controlsChanged || this.isInteracting) {
+                    this.renderer.render(this.scene, this.camera);
+                    this.lastRenderTime = now;
+
+                    // Clear render flag after rendering, but keep rendering during damping
+                    if (!controlsChanged && !this.isInteracting) {
+                        this.needsRender = false;
+                    }
+                }
+            }
+
+            // Force a render (call when scene changes)
+            requestRender() {
+                this.needsRender = true;
+            }
+        }
+
+        // Initialize
+        const container = document.getElementById('canvas-container');
+        const explorer = new InteractiveFlowExplorer(container);
+
+        // Load data from parent (injected by JCEF)
+        window.loadVisualizationData = function(jsonData) {
+            try {
+                const data = typeof jsonData === 'string' ? JSON.parse(jsonData) : jsonData;
+                explorer.loadData(data);
+            } catch (e) {
+                console.error('Failed to load visualization data:', e);
+            }
+        };
+
+        // Listen for postMessage from parent window (VS Code webview iframe)
+        window.addEventListener('message', function(event) {
+            try {
+                const message = event.data;
+                if (message && message.type === 'loadData' && message.data) {
+                    console.log('[Explorer] Received data via postMessage:', Object.keys(message.data));
+                    explorer.loadData(message.data);
+                } else if (message && message.type === 'applyFilters' && message.filters) {
+                    console.log('[Explorer] Received filter update:', message.filters);
+                    // Apply filters and refresh - re-render with filtered data
+                    if (window.explorerData) {
+                        const filteredData = applyFiltersToData(window.explorerData, message.filters);
+                        explorer.loadData(filteredData);
+                    }
+                }
+            } catch (e) {
+                console.error('[Explorer] Error processing postMessage:', e);
+            }
+        });
+
+        // Helper to apply filters to data
+        function applyFiltersToData(data, filters) {
+            const { coverage, module } = filters;
+            let filteredFunctions = { ...data.functions };
+            let filteredCallGraph = { ...data.call_graph };
+            let filteredResolvedCallGraph = { ...(data.resolved_call_graph || {}) };
+
+            // Filter by module name
+            if (module && module.trim()) {
+                const moduleFilter = module.toLowerCase();
+                const matchingFuncs = new Set(Object.keys(filteredFunctions).filter(f =>
+                    f.toLowerCase().includes(moduleFilter)
+                ));
+                filteredFunctions = Object.fromEntries(
+                    Object.entries(filteredFunctions).filter(([k]) => matchingFuncs.has(k))
+                );
+                filteredCallGraph = Object.fromEntries(
+                    Object.entries(filteredCallGraph)
+                        .filter(([k]) => matchingFuncs.has(k))
+                        .map(([k, v]) => [k, v.filter(c => matchingFuncs.has(c))])
+                );
+                filteredResolvedCallGraph = Object.fromEntries(
+                    Object.entries(filteredResolvedCallGraph)
+                        .filter(([k]) => matchingFuncs.has(k))
+                        .map(([k, v]) => [k, v.filter(c => matchingFuncs.has(c))])
+                );
+            }
+
+            // Filter by coverage status
+            const coveredSet = new Set(data.covered_functions || []);
+            const deadSet = new Set(data.dead_functions || []);
+            if (coverage && coverage !== 'all') {
+                const funcNames = Object.keys(filteredFunctions);
+                let matchingFuncs;
+                switch (coverage) {
+                    case 'covered':
+                        matchingFuncs = new Set(funcNames.filter(f => coveredSet.has(f)));
+                        break;
+                    case 'dead':
+                        matchingFuncs = new Set(funcNames.filter(f => deadSet.has(f)));
+                        break;
+                    case 'orphan':
+                        // Functions that are dead and have no callers
+                        const allCallees = new Set(Object.values(filteredCallGraph).flat());
+                        matchingFuncs = new Set(funcNames.filter(f =>
+                            deadSet.has(f) && !allCallees.has(f)
+                        ));
+                        break;
+                    case 'branch':
+                        // Dead functions that have covered callers (dead branch)
+                        const reverseGraph = {};
+                        Object.entries(filteredCallGraph).forEach(([caller, callees]) => {
+                            callees.forEach(callee => {
+                                if (!reverseGraph[callee]) reverseGraph[callee] = [];
+                                reverseGraph[callee].push(caller);
+                            });
+                        });
+                        matchingFuncs = new Set(funcNames.filter(f => {
+                            if (!deadSet.has(f)) return false;
+                            const callers = reverseGraph[f] || [];
+                            return callers.some(c => coveredSet.has(c));
+                        }));
+                        break;
+                    default:
+                        matchingFuncs = new Set(funcNames);
+                }
+                filteredFunctions = Object.fromEntries(
+                    Object.entries(filteredFunctions).filter(([k]) => matchingFuncs.has(k))
+                );
+                filteredCallGraph = Object.fromEntries(
+                    Object.entries(filteredCallGraph)
+                        .filter(([k]) => matchingFuncs.has(k))
+                        .map(([k, v]) => [k, v.filter(c => matchingFuncs.has(c))])
+                );
+            }
+
+            return {
+                ...data,
+                functions: filteredFunctions,
+                call_graph: filteredCallGraph,
+                resolved_call_graph: filteredResolvedCallGraph
+            };
+        }
+
+        // Store original data for filtering
+        const originalLoadData = explorer.loadData.bind(explorer);
+        explorer.loadData = function(data) {
+            window.explorerData = data;
+            originalLoadData(data);
+        };
+
+        // Demo data for testing with class-qualified names
+        const demoData = {
+            functions: {
+                'app.Main.__init__': { line: 5, branches: [] },
+                'app.Main.run': { line: 10, branches: [] },
+                'app.DataProcessor.process': { line: 25, branches: [{ type: 'if', condition: 'data is not None' }] },
+                'app.DataProcessor.validate': { line: 45, branches: [{ type: 'if', condition: 'len(input) > 0' }] },
+                'app.DataProcessor.parse_json': { line: 60, branches: [] },
+                'app.FileHandler.save': { line: 80, branches: [{ type: 'if', condition: 'use_legacy_format' }] },
+                'app.FileHandler.legacy_export': { line: 100, branches: [] },
+                'app.FileHandler.compress': { line: 110, branches: [] },
+                'app.Utils.unused_helper': { line: 120, branches: [] },
+                'app.Utils.format_date': { line: 130, branches: [] }
+            },
+            call_graph: {
+                'app.Main.run': ['app.DataProcessor.process', 'app.FileHandler.save'],
+                'app.DataProcessor.process': ['app.DataProcessor.validate', 'app.DataProcessor.parse_json'],
+                'app.FileHandler.save': ['app.FileHandler.legacy_export', 'app.FileHandler.compress'],
+                'app.Utils.format_date': ['app.Utils.unused_helper']
+            },
+            covered_functions: [
+                'app.Main.__init__',
+                'app.Main.run',
+                'app.DataProcessor.process',
+                'app.DataProcessor.validate',
+                'app.DataProcessor.parse_json',
+                'app.FileHandler.save',
+                'app.FileHandler.compress'
+            ],
+            dead_functions: [
+                'app.FileHandler.legacy_export',
+                'app.Utils.unused_helper',
+                'app.Utils.format_date'
+            ],
+            why_not_covered: {
+                'app.FileHandler.legacy_export': {
+                    function: 'app.FileHandler.legacy_export',
+                    root_cause: 'BRANCH_NOT_TAKEN',
+                    root_cause_detail: {
+                        type: 'BRANCH_NOT_TAKEN',
+                        caller: 'app.FileHandler.save',
+                        line: 85,
+                        branch_type: 'if',
+                        branch_condition: 'use_legacy_format == True',
+                        branch_line: 82
+                    },
+                    reasons: [{
+                        type: 'BRANCH_NOT_TAKEN',
+                        caller: 'app.FileHandler.save',
+                        line: 85,
+                        branch_type: 'if',
+                        branch_condition: 'use_legacy_format == True',
+                        branch_line: 82
+                    }]
+                },
+                'app.Utils.unused_helper': {
+                    function: 'app.Utils.unused_helper',
+                    root_cause: 'BRANCH_NOT_TAKEN',
+                    reasons: [{
+                        type: 'BRANCH_NOT_TAKEN',
+                        caller: 'app.Utils.format_date',
+                        explanation: 'Caller app.Utils.format_date was not executed'
+                    }]
+                },
+                'app.Utils.format_date': {
+                    function: 'app.Utils.format_date',
+                    root_cause: 'NO_CALL_SITES',
+                    reasons: [{
+                        type: 'NO_CALL_SITES',
+                        explanation: 'No code in the project calls app.Utils.format_date'
+                    }]
+                }
+            }
+        };
+
+        // Load demo data after short delay (simulating load)
+        setTimeout(() => {
+            console.log('[Demo] Loading demo data...');
+            console.log('[Demo] Functions:', Object.keys(demoData.functions));
+            console.log('[Demo] Call graph:', demoData.call_graph);
+            console.log('[Demo] Covered:', demoData.covered_functions);
+            console.log('[Demo] Dead:', demoData.dead_functions);
+            console.log('[Demo] WhyNotCovered:', Object.keys(demoData.why_not_covered));
+            explorer.loadData(demoData);
+        }, 500);
+    </script>
+</body>
+</html>

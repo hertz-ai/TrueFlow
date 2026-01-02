@@ -652,6 +652,21 @@ class RuntimeInstrumentor(object):
                         'branches': func_info['branches']  # Already in dict format
                     }
 
+            # Build resolved call graph for cross-class connection visualization
+            resolved_call_graph = {}
+            for caller, callees in branch_analyzer.global_resolved_call_graph.items():
+                # Convert to module.function format
+                module = self._get_module_for_function(caller, branch_analyzer)
+                caller_key = "{0}.{1}".format(module, caller) if module else caller
+                resolved_call_graph[caller_key] = []
+                for callee in callees:
+                    callee_module = self._get_module_for_function(callee, branch_analyzer)
+                    callee_key = "{0}.{1}".format(callee_module, callee) if callee_module else callee
+                    resolved_call_graph[caller_key].append(callee_key)
+
+            # Include class attribute information for type resolution
+            class_attributes = branch_analyzer.global_class_attributes
+
             # Send branch registry event
             branch_event = {
                 'type': 'branch_registry',
@@ -670,7 +685,9 @@ class RuntimeInstrumentor(object):
                 'trace_data': {
                     'total_call_sites': len(call_sites),
                     'call_sites': call_sites,
-                    'function_branches': function_branches
+                    'function_branches': function_branches,
+                    'resolved_call_graph': resolved_call_graph,
+                    'class_attributes': class_attributes
                 }
             }
 
@@ -712,6 +729,21 @@ class RuntimeInstrumentor(object):
         module_path = module_path.lstrip('.')
         return module_path
 
+    def _get_module_for_function(self, func_name, branch_analyzer):
+        """Get module name for a function from the branch analyzer.
+
+        Args:
+            func_name: Function name (may be Class.method or just function)
+            branch_analyzer: ProjectBranchAnalyzer instance
+
+        Returns:
+            Module name or empty string if not found
+        """
+        if func_name in branch_analyzer.all_functions:
+            filepath = branch_analyzer.all_functions[func_name]
+            return self._filepath_to_module(filepath)
+        return ''
+
     def pause_tracing(self):
         """Temporarily pause tracing (useful for performance-critical sections)."""
         self.enabled = False
@@ -731,7 +763,9 @@ class RuntimeInstrumentor(object):
                 return
 
             code = frame.f_code
-            func_name = code.co_name
+            # Use co_qualname (Python 3.3+) for class-qualified names like "ClassName.method"
+            # This matches the format used by static analysis for proper call graph connections
+            func_name = getattr(code, 'co_qualname', code.co_name)
             module = frame.f_globals.get('__name__', '') or ''  # Handle None case
 
             # Skip Python-generated internal functions (comprehensions, lambdas, etc.)
@@ -963,6 +997,15 @@ class RuntimeInstrumentor(object):
                 # The plugin needs matching pairs for proper visualization
                 # Socket will handle backpressure via TCP flow control
                 if self.trace_server and self.trace_server.clients:
+                    # Extract parameters for Watch Architecture visualization
+                    params_info = self._extract_function_parameters(frame, code)
+
+                    # Classify data source (video, api, screen, audio)
+                    data_source = self._classify_data_source(func_name, module, params_info)
+
+                    # Classify data types being processed
+                    data_types = self._classify_data_types(params_info)
+
                     trace_event = {
                         'type': 'call',
                         'timestamp': call_record.start_time,
@@ -976,7 +1019,11 @@ class RuntimeInstrumentor(object):
                         'process_id': self.process_id,
                         'session_id': self.session_id,
                         'correlation_id': self.current_correlation_id,
-                        'learning_phase': phase if phase else None
+                        'learning_phase': phase if phase else None,
+                        # Enhanced data for Watch Architecture
+                        'params': params_info,
+                        'data_source': data_source,
+                        'data_types': data_types
                     }
                     # Stream all call events to maintain coherence
                     self.trace_server.stream_trace(trace_event)
@@ -1023,7 +1070,7 @@ class RuntimeInstrumentor(object):
 
                     # Also check traditional exit points
                     code = frame.f_code
-                    func_name = code.co_name
+                    func_name = getattr(code, 'co_qualname', code.co_name)
                     self._detect_learning_cycle_end(func_name)
 
                     # Detect patterns again on return (all variables are now available)
@@ -1036,6 +1083,9 @@ class RuntimeInstrumentor(object):
                     # Stream return event to PyCharm if connected
                     # Send ALL return events to match with call events
                     if self.trace_server and self.trace_server.clients:
+                        # Extract return value info for Watch Architecture
+                        return_info = self._get_param_info(arg) if arg is not None else None
+
                         trace_event = {
                             'type': 'return',
                             'timestamp': call_record.end_time,
@@ -1050,7 +1100,9 @@ class RuntimeInstrumentor(object):
                             'parent_id': call_record.parent_id,
                             'process_id': self.process_id,
                             'session_id': self.session_id,
-                            'correlation_id': self.current_correlation_id
+                            'correlation_id': self.current_correlation_id,
+                            # Enhanced data for Watch Architecture
+                            'return_value': return_info
                         }
                         self.trace_server.stream_trace(trace_event)
 
@@ -1353,6 +1405,72 @@ class RuntimeInstrumentor(object):
             pass
 
         return info
+
+    def _classify_data_source(self, func_name, module, params):
+        """
+        Classify the data source being processed (video, api, screen, audio).
+        Used by Watch Architecture for source tracking.
+        """
+        # Combine function name and module for pattern matching
+        context = (func_name + ' ' + module + ' ' + str(params)).lower()
+
+        # Video/camera patterns
+        video_patterns = ['frame', 'camera', 'video', 'image', 'cv2', 'pil', 'imagecapture',
+                         'capture', 'webcam', 'imread', 'imshow', 'videocapture']
+        if any(p in context for p in video_patterns):
+            return 'video'
+
+        # API/network patterns
+        api_patterns = ['request', 'response', 'http', 'websocket', 'api', 'fetch',
+                       'axios', 'rest', 'endpoint', 'client', 'server', 'socket',
+                       'get', 'post', 'put', 'delete', 'patch']
+        if any(p in context for p in api_patterns):
+            return 'api'
+
+        # Screen/display patterns
+        screen_patterns = ['screen', 'display', 'monitor', 'screenshot', 'grab',
+                          'pyautogui', 'mss', 'pillow', 'desktop']
+        if any(p in context for p in screen_patterns):
+            return 'screen'
+
+        # Audio patterns
+        audio_patterns = ['audio', 'sound', 'microphone', 'wav', 'mp3', 'speech',
+                         'pyaudio', 'sounddevice', 'voice', 'recording', 'sample_rate']
+        if any(p in context for p in audio_patterns):
+            return 'audio'
+
+        return None
+
+    def _classify_data_types(self, params):
+        """
+        Classify the types of data being processed (tensor, message, class, primitive).
+        Used by Watch Architecture for data flow visualization.
+        """
+        types = set()
+
+        for param_name, param_info in params.items():
+            if param_name.startswith('_'):
+                continue
+
+            param_type = param_info.get('type', '').lower()
+
+            # Tensor types
+            if any(t in param_type for t in ['tensor', 'ndarray', 'array']):
+                types.add('tensor')
+            # Message types
+            elif any(t in param_type for t in ['message', 'request', 'response', 'event', 'packet']):
+                types.add('message')
+            # Primitive types
+            elif param_type in ['int', 'float', 'str', 'bool', 'nonetype']:
+                types.add('primitive')
+            # Dict/list as structured data
+            elif param_type in ['dict', 'list', 'tuple']:
+                types.add('primitive')
+            # Everything else is a custom class
+            else:
+                types.add('class')
+
+        return list(types)
 
     def _export_cycle_execution_tree(self, correlation_id):
         """

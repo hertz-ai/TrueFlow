@@ -81,6 +81,12 @@ class BranchCoverageAnalyzer(ast.NodeVisitor):
         self.branches = []  # All branch points
         self.call_sites = []  # All function calls
         self.call_graph = {}  # {caller: [callees]}
+        self.classes = {}  # {class_name: {'line': N, 'methods': [], 'attributes': {}}}
+
+        # Type tracking for cross-class call resolution
+        self.class_attributes = {}  # {ClassName: {attr_name: TypeName}}
+        self.local_types = {}  # {func_name: {var_name: TypeName}}
+        self.imports = {}  # {alias: full_name}
 
         # State during traversal
         self._current_function = None
@@ -114,12 +120,81 @@ class BranchCoverageAnalyzer(ast.NodeVisitor):
             return f"{self._current_class}.{name}"
         return name
 
+    def visit_Import(self, node):
+        """Track imports for type resolution."""
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            self.imports[name] = alias.name
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        """Track from imports for type resolution."""
+        module = node.module or ''
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            full_name = f"{module}.{alias.name}" if module else alias.name
+            self.imports[name] = full_name
+        self.generic_visit(node)
+
     def visit_ClassDef(self, node):
         """Track class context for method names."""
         old_class = self._current_class
         self._current_class = node.name
+
+        # Register the class
+        self.classes[node.name] = {
+            'line': node.lineno,
+            'methods': [],
+            'attributes': {},
+            'bases': [self._get_base_name(b) for b in node.bases]
+        }
+        self.class_attributes[node.name] = {}
+
         self.generic_visit(node)
         self._current_class = old_class
+
+    def _get_base_name(self, node):
+        """Extract base class name."""
+        if isinstance(node, ast.Name):
+            return node.id
+        elif isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    def visit_Assign(self, node):
+        """Track assignments to infer types for cross-class call resolution."""
+        # Get the assigned value's type (if it's a constructor call)
+        assigned_type = self._get_assigned_type(node.value)
+
+        for target in node.targets:
+            if isinstance(target, ast.Attribute):
+                # self.x = SomeClass() -> class attribute
+                if isinstance(target.value, ast.Name) and target.value.id == 'self' and self._current_class:
+                    attr_name = target.attr
+                    if assigned_type:
+                        self.class_attributes[self._current_class][attr_name] = assigned_type
+                    # Also track in classes dict
+                    if self._current_class in self.classes:
+                        self.classes[self._current_class]['attributes'][attr_name] = assigned_type
+            elif isinstance(target, ast.Name) and self._current_function:
+                # x = SomeClass() -> local variable
+                var_name = target.id
+                if assigned_type:
+                    if self._current_function not in self.local_types:
+                        self.local_types[self._current_function] = {}
+                    self.local_types[self._current_function][var_name] = assigned_type
+
+        self.generic_visit(node)
+
+    def _get_assigned_type(self, node):
+        """Infer the type from an assignment value (constructor call)."""
+        if isinstance(node, ast.Call):
+            # SomeClass() or module.SomeClass()
+            if isinstance(node.func, ast.Name):
+                return node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                return node.func.attr
+        return None
 
     def visit_FunctionDef(self, node):
         """Extract function definition with its branches and calls."""
@@ -432,16 +507,101 @@ class BranchCoverageAnalyzer(ast.NodeVisitor):
             return None
         return None
 
+    def resolve_call(self, raw_callee_name):
+        """
+        Resolve a raw call name to its actual class.method form.
+
+        Examples:
+            self.service.process -> ServiceClass.process (if self.service is ServiceClass)
+            helper.do_work -> HelperClass.do_work (if helper is HelperClass)
+        """
+        parts = raw_callee_name.split('.')
+
+        if len(parts) < 2:
+            return raw_callee_name
+
+        # Handle self.attr.method pattern
+        if parts[0] == 'self' and self._current_class:
+            if len(parts) == 2:
+                # self.method() -> CurrentClass.method
+                return f"{self._current_class}.{parts[1]}"
+            elif len(parts) >= 3:
+                # self.attr.method() -> resolve attr's type
+                attr_name = parts[1]
+                method_name = parts[-1]
+                if self._current_class in self.class_attributes:
+                    attr_type = self.class_attributes[self._current_class].get(attr_name)
+                    if attr_type:
+                        return f"{attr_type}.{method_name}"
+
+        # Handle local variable type resolution
+        if self._current_function and parts[0] in self.local_types.get(self._current_function, {}):
+            var_type = self.local_types[self._current_function][parts[0]]
+            method_name = parts[-1]
+            return f"{var_type}.{method_name}"
+
+        return raw_callee_name
+
+    def get_resolved_call_graph(self):
+        """Return call graph with resolved cross-class references."""
+        resolved = {}
+        for caller, callees in self.call_graph.items():
+            resolved[caller] = []
+            for callee in callees:
+                # Try to resolve each callee
+                resolved_callee = self._resolve_callee(callee, caller)
+                if resolved_callee not in resolved[caller]:
+                    resolved[caller].append(resolved_callee)
+        return resolved
+
+    def _resolve_callee(self, raw_callee, caller_function):
+        """Resolve a callee name to its actual class.method form."""
+        parts = raw_callee.split('.')
+
+        if len(parts) < 2:
+            return raw_callee
+
+        # Determine the class context of the caller
+        caller_class = None
+        if '.' in caller_function:
+            caller_class = caller_function.split('.')[0]
+
+        # Handle self.attr.method pattern
+        if parts[0] == 'self' and caller_class:
+            if len(parts) == 2:
+                # self.method() -> CallerClass.method
+                return f"{caller_class}.{parts[1]}"
+            elif len(parts) >= 3:
+                # self.attr.method() -> resolve attr's type
+                attr_name = parts[1]
+                method_name = parts[-1]
+                if caller_class in self.class_attributes:
+                    attr_type = self.class_attributes[caller_class].get(attr_name)
+                    if attr_type:
+                        return f"{attr_type}.{method_name}"
+
+        # Handle local variable type resolution
+        if caller_function in self.local_types and parts[0] in self.local_types[caller_function]:
+            var_type = self.local_types[caller_function][parts[0]]
+            method_name = parts[-1]
+            return f"{var_type}.{method_name}"
+
+        return raw_callee
+
     def to_dict(self):
         """Export analysis results as dictionary."""
         return {
             'file': self.file_path,
             'functions': self.functions,
+            'classes': self.classes,
             'branches': [b.to_dict() for b in self.branches],
             'call_sites': [c.to_dict() for c in self.call_sites],
             'call_graph': self.call_graph,
+            'resolved_call_graph': self.get_resolved_call_graph(),
+            'class_attributes': self.class_attributes,
             'stats': {
                 'total_functions': len(self.functions),
+                'total_classes': len(self.classes),
                 'total_branches': len(self.branches),
                 'total_call_sites': len(self.call_sites)
             }
@@ -459,7 +619,10 @@ class ProjectBranchAnalyzer:
         self.project_root = os.path.abspath(project_root)
         self.files = {}  # {file_path: BranchCoverageAnalyzer}
         self.all_functions = {}  # {full_name: file_path}
+        self.all_classes = {}  # {class_name: file_path}
         self.global_call_graph = {}  # {caller: [callees]} across all files
+        self.global_resolved_call_graph = {}  # {caller: [callees]} with types resolved
+        self.global_class_attributes = {}  # {ClassName: {attr: Type}}
 
     def scan(self):
         """Scan all Python files in the project."""
@@ -477,18 +640,104 @@ class ProjectBranchAnalyzer:
                     filepath = os.path.join(root, filename)
                     self._analyze_file(filepath)
 
-        # Build global call graph
+        # First pass: collect all class attributes for cross-file resolution
+        for file_path, analyzer in self.files.items():
+            for class_name, attrs in analyzer.class_attributes.items():
+                if class_name not in self.global_class_attributes:
+                    self.global_class_attributes[class_name] = {}
+                self.global_class_attributes[class_name].update(attrs)
+
+        # Build global call graph (raw)
         for file_path, analyzer in self.files.items():
             for caller, callees in analyzer.call_graph.items():
                 if caller not in self.global_call_graph:
                     self.global_call_graph[caller] = []
                 self.global_call_graph[caller].extend(callees)
 
+        # Build resolved call graph with cross-class connections
+        self._build_resolved_call_graph()
+
         print(f"[ProjectBranchAnalyzer] Analyzed {len(self.files)} files, "
-              f"{len(self.all_functions)} functions, "
+              f"{len(self.all_functions)} functions, {len(self.all_classes)} classes, "
               f"{sum(len(a.branches) for a in self.files.values())} branches")
 
         return self
+
+    def _build_resolved_call_graph(self):
+        """Build a resolved call graph using global type information.
+
+        Only includes functions that are defined in the project (in all_functions).
+        External library calls are filtered out.
+        """
+        for caller, callees in self.global_call_graph.items():
+            # Only include callers that are in the project
+            if caller not in self.all_functions:
+                continue
+
+            if caller not in self.global_resolved_call_graph:
+                self.global_resolved_call_graph[caller] = []
+
+            for callee in callees:
+                resolved = self._resolve_global_callee(callee, caller)
+                # Only include callees that are in the project (filter out external libs)
+                if resolved in self.all_functions and resolved not in self.global_resolved_call_graph[caller]:
+                    self.global_resolved_call_graph[caller].append(resolved)
+
+    def _resolve_global_callee(self, raw_callee, caller_function):
+        """Resolve a callee using global type information."""
+        parts = raw_callee.split('.')
+
+        if len(parts) < 2:
+            # Check if it's a direct function call that exists
+            if raw_callee in self.all_functions:
+                return raw_callee
+            # Could be a constructor call - check classes
+            if raw_callee in self.all_classes:
+                return f"{raw_callee}.__init__"
+            return raw_callee
+
+        # Determine caller's class context
+        caller_class = None
+        if '.' in caller_function:
+            caller_class = caller_function.split('.')[0]
+
+        # Handle self.method() -> CallerClass.method
+        if parts[0] == 'self' and caller_class:
+            if len(parts) == 2:
+                resolved = f"{caller_class}.{parts[1]}"
+                if resolved in self.all_functions:
+                    return resolved
+                return raw_callee
+
+            # Handle self.attr.method() -> resolve attr's type
+            if len(parts) >= 3:
+                attr_name = parts[1]
+                method_name = parts[-1]
+                # Check caller class's attributes
+                if caller_class in self.global_class_attributes:
+                    attr_type = self.global_class_attributes[caller_class].get(attr_name)
+                    if attr_type:
+                        resolved = f"{attr_type}.{method_name}"
+                        if resolved in self.all_functions:
+                            return resolved
+
+        # Handle ClassName.method() or module.ClassName.method()
+        # Check if any part matches a known class
+        for i, part in enumerate(parts[:-1]):
+            if part in self.all_classes:
+                method_name = parts[-1]
+                resolved = f"{part}.{method_name}"
+                if resolved in self.all_functions:
+                    return resolved
+
+        # Fuzzy match: check if method name matches any known class method
+        method_name = parts[-1]
+        for func_name in self.all_functions:
+            if func_name.endswith(f".{method_name}"):
+                # Potential match - but be careful with common names
+                return func_name
+
+        return raw_callee
 
     def _analyze_file(self, filepath):
         """Analyze a single file."""
@@ -511,6 +760,10 @@ class ProjectBranchAnalyzer:
             # Track all functions globally
             for func_name in analyzer.functions:
                 self.all_functions[func_name] = filepath
+
+            # Track all classes globally
+            for class_name in analyzer.classes:
+                self.all_classes[class_name] = filepath
 
         except Exception as e:
             print(f"[ProjectBranchAnalyzer] Error analyzing {filepath}: {e}")
@@ -604,16 +857,33 @@ class ProjectBranchAnalyzer:
 
         return result
 
+    def find_callers_resolved(self, function_name):
+        """Find callers using the resolved call graph."""
+        callers = []
+        for caller, callees in self.global_resolved_call_graph.items():
+            if function_name in callees:
+                # Find the file for this caller
+                file_path = self.all_functions.get(caller, 'unknown')
+                callers.append({
+                    'caller': caller,
+                    'file': file_path
+                })
+        return callers
+
     def to_dict(self):
         """Export full analysis as dictionary."""
         return {
             'project_root': self.project_root,
             'files': {fp: a.to_dict() for fp, a in self.files.items()},
             'all_functions': self.all_functions,
+            'all_classes': self.all_classes,
             'global_call_graph': self.global_call_graph,
+            'global_resolved_call_graph': self.global_resolved_call_graph,
+            'global_class_attributes': self.global_class_attributes,
             'stats': {
                 'total_files': len(self.files),
                 'total_functions': len(self.all_functions),
+                'total_classes': len(self.all_classes),
                 'total_branches': sum(len(a.branches) for a in self.files.values()),
                 'total_call_sites': sum(len(a.call_sites) for a in self.files.values())
             }
