@@ -32,6 +32,17 @@ import java.util.concurrent.CopyOnWriteArrayList
 class TraceFilter : PersistentStateComponent<TraceFilter.FilterState> {
 
     /**
+     * Serializable preset containing filter configuration
+     */
+    data class FilterPreset(
+        var excludedFolders: MutableList<String> = mutableListOf(),
+        var excludedFiles: MutableList<String> = mutableListOf(),
+        var excludedModules: MutableList<String> = mutableListOf(),
+        var excludedPatternStrings: MutableList<String> = mutableListOf(),
+        var includeOnly: MutableList<String> = mutableListOf()
+    )
+
+    /**
      * Serializable state for persistence
      */
     data class FilterState(
@@ -39,7 +50,9 @@ class TraceFilter : PersistentStateComponent<TraceFilter.FilterState> {
         var excludedFiles: MutableList<String> = mutableListOf(),
         var excludedModules: MutableList<String> = mutableListOf(),
         var excludedPatternStrings: MutableList<String> = mutableListOf(),
-        var includeOnly: MutableList<String> = mutableListOf()
+        var includeOnly: MutableList<String> = mutableListOf(),
+        var savedPresets: MutableMap<String, FilterPreset> = mutableMapOf(),
+        var activePresetName: String? = null
     ) {
         companion object {
             fun getDefault(): FilterState {
@@ -198,10 +211,17 @@ class TraceFilter : PersistentStateComponent<TraceFilter.FilterState> {
         changeListeners.remove(listener)
     }
 
+    /** Flag to prevent clearing preset name during preset load */
+    private var isLoadingPreset = false
+
     /**
      * Notify all listeners that filters have changed
      */
     private fun notifyChange() {
+        // Clear active preset if this change wasn't from loading a preset
+        if (!isLoadingPreset) {
+            activePresetName = null
+        }
         changeListeners.forEach { it() }
     }
 
@@ -412,6 +432,97 @@ class TraceFilter : PersistentStateComponent<TraceFilter.FilterState> {
                config.includeOnly.isEmpty()
     }
 
+    // === Preset Management ===
+
+    /** Currently active preset name (null if custom/unsaved) */
+    var activePresetName: String? = null
+        private set
+
+    /** Saved presets */
+    private val savedPresets = mutableMapOf<String, FilterPreset>()
+
+    /**
+     * Save current filter configuration as a named preset
+     */
+    fun savePreset(name: String) {
+        val preset = FilterPreset(
+            excludedFolders = config.excludedFolders.toMutableList(),
+            excludedFiles = config.excludedFiles.toMutableList(),
+            excludedModules = config.excludedModules.toMutableList(),
+            excludedPatternStrings = config.excludedPatterns.map { it.pattern }.toMutableList(),
+            includeOnly = config.includeOnly.toMutableList()
+        )
+        savedPresets[name] = preset
+        activePresetName = name
+        notifyChange()
+    }
+
+    /**
+     * Load a named preset
+     */
+    fun loadPreset(name: String): Boolean {
+        val preset = savedPresets[name] ?: return false
+
+        isLoadingPreset = true
+        try {
+            config.excludedFolders.clear()
+            config.excludedFolders.addAll(preset.excludedFolders)
+
+            config.excludedFiles.clear()
+            config.excludedFiles.addAll(preset.excludedFiles)
+
+            config.excludedModules.clear()
+            config.excludedModules.addAll(preset.excludedModules)
+
+            config.excludedPatterns.clear()
+            preset.excludedPatternStrings.forEach { pattern ->
+                try {
+                    config.excludedPatterns.add(Regex(pattern))
+                } catch (e: Exception) {
+                    // Invalid regex, skip
+                }
+            }
+
+            config.includeOnly.clear()
+            config.includeOnly.addAll(preset.includeOnly)
+
+            activePresetName = name
+            notifyChange()
+        } finally {
+            isLoadingPreset = false
+        }
+        return true
+    }
+
+    /**
+     * Delete a saved preset
+     */
+    fun deletePreset(name: String): Boolean {
+        val removed = savedPresets.remove(name) != null
+        if (removed && activePresetName == name) {
+            activePresetName = null
+        }
+        if (removed) notifyChange()
+        return removed
+    }
+
+    /**
+     * Get list of saved preset names
+     */
+    fun getPresetNames(): List<String> = savedPresets.keys.toList().sorted()
+
+    /**
+     * Check if a preset with the given name exists
+     */
+    fun hasPreset(name: String): Boolean = savedPresets.containsKey(name)
+
+    /**
+     * Mark current config as modified (no longer matching saved preset)
+     */
+    fun markAsModified() {
+        activePresetName = null
+    }
+
     // === PersistentStateComponent Implementation ===
 
     /**
@@ -423,7 +534,9 @@ class TraceFilter : PersistentStateComponent<TraceFilter.FilterState> {
             excludedFiles = config.excludedFiles.toMutableList(),
             excludedModules = config.excludedModules.toMutableList(),
             excludedPatternStrings = config.excludedPatterns.map { it.pattern }.toMutableList(),
-            includeOnly = config.includeOnly.toMutableList()
+            includeOnly = config.includeOnly.toMutableList(),
+            savedPresets = savedPresets.toMutableMap(),
+            activePresetName = activePresetName
         )
     }
 
@@ -432,6 +545,10 @@ class TraceFilter : PersistentStateComponent<TraceFilter.FilterState> {
      */
     override fun loadState(state: FilterState) {
         loadStateIntoConfig(state)
+        // Load presets
+        savedPresets.clear()
+        savedPresets.putAll(state.savedPresets)
+        activePresetName = state.activePresetName
     }
 
     companion object {

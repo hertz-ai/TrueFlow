@@ -184,6 +184,468 @@
             color: #fde68a;
         }
 
+        /* Color-coded function name parts */
+        .fn-package { color: #9ca3af; }  /* Grey for package/module path */
+        .fn-class { color: #fbbf24; }    /* Yellow for class name */
+        .fn-method { color: #ffffff; font-weight: 500; }  /* White for function/method name */
+        .fn-separator { color: #6b7280; }  /* Dimmer separator dots */
+
+        /* Colored function name container */
+        .fn-colored {
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.4;
+            word-break: break-all;
+        }
+
+        .fn-colored.fn-large {
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .fn-colored.fn-small {
+            font-size: 10px;
+        }
+
+        /* Hover tooltip with navigation */
+        #hover-tooltip {
+            position: absolute;
+            display: none;
+            background: rgba(15, 15, 30, 0.98);
+            border: 1px solid #6366f1;
+            border-radius: 10px;
+            padding: 0;
+            min-width: 280px;
+            max-width: 400px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 20px rgba(99, 102, 241, 0.3);
+            z-index: 200;
+            backdrop-filter: blur(10px);
+            overflow: hidden;
+        }
+
+        #hover-tooltip.visible {
+            display: block;
+        }
+
+        .tooltip-header {
+            padding: 12px 14px;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.1));
+            border-bottom: 1px solid rgba(99, 102, 241, 0.3);
+        }
+
+        .tooltip-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .tooltip-status.alive {
+            background: rgba(34, 197, 94, 0.2);
+            color: #4ade80;
+            border: 1px solid rgba(34, 197, 94, 0.4);
+        }
+
+        .tooltip-status.dead {
+            background: rgba(239, 68, 68, 0.2);
+            color: #f87171;
+            border: 1px solid rgba(239, 68, 68, 0.4);
+        }
+
+        .tooltip-status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        .tooltip-status.alive .tooltip-status-dot { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
+        .tooltip-status.dead .tooltip-status-dot { background: #f87171; box-shadow: 0 0 6px #f87171; }
+
+        .tooltip-body {
+            padding: 12px 14px;
+        }
+
+        .tooltip-meta {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 6px 12px;
+            font-size: 11px;
+            margin-bottom: 12px;
+        }
+
+        .tooltip-meta-label {
+            color: #6b7280;
+        }
+
+        .tooltip-meta-value {
+            color: #d1d5db;
+        }
+
+        .tooltip-meta-value.highlight {
+            color: #60a5fa;
+        }
+
+        /* Navigation buttons in tooltip */
+        .tooltip-nav {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding-top: 10px;
+            border-top: 1px solid rgba(99, 102, 241, 0.2);
+        }
+
+        .tooltip-nav-btn {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            background: rgba(55, 65, 81, 0.4);
+            border: 1px solid rgba(75, 85, 99, 0.6);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .tooltip-nav-btn:hover:not(:disabled) {
+            background: rgba(99, 102, 241, 0.3);
+            border-color: #818cf8;
+            transform: translateX(2px);
+        }
+
+        .tooltip-nav-btn:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+
+        .tooltip-nav-btn:active:not(:disabled) {
+            transform: scale(0.98);
+        }
+
+        .nav-icon {
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .nav-icon.parent { background: rgba(251, 191, 36, 0.2); color: #fbbf24; }
+        .nav-icon.root { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+        .nav-icon.downstream { background: rgba(96, 165, 250, 0.2); color: #60a5fa; }
+
+        .nav-label {
+            font-size: 10px;
+            color: #9ca3af;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .nav-target {
+            flex: 1;
+            text-align: left;
+        }
+
+        .nav-arrow {
+            color: #6b7280;
+            font-size: 12px;
+        }
+
+        /* View Controls (zoom, recenter) */
+        #view-controls {
+            display: flex;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+
+        .view-btn {
+            width: 36px;
+            height: 36px;
+            background: rgba(26, 26, 46, 0.9);
+            border: 1px solid #4a4a6a;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+        }
+
+        .view-btn:hover {
+            background: rgba(99, 102, 241, 0.3);
+            border-color: #6366f1;
+        }
+
+        .view-btn:active {
+            transform: scale(0.95);
+        }
+
+        .view-btn.recenter {
+            font-size: 16px;
+        }
+
+        .view-btn.entry-points {
+            font-size: 14px;
+            color: #4ade80;
+        }
+
+        .view-btn.entry-points:hover {
+            background: rgba(74, 222, 128, 0.2);
+            border-color: #4ade80;
+        }
+
+        /* Search Box - E-commerce style */
+        #search-container {
+            position: relative;
+            flex: 1;
+            min-width: 200px;
+            max-width: 500px;
+        }
+
+        #search-box {
+            width: 100%;
+            padding: 12px 45px 12px 16px;
+            background: rgba(15, 15, 30, 0.95);
+            border: 2px solid #4a4a6a;
+            border-radius: 12px;
+            color: #fff;
+            font-size: 14px;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+            outline: none;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        #search-box:focus {
+            border-color: #6366f1;
+            box-shadow: 0 4px 20px rgba(99, 102, 241, 0.3), 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        #search-box::placeholder {
+            color: #6b7280;
+        }
+
+        #search-icon {
+            position: absolute;
+            right: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #6b7280;
+            pointer-events: none;
+            font-size: 18px;
+        }
+
+        #search-clear {
+            position: absolute;
+            right: 40px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #6b7280;
+            cursor: pointer;
+            font-size: 16px;
+            display: none;
+            padding: 4px;
+            border-radius: 50%;
+            transition: all 0.15s;
+        }
+
+        #search-clear:hover {
+            color: #fff;
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        #search-clear.visible {
+            display: block;
+        }
+
+        /* Search Results Dropdown */
+        #search-results {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            margin-top: 8px;
+            background: rgba(15, 15, 30, 0.98);
+            border: 1px solid #4a4a6a;
+            border-radius: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            display: none;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(10px);
+        }
+
+        #search-results.visible {
+            display: block;
+        }
+
+        #search-results::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        #search-results::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+        }
+
+        #search-results::-webkit-scrollbar-thumb {
+            background: #4a4a6a;
+            border-radius: 4px;
+        }
+
+        .search-section {
+            padding: 8px 0;
+        }
+
+        .search-section:not(:last-child) {
+            border-bottom: 1px solid rgba(74, 74, 106, 0.5);
+        }
+
+        .search-section-title {
+            padding: 8px 16px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .search-section-title.classes {
+            color: #fbbf24;
+        }
+
+        .search-section-title.functions {
+            color: #ffffff;
+        }
+
+        .search-section-count {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 9px;
+        }
+
+        .search-result-item {
+            padding: 10px 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            transition: all 0.15s ease;
+        }
+
+        .search-result-item:hover {
+            background: rgba(99, 102, 241, 0.2);
+        }
+
+        .search-result-item.selected {
+            background: rgba(99, 102, 241, 0.3);
+        }
+
+        .search-result-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+
+        .search-result-icon.class-icon {
+            background: rgba(251, 191, 36, 0.2);
+            color: #fbbf24;
+            border: 1px solid rgba(251, 191, 36, 0.4);
+        }
+
+        .search-result-icon.function-icon {
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+        }
+
+        .search-result-icon.function-icon.alive {
+            background: rgba(74, 222, 128, 0.15);
+            color: #4ade80;
+            border-color: rgba(74, 222, 128, 0.4);
+        }
+
+        .search-result-icon.function-icon.dead {
+            background: rgba(239, 68, 68, 0.15);
+            color: #f87171;
+            border-color: rgba(239, 68, 68, 0.4);
+        }
+
+        .search-result-content {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .search-result-name {
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 13px;
+            line-height: 1.3;
+        }
+
+        .search-result-meta {
+            font-size: 11px;
+            color: #6b7280;
+            margin-top: 2px;
+        }
+
+        .search-result-badge {
+            font-size: 9px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        .search-result-badge.alive {
+            background: rgba(74, 222, 128, 0.2);
+            color: #4ade80;
+        }
+
+        .search-result-badge.dead {
+            background: rgba(239, 68, 68, 0.2);
+            color: #f87171;
+        }
+
+        .search-no-results {
+            padding: 24px 16px;
+            text-align: center;
+            color: #6b7280;
+            font-size: 13px;
+        }
+
+        .search-no-results-icon {
+            font-size: 32px;
+            margin-bottom: 8px;
+            opacity: 0.5;
+        }
+
+        /* Highlight matched text */
+        .search-highlight {
+            background: rgba(99, 102, 241, 0.4);
+            color: #fff;
+            padding: 0 2px;
+            border-radius: 2px;
+        }
+
         /* Legend */
         #legend {
             position: absolute;
@@ -216,22 +678,32 @@
             margin-right: 8px;
         }
 
-        /* Stats Bar */
-        #stats-bar {
+        /* Top Bar - Contains stats and search */
+        #top-bar {
             position: absolute;
             top: 10px;
             left: 10px;
+            right: 10px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            z-index: 150;
+        }
+
+        /* Stats Bar */
+        #stats-bar {
             background: rgba(26, 26, 46, 0.9);
             border: 1px solid #4a4a6a;
             border-radius: 8px;
             padding: 10px 15px;
-            z-index: 100;
             font-size: 12px;
+            flex-shrink: 0;
+            white-space: nowrap;
         }
 
         #stats-bar .stat {
             display: inline-block;
-            margin-right: 20px;
+            margin-right: 12px;
         }
 
         #stats-bar .stat-value {
@@ -249,6 +721,76 @@
 
         #stats-bar .stat-value.partial {
             color: #fbbf24;
+        }
+
+        #stats-bar .stat-value.highlight {
+            color: #fbbf24;
+            font-size: 13px;
+        }
+
+        .stat-separator {
+            display: inline-block;
+            width: 1px;
+            height: 20px;
+            background: #4a4a6a;
+            margin: 0 12px;
+            vertical-align: middle;
+        }
+
+        /* Toggle Buttons */
+        .stat-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            margin-right: 8px;
+            background: rgba(74, 74, 106, 0.3);
+            border: 1px solid #4a4a6a;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-size: 12px;
+            color: #9ca3af;
+            vertical-align: middle;
+        }
+
+        .stat-toggle:hover {
+            background: rgba(74, 74, 106, 0.5);
+            border-color: #6366f1;
+        }
+
+        .stat-toggle.active {
+            background: rgba(74, 222, 128, 0.1);
+            border-color: #4a4a6a;
+        }
+
+        .stat-toggle.active .toggle-icon {
+            color: #4ade80;
+        }
+
+        .stat-toggle:not(.active) {
+            opacity: 0.6;
+        }
+
+        .stat-toggle:not(.active) .toggle-icon {
+            color: #6b7280;
+        }
+
+        .stat-toggle:not(.active) .stat-value {
+            color: #6b7280 !important;
+        }
+
+        .toggle-icon {
+            font-size: 10px;
+            transition: transform 0.2s ease;
+        }
+
+        .stat-toggle:not(.active) .toggle-icon {
+            transform: scale(0.8);
+        }
+
+        .toggle-label {
+            color: inherit;
         }
 
         /* Controls hint */
@@ -319,20 +861,58 @@
             <div class="spinner"></div>
         </div>
 
-        <div id="stats-bar">
-            <span class="stat">Functions: <span class="stat-value" id="stat-total">0</span></span>
-            <span class="stat">Covered: <span class="stat-value alive" id="stat-covered">0</span></span>
-            <span class="stat">Partial: <span class="stat-value partial" id="stat-partial">0</span></span>
-            <span class="stat">Dead: <span class="stat-value dead" id="stat-dead">0</span></span>
-            <span class="stat" style="margin-left: 15px; border-left: 1px solid #4a4a6a; padding-left: 15px;">Classes: <span class="stat-value" id="stat-classes">0</span></span>
-            <span class="stat">Dead Classes: <span class="stat-value dead" id="stat-dead-classes">0</span></span>
-            <span class="stat">Coverage: <span class="stat-value" id="stat-coverage">0%</span></span>
+        <div id="top-bar">
+            <div id="stats-bar">
+                <span class="stat">Total: <span class="stat-value" id="stat-total">0</span></span>
+                <button class="stat-toggle active" id="toggle-covered" title="Toggle covered functions visibility">
+                    <span class="toggle-icon">✓</span>
+                    <span class="stat-value alive" id="stat-covered">0</span>
+                    <span class="toggle-label">Covered</span>
+                </button>
+                <button class="stat-toggle active" id="toggle-dead" title="Toggle dead functions visibility">
+                    <span class="toggle-icon">✓</span>
+                    <span class="stat-value dead" id="stat-dead">0</span>
+                    <span class="toggle-label">Dead</span>
+                </button>
+                <span class="stat-separator"></span>
+                <button class="stat-toggle active" id="toggle-classes" title="Toggle covered classes visibility">
+                    <span class="toggle-icon">✓</span>
+                    <span class="stat-value" id="stat-classes">0</span>
+                    <span class="toggle-label">Classes</span>
+                </button>
+                <button class="stat-toggle active" id="toggle-dead-classes" title="Toggle dead classes visibility">
+                    <span class="toggle-icon">✓</span>
+                    <span class="stat-value dead" id="stat-dead-classes">0</span>
+                    <span class="toggle-label">Dead Classes</span>
+                </button>
+                <span class="stat-separator"></span>
+                <span class="stat">Coverage: <span class="stat-value highlight" id="stat-coverage">0%</span></span>
+            </div>
+
+            <!-- Search Box -->
+            <div id="search-container">
+                <input type="text" id="search-box" placeholder="Search classes or functions..." autocomplete="off" />
+                <span id="search-clear">✕</span>
+                <span id="search-icon">🔍</span>
+                <div id="search-results"></div>
+            </div>
+
+            <!-- View Controls -->
+            <div id="view-controls">
+                <button id="btn-zoom-in" class="view-btn" title="Zoom In (Ctrl++)">+</button>
+                <button id="btn-zoom-out" class="view-btn" title="Zoom Out (Ctrl+-)">−</button>
+                <button id="btn-recenter" class="view-btn" title="Recenter View (Ctrl+0)">⌖</button>
+                <button id="btn-entry-points" class="view-btn entry-points" title="Go to Entry Points (Ctrl+E)">▶</button>
+            </div>
         </div>
 
         <div id="info-panel">
             <h3 id="info-title">Select a node</h3>
             <div id="info-content"></div>
         </div>
+
+        <!-- Hover tooltip with navigation buttons -->
+        <div id="hover-tooltip"></div>
 
         <div id="legend">
             <h4>Legend</h4>
@@ -491,9 +1071,34 @@
                 // Add keyboard pan support (WASD and arrow keys)
                 this.keyPanSpeed = 0.5;
                 this.keysPressed = {};
+
+                // Zoom limits
+                this.minZoom = 5;    // Closest zoom
+                this.maxZoom = 200;  // Furthest zoom
+
                 document.addEventListener('keydown', (e) => {
                     this.keysPressed[e.key.toLowerCase()] = true;
-                    // Shift+drag enables pan mode (handled by OrbitControls internally)
+
+                    // Ctrl+Plus or Ctrl+= to zoom in
+                    if ((e.ctrlKey || e.metaKey) && (e.key === '+' || e.key === '=' || e.key === 'NumpadAdd')) {
+                        e.preventDefault();
+                        this.zoomIn();
+                    }
+                    // Ctrl+Minus to zoom out
+                    if ((e.ctrlKey || e.metaKey) && (e.key === '-' || e.key === '_' || e.key === 'NumpadSubtract')) {
+                        e.preventDefault();
+                        this.zoomOut();
+                    }
+                    // Ctrl+0 to recenter
+                    if ((e.ctrlKey || e.metaKey) && e.key === '0') {
+                        e.preventDefault();
+                        this.recenterView();
+                    }
+                    // Ctrl+E to go to entry points
+                    if ((e.ctrlKey || e.metaKey) && e.key === 'e') {
+                        e.preventDefault();
+                        this.focusOnEntryPoints();
+                    }
                 });
                 document.addEventListener('keyup', (e) => {
                     this.keysPressed[e.key.toLowerCase()] = false;
@@ -547,6 +1152,15 @@
                 // Detect system load - reduce quality if needed
                 this.setupPerformanceMonitor();
 
+                // Initialize search functionality
+                this.initSearch();
+
+                // Initialize view control buttons
+                this.initViewControls();
+
+                // Initialize visibility toggle buttons
+                this.initToggleButtons();
+
                 // Start render loop
                 this.animate();
             }
@@ -595,6 +1209,712 @@
                 this.minFrameTime = 1000 / this.targetFPS;
                 // Note: Don't change pixel ratio - it can cause white screen flashing
                 console.log('TrueFlow: Normal quality mode restored');
+            }
+
+            /**
+             * Creates color-coded HTML for a fully qualified function name.
+             * Package parts: grey, Class name: yellow, Method name: white
+             * @param {string} funcName - Fully qualified name like "src.myapp.MyClass.my_method"
+             * @param {string} sizeClass - Optional: 'fn-large', 'fn-small', or '' for normal
+             * @param {boolean} truncate - Whether to truncate long package paths
+             * @returns {string} HTML with color-coded spans
+             */
+            formatColoredFunctionName(funcName, sizeClass = '', truncate = false) {
+                if (!funcName) return '<span class="fn-colored">Unknown</span>';
+
+                const parts = funcName.split('.');
+                if (parts.length === 0) return `<span class="fn-colored ${sizeClass}">${funcName}</span>`;
+
+                // Last part is always the method/function name
+                const methodName = parts[parts.length - 1];
+
+                // Check if second-to-last is a class (starts with uppercase)
+                let className = '';
+                let packageParts = [];
+
+                if (parts.length >= 2) {
+                    const potentialClass = parts[parts.length - 2];
+                    // Heuristic: class names start with uppercase, module names are lowercase
+                    if (potentialClass && /^[A-Z]/.test(potentialClass)) {
+                        className = potentialClass;
+                        packageParts = parts.slice(0, -2);
+                    } else {
+                        // No class, all before method is package
+                        packageParts = parts.slice(0, -1);
+                    }
+                }
+
+                // Build HTML
+                let html = `<span class="fn-colored ${sizeClass}">`;
+
+                // Package path (grey)
+                if (packageParts.length > 0) {
+                    let pkgDisplay = packageParts.join('.');
+                    if (truncate && packageParts.length > 2) {
+                        // Truncate long paths: "src.crawl4ai.deep.module" -> "src...module"
+                        pkgDisplay = packageParts[0] + '<span class="fn-separator">...</span>' + packageParts[packageParts.length - 1];
+                    }
+                    html += `<span class="fn-package">${truncate ? pkgDisplay : packageParts.join('<span class="fn-separator">.</span>')}</span>`;
+                    html += '<span class="fn-separator">.</span>';
+                }
+
+                // Class name (yellow)
+                if (className) {
+                    html += `<span class="fn-class">${className}</span>`;
+                    html += '<span class="fn-separator">.</span>';
+                }
+
+                // Method name (white, bold)
+                html += `<span class="fn-method">${methodName}</span>`;
+                html += '</span>';
+
+                return html;
+            }
+
+            /**
+             * Find the immediate parent (caller) of a function
+             */
+            findParent(funcName) {
+                const reverseGraph = this.buildReverseCallGraph();
+                const callers = reverseGraph[funcName] || [];
+                // Return the first covered caller, or first caller if none covered
+                const coveredSet = new Set(this.data?.covered_functions || []);
+                const coveredCaller = callers.find(c => coveredSet.has(c));
+                return coveredCaller || callers[0] || null;
+            }
+
+            /**
+             * Find the root caller (topmost entry point) for a function
+             */
+            findRoot(funcName) {
+                const reverseGraph = this.buildReverseCallGraph();
+                const visited = new Set();
+                let current = funcName;
+                let root = funcName;
+
+                while (current && !visited.has(current)) {
+                    visited.add(current);
+                    const callers = reverseGraph[current] || [];
+                    if (callers.length === 0) {
+                        root = current;
+                        break;
+                    }
+                    // Follow the first caller path
+                    current = callers[0];
+                    root = current;
+                }
+
+                return root !== funcName ? root : null;
+            }
+
+            /**
+             * Find the first downstream callee of a function
+             */
+            findFirstDownstream(funcName) {
+                const callGraph = this.data?.call_graph || {};
+                const callees = callGraph[funcName] || [];
+                return callees[0] || null;
+            }
+
+            /**
+             * Show enhanced hover tooltip with navigation buttons
+             */
+            showHoverTooltip(node, event) {
+                const tooltip = document.getElementById('hover-tooltip');
+                const data = node.userData;
+                const funcName = data.name;
+                const info = data.info || {};
+
+                // Find navigation targets
+                const parent = this.findParent(funcName);
+                const root = this.findRoot(funcName);
+                const downstream = this.findFirstDownstream(funcName);
+
+                // Status badge
+                const isAlive = data.isAlive;
+                const statusClass = isAlive ? 'alive' : 'dead';
+                const statusText = isAlive ? 'Executed' : 'Not Executed';
+
+                // First called timestamp
+                const firstCalled = info.first_called;
+                const firstCalledText = firstCalled ? new Date(firstCalled * 1000).toLocaleTimeString() : '—';
+
+                tooltip.innerHTML = `
+                    <div class="tooltip-header">
+                        <div class="tooltip-status ${statusClass}">
+                            <span class="tooltip-status-dot"></span>
+                            ${statusText}
+                        </div>
+                        ${this.formatColoredFunctionName(funcName, 'fn-large', false)}
+                    </div>
+                    <div class="tooltip-body">
+                        <div class="tooltip-meta">
+                            <span class="tooltip-meta-label">File:</span>
+                            <span class="tooltip-meta-value">${info.file || '—'}</span>
+                            <span class="tooltip-meta-label">Line:</span>
+                            <span class="tooltip-meta-value">${info.line || '—'}</span>
+                            <span class="tooltip-meta-label">Calls:</span>
+                            <span class="tooltip-meta-value highlight">${info.call_count || 0}</span>
+                            <span class="tooltip-meta-label">First Called:</span>
+                            <span class="tooltip-meta-value">${firstCalledText}</span>
+                        </div>
+                        <div class="tooltip-nav">
+                            <div class="tooltip-nav-btn ${parent ? '' : 'disabled'}" data-action="parent" data-target="${parent || ''}">
+                                <span class="nav-icon parent">↑</span>
+                                <span class="nav-label">Parent</span>
+                                <span class="nav-target">${parent ? this.formatColoredFunctionName(parent, 'fn-small', true) : '<span style="color:#6b7280">No caller</span>'}</span>
+                                ${parent ? '<span class="nav-arrow">→</span>' : ''}
+                            </div>
+                            <div class="tooltip-nav-btn ${root && root !== parent ? '' : 'disabled'}" data-action="root" data-target="${root || ''}">
+                                <span class="nav-icon root">⬆</span>
+                                <span class="nav-label">Root</span>
+                                <span class="nav-target">${root && root !== parent ? this.formatColoredFunctionName(root, 'fn-small', true) : '<span style="color:#6b7280">—</span>'}</span>
+                                ${root && root !== parent ? '<span class="nav-arrow">→</span>' : ''}
+                            </div>
+                            <div class="tooltip-nav-btn ${downstream ? '' : 'disabled'}" data-action="downstream" data-target="${downstream || ''}">
+                                <span class="nav-icon downstream">↓</span>
+                                <span class="nav-label">Calls</span>
+                                <span class="nav-target">${downstream ? this.formatColoredFunctionName(downstream, 'fn-small', true) : '<span style="color:#6b7280">No callees</span>'}</span>
+                                ${downstream ? '<span class="nav-arrow">→</span>' : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+
+                // Position tooltip
+                const rect = this.container.getBoundingClientRect();
+                let left = event.clientX - rect.left + 20;
+                let top = event.clientY - rect.top + 20;
+
+                // Keep tooltip in view
+                const tooltipRect = { width: 350, height: 280 };
+                if (left + tooltipRect.width > rect.width) {
+                    left = event.clientX - rect.left - tooltipRect.width - 10;
+                }
+                if (top + tooltipRect.height > rect.height) {
+                    top = event.clientY - rect.top - tooltipRect.height - 10;
+                }
+
+                tooltip.style.left = left + 'px';
+                tooltip.style.top = top + 'px';
+                tooltip.classList.add('visible');
+
+                // Add click handlers to navigation buttons
+                tooltip.querySelectorAll('.tooltip-nav-btn:not(.disabled)').forEach(btn => {
+                    btn.onclick = (e) => {
+                        e.stopPropagation();
+                        const target = btn.getAttribute('data-target');
+                        if (target) {
+                            this.navigateToFunction(target);
+                        }
+                    };
+                });
+            }
+
+            /**
+             * Hide the hover tooltip
+             */
+            hideHoverTooltip() {
+                const tooltip = document.getElementById('hover-tooltip');
+                tooltip.classList.remove('visible');
+            }
+
+            /**
+             * Navigate to a function node - select it and focus camera
+             */
+            navigateToFunction(funcName) {
+                const node = this.nodes.get(funcName);
+                if (node) {
+                    this.hideHoverTooltip();
+                    this.selectNode(node);
+                    this.focusOnNode(node);
+                }
+            }
+
+            // === SEARCH FUNCTIONALITY ===
+
+            /**
+             * Initialize search box event listeners
+             */
+            initSearch() {
+                const searchBox = document.getElementById('search-box');
+                const searchResults = document.getElementById('search-results');
+                const searchClear = document.getElementById('search-clear');
+
+                if (!searchBox) return;
+
+                // Debounce search input
+                let searchTimeout = null;
+                searchBox.addEventListener('input', (e) => {
+                    const query = e.target.value.trim();
+
+                    // Show/hide clear button
+                    searchClear.classList.toggle('visible', query.length > 0);
+
+                    // Debounce search
+                    clearTimeout(searchTimeout);
+                    searchTimeout = setTimeout(() => {
+                        this.performSearch(query);
+                    }, 150);
+                });
+
+                // Handle keyboard navigation
+                searchBox.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') {
+                        this.hideSearchResults();
+                        searchBox.blur();
+                    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        this.navigateSearchResults(e.key === 'ArrowDown' ? 1 : -1);
+                    } else if (e.key === 'Enter') {
+                        const selected = searchResults.querySelector('.search-result-item.selected');
+                        if (selected) {
+                            selected.click();
+                        }
+                    }
+                });
+
+                // Clear button
+                searchClear.addEventListener('click', () => {
+                    searchBox.value = '';
+                    searchClear.classList.remove('visible');
+                    this.hideSearchResults();
+                });
+
+                // Close results when clicking outside
+                document.addEventListener('click', (e) => {
+                    if (!e.target.closest('#search-container')) {
+                        this.hideSearchResults();
+                    }
+                });
+
+                // Focus search on Ctrl+F or Cmd+F
+                document.addEventListener('keydown', (e) => {
+                    if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+                        e.preventDefault();
+                        searchBox.focus();
+                        searchBox.select();
+                    }
+                });
+            }
+
+            /**
+             * Initialize view control buttons (zoom, recenter, entry points)
+             */
+            initViewControls() {
+                const btnZoomIn = document.getElementById('btn-zoom-in');
+                const btnZoomOut = document.getElementById('btn-zoom-out');
+                const btnRecenter = document.getElementById('btn-recenter');
+                const btnEntryPoints = document.getElementById('btn-entry-points');
+
+                if (btnZoomIn) {
+                    btnZoomIn.addEventListener('click', () => this.zoomIn());
+                }
+                if (btnZoomOut) {
+                    btnZoomOut.addEventListener('click', () => this.zoomOut());
+                }
+                if (btnRecenter) {
+                    btnRecenter.addEventListener('click', () => this.recenterView());
+                }
+                if (btnEntryPoints) {
+                    btnEntryPoints.addEventListener('click', () => this.focusOnEntryPoints());
+                }
+            }
+
+            /**
+             * Perform search and display results
+             */
+            performSearch(query) {
+                const searchResults = document.getElementById('search-results');
+
+                if (!query || query.length < 1) {
+                    this.hideSearchResults();
+                    return;
+                }
+
+                const lowerQuery = query.toLowerCase();
+                const coveredSet = new Set(this.data?.covered_functions || []);
+
+                // Separate classes and functions
+                const classMatches = [];
+                const functionMatches = [];
+
+                // Search through all nodes
+                this.nodes.forEach((node, funcName) => {
+                    if (funcName.toLowerCase().includes(lowerQuery)) {
+                        const parts = funcName.split('.');
+                        const methodName = parts[parts.length - 1];
+                        const isAlive = coveredSet.has(funcName);
+
+                        // Check if this is a class (has methods) or a function
+                        const potentialClass = parts.length >= 2 ? parts[parts.length - 2] : null;
+                        const isClassMethod = potentialClass && /^[A-Z]/.test(potentialClass);
+
+                        const info = node.userData?.info || {};
+
+                        const match = {
+                            name: funcName,
+                            displayName: funcName,
+                            methodName: methodName,
+                            className: isClassMethod ? potentialClass : null,
+                            isAlive: isAlive,
+                            callCount: info.call_count || 0,
+                            line: info.line || 0
+                        };
+
+                        if (isClassMethod) {
+                            functionMatches.push(match);
+                        } else {
+                            functionMatches.push(match);
+                        }
+                    }
+                });
+
+                // Also search class containers
+                if (this.classInfo) {
+                    Object.keys(this.classInfo).forEach(className => {
+                        if (className.toLowerCase().includes(lowerQuery)) {
+                            const info = this.classInfo[className];
+                            classMatches.push({
+                                name: className,
+                                displayName: className,
+                                isClass: true,
+                                methodCount: info.totalMethods,
+                                coveredCount: info.coveredMethods,
+                                isFullyDead: info.isFullyDead
+                            });
+                        }
+                    });
+                }
+
+                // Build results HTML
+                let html = '';
+
+                if (classMatches.length === 0 && functionMatches.length === 0) {
+                    html = `
+                        <div class="search-no-results">
+                            <div class="search-no-results-icon">🔍</div>
+                            No matches found for "${this.escapeHtml(query)}"
+                        </div>
+                    `;
+                } else {
+                    // Classes section
+                    if (classMatches.length > 0) {
+                        html += `
+                            <div class="search-section">
+                                <div class="search-section-title classes">
+                                    <span>◆</span> Classes
+                                    <span class="search-section-count">${classMatches.length}</span>
+                                </div>
+                        `;
+                        classMatches.slice(0, 10).forEach(match => {
+                            const statusBadge = match.isFullyDead
+                                ? '<span class="search-result-badge dead">Dead</span>'
+                                : '<span class="search-result-badge alive">Active</span>';
+                            html += `
+                                <div class="search-result-item" data-type="class" data-name="${this.escapeHtml(match.name)}">
+                                    <div class="search-result-icon class-icon">C</div>
+                                    <div class="search-result-content">
+                                        <div class="search-result-name">${this.highlightMatch(match.displayName, query)}</div>
+                                        <div class="search-result-meta">${match.coveredCount}/${match.methodCount} methods covered</div>
+                                    </div>
+                                    ${statusBadge}
+                                </div>
+                            `;
+                        });
+                        html += '</div>';
+                    }
+
+                    // Functions section
+                    if (functionMatches.length > 0) {
+                        html += `
+                            <div class="search-section">
+                                <div class="search-section-title functions">
+                                    <span>ƒ</span> Functions
+                                    <span class="search-section-count">${functionMatches.length}</span>
+                                </div>
+                        `;
+                        functionMatches.slice(0, 15).forEach(match => {
+                            const statusClass = match.isAlive ? 'alive' : 'dead';
+                            const statusBadge = match.isAlive
+                                ? `<span class="search-result-badge alive">${match.callCount}×</span>`
+                                : '<span class="search-result-badge dead">Dead</span>';
+                            html += `
+                                <div class="search-result-item" data-type="function" data-name="${this.escapeHtml(match.name)}">
+                                    <div class="search-result-icon function-icon ${statusClass}">ƒ</div>
+                                    <div class="search-result-content">
+                                        <div class="search-result-name">${this.formatColoredFunctionNameWithHighlight(match.name, query)}</div>
+                                        <div class="search-result-meta">Line ${match.line}</div>
+                                    </div>
+                                    ${statusBadge}
+                                </div>
+                            `;
+                        });
+                        html += '</div>';
+                    }
+                }
+
+                searchResults.innerHTML = html;
+                searchResults.classList.add('visible');
+
+                // Add click handlers
+                searchResults.querySelectorAll('.search-result-item').forEach(item => {
+                    item.addEventListener('click', () => {
+                        const type = item.getAttribute('data-type');
+                        const name = item.getAttribute('data-name');
+                        this.selectSearchResult(type, name);
+                    });
+                });
+            }
+
+            /**
+             * Format function name with color coding AND search highlight
+             */
+            formatColoredFunctionNameWithHighlight(funcName, query) {
+                if (!funcName) return '<span class="fn-colored">Unknown</span>';
+
+                const parts = funcName.split('.');
+                if (parts.length === 0) return `<span class="fn-colored">${this.highlightMatch(funcName, query)}</span>`;
+
+                const methodName = parts[parts.length - 1];
+                let className = '';
+                let packageParts = [];
+
+                if (parts.length >= 2) {
+                    const potentialClass = parts[parts.length - 2];
+                    if (potentialClass && /^[A-Z]/.test(potentialClass)) {
+                        className = potentialClass;
+                        packageParts = parts.slice(0, -2);
+                    } else {
+                        packageParts = parts.slice(0, -1);
+                    }
+                }
+
+                let html = '<span class="fn-colored">';
+
+                // Package (grey)
+                if (packageParts.length > 0) {
+                    const pkgStr = packageParts.join('.');
+                    html += `<span class="fn-package">${this.highlightMatch(pkgStr, query)}</span>`;
+                    html += '<span class="fn-separator">.</span>';
+                }
+
+                // Class (yellow)
+                if (className) {
+                    html += `<span class="fn-class">${this.highlightMatch(className, query)}</span>`;
+                    html += '<span class="fn-separator">.</span>';
+                }
+
+                // Method (white)
+                html += `<span class="fn-method">${this.highlightMatch(methodName, query)}</span>`;
+                html += '</span>';
+
+                return html;
+            }
+
+            /**
+             * Highlight matched text in search results
+             */
+            highlightMatch(text, query) {
+                if (!query) return this.escapeHtml(text);
+                const regex = new RegExp(`(${this.escapeRegex(query)})`, 'gi');
+                return this.escapeHtml(text).replace(regex, '<span class="search-highlight">$1</span>');
+            }
+
+            /**
+             * Escape HTML special characters
+             */
+            escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            /**
+             * Escape regex special characters
+             */
+            escapeRegex(str) {
+                return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            }
+
+            /**
+             * Navigate through search results with keyboard
+             */
+            navigateSearchResults(direction) {
+                const searchResults = document.getElementById('search-results');
+                const items = searchResults.querySelectorAll('.search-result-item');
+                if (items.length === 0) return;
+
+                const currentIndex = Array.from(items).findIndex(item => item.classList.contains('selected'));
+                let newIndex = currentIndex + direction;
+
+                if (newIndex < 0) newIndex = items.length - 1;
+                if (newIndex >= items.length) newIndex = 0;
+
+                items.forEach((item, i) => {
+                    item.classList.toggle('selected', i === newIndex);
+                });
+
+                // Scroll into view
+                items[newIndex].scrollIntoView({ block: 'nearest' });
+            }
+
+            /**
+             * Handle selection of a search result
+             */
+            selectSearchResult(type, name) {
+                this.hideSearchResults();
+                document.getElementById('search-box').value = '';
+                document.getElementById('search-clear').classList.remove('visible');
+
+                if (type === 'class') {
+                    // Focus on class container
+                    this.focusOnClass(name);
+                } else {
+                    // Focus on function node
+                    const node = this.nodes.get(name);
+                    if (node) {
+                        // Make node visible if hidden by toggle
+                        if (!node.visible) {
+                            node.visible = true;
+                            node.material.opacity = node.userData.isDead ? 0.7 : 1.0;
+                            node.material.needsUpdate = true;
+                        }
+                        this.selectNode(node);
+                        this.focusOnNode(node);
+                    }
+                }
+            }
+
+            /**
+             * Focus camera on a class container
+             */
+            focusOnClass(className) {
+                console.log('[Explorer] focusOnClass called with:', className);
+                console.log('[Explorer] Total nodes:', this.nodes.size);
+
+                // Find all nodes belonging to this class
+                let classNodes = [];
+                this.nodes.forEach((node, funcName) => {
+                    if (funcName.startsWith(className + '.')) {
+                        classNodes.push(node);
+                    }
+                });
+
+                console.log('[Explorer] Found', classNodes.length, 'matching nodes with exact prefix');
+
+                // If no exact matches, try fuzzy matching (class name at end of path)
+                if (classNodes.length === 0) {
+                    // Extract just the class name (last part that starts with uppercase)
+                    const classNameParts = className.split('.');
+                    let shortClassName = null;
+                    for (let i = classNameParts.length - 1; i >= 0; i--) {
+                        if (/^[A-Z]/.test(classNameParts[i])) {
+                            shortClassName = classNameParts[i];
+                            break;
+                        }
+                    }
+
+                    if (shortClassName) {
+                        console.log('[Explorer] Trying fuzzy match with class:', shortClassName);
+                        this.nodes.forEach((node, funcName) => {
+                            // Match if the class name appears followed by a dot
+                            if (funcName.includes('.' + shortClassName + '.') || funcName.startsWith(shortClassName + '.')) {
+                                classNodes.push(node);
+                            }
+                        });
+                        console.log('[Explorer] Found', classNodes.length, 'nodes with fuzzy match');
+                    }
+                }
+
+                if (classNodes.length === 0) {
+                    // Debug: show first few node names
+                    const sampleNodes = [];
+                    let count = 0;
+                    this.nodes.forEach((node, funcName) => {
+                        if (count < 5) sampleNodes.push(funcName);
+                        count++;
+                    });
+                    console.log('[Explorer] No matches found. Sample node names:', sampleNodes);
+                    return;
+                }
+
+                // Make nodes visible if they were hidden by toggle
+                classNodes.forEach(node => {
+                    if (!node.visible) {
+                        node.visible = true;
+                        node.material.opacity = node.userData.isDead ? 0.7 : 1.0;
+                        node.material.needsUpdate = true;
+                    }
+                });
+
+                // Find bounding box of class nodes
+                let minX = Infinity, maxX = -Infinity;
+                let minY = Infinity, maxY = -Infinity;
+
+                classNodes.forEach(node => {
+                    minX = Math.min(minX, node.position.x);
+                    maxX = Math.max(maxX, node.position.x);
+                    minY = Math.min(minY, node.position.y);
+                    maxY = Math.max(maxY, node.position.y);
+                });
+
+                const centerX = (minX + maxX) / 2;
+                const centerY = (minY + maxY) / 2;
+                const width = Math.max(maxX - minX, 5);
+                const height = Math.max(maxY - minY, 5);
+                const viewDistance = Math.max(width, height) * 0.8 + 12;
+
+                // Animate camera to class position
+                this.animateCameraTo(centerX, centerY + 5, viewDistance, centerX, centerY, 0);
+
+                // Select first node in class
+                if (classNodes[0]) {
+                    this.selectNode(classNodes[0]);
+                }
+
+                console.log('[Explorer] Focused on class:', className, 'with', classNodes.length, 'methods');
+            }
+
+            /**
+             * Animate camera smoothly to target position
+             */
+            animateCameraTo(px, py, pz, tx, ty, tz) {
+                const startPos = this.camera.position.clone();
+                const startTarget = this.controls.target.clone();
+                const endPos = new THREE.Vector3(px, py, pz);
+                const endTarget = new THREE.Vector3(tx, ty, tz);
+
+                const duration = 500;
+                const startTime = performance.now();
+
+                const animate = () => {
+                    const elapsed = performance.now() - startTime;
+                    const t = Math.min(elapsed / duration, 1);
+                    // Ease out cubic
+                    const eased = 1 - Math.pow(1 - t, 3);
+
+                    this.camera.position.lerpVectors(startPos, endPos, eased);
+                    this.controls.target.lerpVectors(startTarget, endTarget, eased);
+                    this.controls.update();
+                    this.needsRender = true;
+
+                    if (t < 1) {
+                        requestAnimationFrame(animate);
+                    }
+                };
+
+                animate();
+            }
+
+            /**
+             * Hide search results dropdown
+             */
+            hideSearchResults() {
+                const searchResults = document.getElementById('search-results');
+                if (searchResults) {
+                    searchResults.classList.remove('visible');
+                }
             }
 
             loadData(data, forceRecreate = false) {
@@ -1071,23 +2391,34 @@
                 });
                 console.log('[Explorer] Entry points (covered with no covered caller):', this.entryPoints.size);
 
-                // Group functions by class (detect ClassName.method pattern)
-                const classFunctions = {};  // className -> [functionNames]
+                // Group functions by their parent (class or module)
+                // Classes start with uppercase, modules are lowercase
+                const classFunctions = {};  // parentName -> [functionNames]
+                const containerTypes = {};  // parentName -> 'class' | 'module'
                 const standaloneFunctions = [];
 
                 Object.keys(functions).forEach(name => {
-                    const dotIndex = name.lastIndexOf('.');
-                    if (dotIndex > 0) {
-                        const className = name.substring(0, dotIndex);
-                        const methodName = name.substring(dotIndex + 1);
-                        if (!classFunctions[className]) {
-                            classFunctions[className] = [];
+                    const parts = name.split('.');
+                    if (parts.length >= 2) {
+                        const methodName = parts[parts.length - 1];
+                        const parentName = parts.slice(0, -1).join('.');
+                        const lastParentPart = parts[parts.length - 2];
+
+                        // Determine if parent is a class (uppercase) or module (lowercase)
+                        const isClass = lastParentPart && /^[A-Z]/.test(lastParentPart);
+
+                        if (!classFunctions[parentName]) {
+                            classFunctions[parentName] = [];
+                            containerTypes[parentName] = isClass ? 'class' : 'module';
                         }
-                        classFunctions[className].push({ fullName: name, methodName });
+                        classFunctions[parentName].push({ fullName: name, methodName });
                     } else {
                         standaloneFunctions.push(name);
                     }
                 });
+
+                // Store container types for styling
+                this.containerTypes = containerTypes;
 
                 // Calculate class coverage status
                 this.classInfo = {};  // Store for stats
@@ -1110,7 +2441,9 @@
                 });
 
                 // Layout: hierarchical based on call depth, but group classes
-                const positions = this.calculateLayoutWithClasses(functions, callGraph, classFunctions);
+                // Pass instantiation order for sorting classes by when they were first instantiated
+                const classInstantiationOrder = this.data.class_instantiation_order || {};
+                const positions = this.calculateLayoutWithClasses(functions, callGraph, classFunctions, classInstantiationOrder);
 
                 // Create nodes
                 Object.entries(functions).forEach(([name, info]) => {
@@ -1152,11 +2485,12 @@
                     this.scene.add(node);
                 });
 
-                // Create class containers (transparent boxes around class methods)
+                // Create containers (transparent boxes around class/module methods)
                 this.classContainers = [];
-                Object.entries(classFunctions).forEach(([className, methods]) => {
+                Object.entries(classFunctions).forEach(([parentName, methods]) => {
                     if (methods.length >= 1) {
-                        const container = this.createClassContainer(className, methods, positions);
+                        const containerType = this.containerTypes[parentName] || 'module';
+                        const container = this.createClassContainer(parentName, methods, positions, containerType);
                         if (container) {
                             this.classContainers.push(container);
                             this.scene.add(container);
@@ -1217,8 +2551,152 @@
                 });
                 console.log('[Explorer] Created', this.entryPointMarkers.length, 'entry point markers');
 
-                // Center camera on scene
-                this.centerCamera();
+                // Focus camera on entry points (root nodes) to show temporal flow start
+                this.focusOnEntryPoints();
+            }
+
+            /**
+             * Focus camera on entry points (root nodes) to show the start of temporal flow.
+             * Positions camera to view the leftmost functions/classes which are the first instantiated.
+             */
+            focusOnEntryPoints() {
+                if (this.entryPoints.size === 0) {
+                    // No entry points, fall back to center camera
+                    this.centerCamera();
+                    return;
+                }
+
+                // Find positions of all entry point nodes
+                let minX = Infinity, maxX = -Infinity;
+                let minY = Infinity, maxY = -Infinity;
+                let entryCount = 0;
+
+                this.entryPoints.forEach(funcName => {
+                    const node = this.nodes.get(funcName);
+                    if (node) {
+                        minX = Math.min(minX, node.position.x);
+                        maxX = Math.max(maxX, node.position.x);
+                        minY = Math.min(minY, node.position.y);
+                        maxY = Math.max(maxY, node.position.y);
+                        entryCount++;
+                    }
+                });
+
+                if (entryCount === 0) {
+                    this.centerCamera();
+                    return;
+                }
+
+                // Calculate the bounding box of entry points
+                const centerX = (minX + maxX) / 2;
+                const centerY = (minY + maxY) / 2;
+                const width = Math.max(maxX - minX, 10);
+                const height = Math.max(maxY - minY, 10);
+
+                // Position camera to view entry points with some padding
+                // Slightly offset to the left to show flow direction
+                const viewDistance = Math.max(width, height) * 0.8 + 15;
+
+                this.camera.position.set(
+                    centerX - 5,  // Slight left offset to show flow starts here
+                    centerY + 8,  // Elevated view
+                    viewDistance
+                );
+                this.controls.target.set(centerX, centerY, 0);
+                this.controls.update();
+                this.needsRender = true;
+
+                console.log('[Explorer] Focused on', entryCount, 'entry points at x:', centerX.toFixed(1));
+            }
+
+            /**
+             * Zoom in - move camera closer to target
+             */
+            zoomIn() {
+                const direction = new THREE.Vector3();
+                direction.subVectors(this.controls.target, this.camera.position).normalize();
+
+                const currentDistance = this.camera.position.distanceTo(this.controls.target);
+                const newDistance = Math.max(this.minZoom, currentDistance * 0.7);  // Zoom in by 30%
+
+                const newPos = this.controls.target.clone().sub(direction.multiplyScalar(newDistance));
+                this.animateCameraTo(newPos, this.controls.target.clone());
+            }
+
+            /**
+             * Zoom out - move camera further from target
+             */
+            zoomOut() {
+                const direction = new THREE.Vector3();
+                direction.subVectors(this.controls.target, this.camera.position).normalize();
+
+                const currentDistance = this.camera.position.distanceTo(this.controls.target);
+                const newDistance = Math.min(this.maxZoom, currentDistance * 1.4);  // Zoom out by 40%
+
+                const newPos = this.controls.target.clone().sub(direction.multiplyScalar(newDistance));
+                this.animateCameraTo(newPos, this.controls.target.clone());
+            }
+
+            /**
+             * Recenter view to show all nodes
+             */
+            recenterView() {
+                if (this.nodes.size === 0) {
+                    this.centerCamera();
+                    return;
+                }
+
+                // Calculate bounding box of all nodes
+                let minX = Infinity, maxX = -Infinity;
+                let minY = Infinity, maxY = -Infinity;
+
+                this.nodes.forEach(node => {
+                    minX = Math.min(minX, node.position.x);
+                    maxX = Math.max(maxX, node.position.x);
+                    minY = Math.min(minY, node.position.y);
+                    maxY = Math.max(maxY, node.position.y);
+                });
+
+                const centerX = (minX + maxX) / 2;
+                const centerY = (minY + maxY) / 2;
+                const width = maxX - minX;
+                const height = maxY - minY;
+
+                // Calculate distance to fit all nodes in view
+                const viewDistance = Math.max(width, height) * 0.8 + 20;
+
+                const targetPos = new THREE.Vector3(centerX, centerY + 10, viewDistance);
+                const targetLookAt = new THREE.Vector3(centerX, centerY, 0);
+
+                this.animateCameraTo(targetPos, targetLookAt);
+                console.log('[Explorer] Recentered view on', this.nodes.size, 'nodes');
+            }
+
+            /**
+             * Animate camera to a new position smoothly
+             */
+            animateCameraTo(targetPosition, targetLookAt) {
+                const startPos = this.camera.position.clone();
+                const startTarget = this.controls.target.clone();
+                const duration = 300;
+                const startTime = performance.now();
+
+                const animate = () => {
+                    const elapsed = performance.now() - startTime;
+                    const t = Math.min(elapsed / duration, 1);
+                    const easeT = 1 - Math.pow(1 - t, 3);  // Ease out cubic
+
+                    this.camera.position.lerpVectors(startPos, targetPosition, easeT);
+                    this.controls.target.lerpVectors(startTarget, targetLookAt, easeT);
+                    this.controls.update();
+                    this.needsRender = true;
+
+                    if (t < 1) {
+                        requestAnimationFrame(animate);
+                    }
+                };
+
+                animate();
             }
 
             // Create an entry point marker (downward arrow indicating function was called from outside)
@@ -1271,8 +2749,8 @@
                 return group;
             }
 
-            createClassContainer(className, methods, positions) {
-                // Calculate bounding box for class methods
+            createClassContainer(className, methods, positions, containerType = 'class') {
+                // Calculate bounding box for class/module methods
                 let minX = Infinity, maxX = -Infinity;
                 let minY = Infinity, maxY = -Infinity;
                 let minZ = Infinity, maxZ = -Infinity;
@@ -1301,18 +2779,34 @@
                 const height = maxY - minY;
                 const depth = maxZ - minZ;
 
-                // Determine container color based on class status
+                // Determine container color based on status and type
                 const classStatus = this.classInfo[className];
                 let containerColor, opacity;
-                if (classStatus && classStatus.isFullyDead) {
-                    containerColor = 0xef4444;  // Red for fully dead class
-                    opacity = 0.15;
-                } else if (classStatus && classStatus.isPartiallyDead) {
-                    containerColor = 0xfbbf24;  // Yellow for partially dead
-                    opacity = 0.1;
+
+                if (containerType === 'module') {
+                    // Module containers use blue/cyan tones
+                    if (classStatus && classStatus.isFullyDead) {
+                        containerColor = 0x6366f1;  // Indigo for fully dead module
+                        opacity = 0.12;
+                    } else if (classStatus && classStatus.isPartiallyDead) {
+                        containerColor = 0x8b5cf6;  // Purple for partially dead module
+                        opacity = 0.08;
+                    } else {
+                        containerColor = 0x06b6d4;  // Cyan for fully covered module
+                        opacity = 0.06;
+                    }
                 } else {
-                    containerColor = 0x4ade80;  // Green for fully covered
-                    opacity = 0.08;
+                    // Class containers use warm tones (original behavior)
+                    if (classStatus && classStatus.isFullyDead) {
+                        containerColor = 0xef4444;  // Red for fully dead class
+                        opacity = 0.15;
+                    } else if (classStatus && classStatus.isPartiallyDead) {
+                        containerColor = 0xfbbf24;  // Yellow for partially dead
+                        opacity = 0.1;
+                    } else {
+                        containerColor = 0x4ade80;  // Green for fully covered
+                        opacity = 0.08;
+                    }
                 }
 
                 // Create transparent box
@@ -1345,24 +2839,32 @@
                 wireframe.frustumCulled = false;
                 container.add(wireframe);
 
-                // Add class label above the container
+                // Add label above the container
                 const canvas = document.createElement('canvas');
                 const context = canvas.getContext('2d');
                 canvas.width = 512;
                 canvas.height = 64;
 
-                // Extract just the class name (last part after dots)
-                const displayClassName = className.includes('.')
+                // Extract just the class/module name (last part after dots)
+                const displayName = className.includes('.')
                     ? className.split('.').pop()
                     : className;
 
-                context.fillStyle = classStatus && classStatus.isFullyDead ? '#ef4444' : '#7dd3fc';
+                // Different colors for classes vs modules
+                let labelColor;
+                if (classStatus && classStatus.isFullyDead) {
+                    labelColor = containerType === 'module' ? '#6366f1' : '#ef4444';
+                } else {
+                    labelColor = containerType === 'module' ? '#06b6d4' : '#7dd3fc';
+                }
+                context.fillStyle = labelColor;
+
                 // Adjust font size based on name length
-                const fontSize = displayClassName.length > 15 ? 22 : 28;
+                const fontSize = displayName.length > 15 ? 22 : 28;
                 context.font = `bold ${fontSize}px sans-serif`;
                 context.textAlign = 'center';
                 context.textBaseline = 'middle';
-                context.fillText(displayClassName, 256, 32);
+                context.fillText(displayName, 256, 32);
 
                 const texture = new THREE.CanvasTexture(canvas);
                 const spriteMaterial = new THREE.SpriteMaterial({ map: texture, transparent: true });
@@ -1372,9 +2874,10 @@
                 sprite.frustumCulled = false;  // Prevent label disappearing
                 container.add(sprite);
 
-                // Store class info in userData
+                // Store container info in userData
                 container.userData = {
                     isClassContainer: true,
+                    containerType: containerType,
                     className: className,
                     classInfo: classStatus
                 };
@@ -1382,14 +2885,45 @@
                 return container;
             }
 
-            calculateLayoutWithClasses(functions, callGraph, classFunctions) {
+            calculateLayoutWithClasses(functions, callGraph, classFunctions, classInstantiationOrder = {}) {
                 const positions = {};
 
+                // Debug: Log instantiation order data
+                console.log('[Layout] classInstantiationOrder:', classInstantiationOrder);
+                console.log('[Layout] classFunctions keys:', Object.keys(classFunctions).slice(0, 5));
+
                 // First, group by class and calculate class positions
+                // Sort classes by instantiation order (when their __init__ was first called)
+                // Classes that were never instantiated go to the end (sorted alphabetically)
+                const classEntries = Object.entries(classFunctions);
+                classEntries.sort((a, b) => {
+                    const classNameA = a[0];
+                    const classNameB = b[0];
+                    const orderA = classInstantiationOrder[classNameA];
+                    const orderB = classInstantiationOrder[classNameB];
+
+                    // Both have instantiation order: sort by timestamp
+                    if (orderA !== undefined && orderB !== undefined) {
+                        return orderA - orderB;
+                    }
+                    // Only A has order: A comes first
+                    if (orderA !== undefined) return -1;
+                    // Only B has order: B comes first
+                    if (orderB !== undefined) return 1;
+                    // Neither has order: sort alphabetically
+                    return classNameA.localeCompare(classNameB);
+                });
+
+                // Debug: Log sorted order
+                console.log('[Layout] Sorted class order (first 5):', classEntries.slice(0, 5).map(([name]) => {
+                    const order = classInstantiationOrder[name];
+                    return `${name.split('.').pop()}=${order !== undefined ? order.toFixed(2) : 'N/A'}`;
+                }));
+
                 let classIndex = 0;
                 const classWidth = 12;  // Space for each class horizontally
 
-                Object.entries(classFunctions).forEach(([className, methods]) => {
+                classEntries.forEach(([className, methods]) => {
                     const classX = classIndex * classWidth;
 
                     // Arrange methods vertically within the class (deterministic positions)
@@ -1668,37 +3202,226 @@
 
                 const functions = this.data.functions || {};
                 const coveredSet = new Set(this.data.covered_functions || []);
+                const functionKeys = new Set(Object.keys(functions));
 
-                const total = Object.keys(functions).length;
-                const dead = (this.data.dead_functions || []).length;
+                const total = functionKeys.size;
 
-                // Count partially covered (covered + has branches) vs fully covered (covered + no branches)
-                let partial = 0;
-                let fullyCovered = 0;
+                // Count covered as functions that are BOTH in functions map AND in covered list
+                // This handles the case where covered_functions may include items not in filtered functions
+                let covered = 0;
                 coveredSet.forEach(name => {
-                    const info = functions[name];
-                    if (info && (info.branches || []).length > 0) {
-                        partial++;
-                    } else {
-                        fullyCovered++;
-                    }
+                    if (functionKeys.has(name)) covered++;
                 });
 
-                const coverage = total > 0 ? Math.round(((fullyCovered + partial) / total) * 100) : 0;
+                // Dead = total - covered (proper math)
+                const dead = total - covered;
+
+                const coverage = total > 0 ? Math.round((covered / total) * 100) : 0;
 
                 document.getElementById('stat-total').textContent = total;
-                document.getElementById('stat-covered').textContent = fullyCovered;
-                document.getElementById('stat-partial').textContent = partial;
+                document.getElementById('stat-covered').textContent = covered;
                 document.getElementById('stat-dead').textContent = dead;
                 document.getElementById('stat-coverage').textContent = coverage + '%';
 
-                // Class statistics
+                // Class statistics - count classes vs modules separately
                 if (this.classInfo) {
-                    const totalClasses = Object.keys(this.classInfo).length;
-                    const deadClasses = Object.values(this.classInfo).filter(c => c.isFullyDead).length;
+                    // Only count actual classes (not modules) for class stats
+                    let totalClasses = 0;
+                    let deadClasses = 0;
+                    Object.entries(this.classInfo).forEach(([name, info]) => {
+                        const isClass = this.containerTypes && this.containerTypes[name] === 'class';
+                        if (isClass) {
+                            totalClasses++;
+                            if (info.isFullyDead) deadClasses++;
+                        }
+                    });
                     document.getElementById('stat-classes').textContent = totalClasses;
                     document.getElementById('stat-dead-classes').textContent = deadClasses;
                 }
+            }
+
+            /**
+             * Initialize visibility toggle buttons
+             */
+            initToggleButtons() {
+                // Visibility states
+                this.visibilityState = {
+                    covered: true,
+                    dead: true,
+                    classes: true,
+                    deadClasses: true
+                };
+
+                const toggleCovered = document.getElementById('toggle-covered');
+                const toggleDead = document.getElementById('toggle-dead');
+                const toggleClasses = document.getElementById('toggle-classes');
+                const toggleDeadClasses = document.getElementById('toggle-dead-classes');
+
+                if (toggleCovered) {
+                    toggleCovered.addEventListener('click', () => {
+                        this.visibilityState.covered = !this.visibilityState.covered;
+                        toggleCovered.classList.toggle('active', this.visibilityState.covered);
+                        this.updateNodeVisibility();
+                    });
+                }
+
+                if (toggleDead) {
+                    toggleDead.addEventListener('click', () => {
+                        this.visibilityState.dead = !this.visibilityState.dead;
+                        toggleDead.classList.toggle('active', this.visibilityState.dead);
+                        this.updateNodeVisibility();
+                    });
+                }
+
+                if (toggleClasses) {
+                    toggleClasses.addEventListener('click', () => {
+                        this.visibilityState.classes = !this.visibilityState.classes;
+                        toggleClasses.classList.toggle('active', this.visibilityState.classes);
+                        this.updateContainerVisibility();
+                    });
+                }
+
+                if (toggleDeadClasses) {
+                    toggleDeadClasses.addEventListener('click', () => {
+                        this.visibilityState.deadClasses = !this.visibilityState.deadClasses;
+                        toggleDeadClasses.classList.toggle('active', this.visibilityState.deadClasses);
+                        this.updateContainerVisibility();
+                    });
+                }
+            }
+
+            /**
+             * Update node visibility based on toggle states with animation
+             */
+            updateNodeVisibility() {
+                const coveredSet = new Set(this.data?.covered_functions || []);
+                const duration = 200;
+
+                this.nodes.forEach((node, name) => {
+                    const isCovered = coveredSet.has(name);
+                    const shouldShow = isCovered ? this.visibilityState.covered : this.visibilityState.dead;
+
+                    // Animate opacity
+                    const targetOpacity = shouldShow ? (node.userData.isDead ? 0.7 : 1.0) : 0;
+                    const startOpacity = node.material.opacity;
+
+                    if (Math.abs(targetOpacity - startOpacity) > 0.01) {
+                        this.animateNodeOpacity(node, startOpacity, targetOpacity, duration);
+                    }
+
+                    node.visible = shouldShow || node.material.opacity > 0.01;
+                });
+
+                // Update edges visibility
+                this.updateEdgeVisibility();
+                this.needsRender = true;
+            }
+
+            /**
+             * Update container visibility based on toggle states
+             */
+            updateContainerVisibility() {
+                if (!this.classContainers) return;
+                const duration = 200;
+
+                this.classContainers.forEach(container => {
+                    const info = container.userData;
+                    const isClass = info.containerType === 'class';
+                    const isDead = info.classInfo?.isFullyDead;
+
+                    let shouldShow;
+                    if (isClass) {
+                        shouldShow = isDead ? this.visibilityState.deadClasses : this.visibilityState.classes;
+                    } else {
+                        // Modules follow the same visibility as their type
+                        shouldShow = isDead ? this.visibilityState.deadClasses : this.visibilityState.classes;
+                    }
+
+                    const targetOpacity = shouldShow ? (isDead ? 0.12 : 0.08) : 0;
+                    const startOpacity = container.material.opacity;
+
+                    if (Math.abs(targetOpacity - startOpacity) > 0.01) {
+                        this.animateContainerOpacity(container, startOpacity, targetOpacity, duration);
+                    }
+
+                    container.visible = shouldShow || container.material.opacity > 0.01;
+                });
+
+                this.needsRender = true;
+            }
+
+            /**
+             * Animate node opacity
+             */
+            animateNodeOpacity(node, from, to, duration) {
+                const startTime = performance.now();
+
+                const animate = () => {
+                    const elapsed = performance.now() - startTime;
+                    const t = Math.min(elapsed / duration, 1);
+                    const eased = 1 - Math.pow(1 - t, 2);
+
+                    node.material.opacity = from + (to - from) * eased;
+                    // Keep visible if animating TO visible (to > 0), or if still has opacity
+                    node.visible = to > 0 || node.material.opacity > 0.01;
+                    node.material.needsUpdate = true;
+                    this.needsRender = true;
+
+                    if (t < 1) requestAnimationFrame(animate);
+                };
+                animate();
+            }
+
+            /**
+             * Animate container opacity
+             */
+            animateContainerOpacity(container, from, to, duration) {
+                const startTime = performance.now();
+
+                const animate = () => {
+                    const elapsed = performance.now() - startTime;
+                    const t = Math.min(elapsed / duration, 1);
+                    const eased = 1 - Math.pow(1 - t, 2);
+
+                    container.material.opacity = from + (to - from) * eased;
+                    // Also animate wireframe
+                    if (container.children[0]?.material) {
+                        container.children[0].material.opacity = (from + (to - from) * eased) * 4;
+                    }
+                    // Keep visible if animating TO visible (to > 0), or if still has opacity
+                    container.visible = to > 0 || container.material.opacity > 0.01;
+                    container.material.needsUpdate = true;
+                    this.needsRender = true;
+
+                    if (t < 1) requestAnimationFrame(animate);
+                };
+                animate();
+            }
+
+            /**
+             * Update edge visibility based on node visibility
+             */
+            updateEdgeVisibility() {
+                const coveredSet = new Set(this.data?.covered_functions || []);
+                const callGraph = this.data?.call_graph || {};
+
+                let edgeIndex = 0;
+                Object.entries(callGraph).forEach(([caller, callees]) => {
+                    const callerNode = this.nodes.get(caller);
+                    if (!callerNode) return;
+
+                    callees.forEach(callee => {
+                        const calleeNode = this.nodes.get(callee);
+                        if (!calleeNode || edgeIndex >= this.edges.length) return;
+
+                        const edge = this.edges[edgeIndex];
+                        const callerVisible = callerNode.visible && callerNode.material.opacity > 0.1;
+                        const calleeVisible = calleeNode.visible && calleeNode.material.opacity > 0.1;
+
+                        edge.visible = callerVisible && calleeVisible;
+                        edgeIndex++;
+                    });
+                });
             }
 
             onClick(event) {
@@ -1739,16 +3462,29 @@
                 const classData = this.classInfo[className];
                 if (!classData) return;
 
-                const panel = document.getElementById('details-panel');
-                panel.innerHTML = `
-                    <h3>${className}</h3>
+                // Use the existing info-panel elements
+                const title = document.getElementById('info-title');
+                const content = document.getElementById('info-content');
+                if (!title || !content) return;
+
+                // Extract short class name for title
+                const shortName = className.split('.').pop() || className;
+                const statusText = classData.isFullyDead ? 'Dead' : classData.isPartiallyDead ? 'Partial' : 'Active';
+                const statusClass = classData.isFullyDead ? 'dead' : classData.isPartiallyDead ? 'partial' : 'alive';
+
+                title.innerHTML = this.formatColoredFunctionName(className, '', true);
+                content.innerHTML = `
+                    <p><span class="stat-value ${statusClass}">${statusText}</span></p>
                     <p><strong>Methods:</strong> ${classData.totalMethods}</p>
-                    <p><strong>Covered:</strong> ${classData.coveredMethods}</p>
-                    <p><strong>Status:</strong> ${classData.isFullyDead ? 'Fully Dead' : classData.isPartiallyDead ? 'Partially Dead' : 'Active'}</p>
-                    <div style="margin-top: 10px;">
+                    <p><strong>Covered:</strong> <span class="stat-value alive">${classData.coveredMethods}</span></p>
+                    <p><strong>Dead:</strong> <span class="stat-value dead">${classData.totalMethods - classData.coveredMethods}</span></p>
+                    <div style="margin-top: 10px; max-height: 200px; overflow-y: auto;">
                         <strong>Methods:</strong>
-                        <ul style="margin-top: 5px; padding-left: 20px;">
-                            ${classData.methods.map(m => `<li>${m.methodName}</li>`).join('')}
+                        <ul style="margin-top: 5px; padding-left: 20px; font-size: 11px;">
+                            ${classData.methods.map(m => {
+                                const isCovered = this.data?.covered_functions?.includes(m.fullName);
+                                return `<li style="color: ${isCovered ? '#4ade80' : '#f87171'}">${m.methodName}</li>`;
+                            }).join('')}
                         </ul>
                     </div>
                 `;
@@ -1774,7 +3510,9 @@
                 const meshes = Array.from(this.nodes.values());
                 const intersects = this.raycaster.intersectObjects(meshes);
 
+                // Legacy simple tooltip (hidden, using enhanced instead)
                 const tooltip = document.getElementById('tooltip');
+                tooltip.style.display = 'none';
 
                 if (intersects.length > 0) {
                     const node = intersects[0].object;
@@ -1783,18 +3521,14 @@
                         this.highlightNode(node, true);
                     }
 
-                    // Show tooltip
-                    const data = node.userData;
-                    tooltip.innerHTML = data.name;
-                    tooltip.style.display = 'block';
-                    tooltip.style.left = event.clientX + 15 + 'px';
-                    tooltip.style.top = event.clientY + 15 + 'px';
+                    // Show enhanced hover tooltip with navigation
+                    this.showHoverTooltip(node, event);
                 } else {
                     if (this.hoveredNode) {
                         this.highlightNode(this.hoveredNode, false);
                         this.hoveredNode = null;
                     }
-                    tooltip.style.display = 'none';
+                    this.hideHoverTooltip();
                 }
             }
 

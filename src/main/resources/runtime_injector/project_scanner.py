@@ -60,7 +60,11 @@ class ProjectScanner(object):
         return self.functions
 
     def _extract_functions(self, filepath):
-        """Extract all function and method names with line numbers from a Python file."""
+        """Extract all function and method names with line numbers from a Python file.
+
+        Methods are extracted with class context: ClassName.method_name
+        This matches the co_qualname used in runtime tracing.
+        """
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 source = f.read()
@@ -77,15 +81,36 @@ class ProjectScanner(object):
         functions = set()
         func_lines = {}  # {function_name: line_number}
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                functions.add(node.name)
-                func_lines[node.name] = node.lineno
-            elif isinstance(node, ast.AsyncFunctionDef):
-                functions.add(node.name)
-                func_lines[node.name] = node.lineno
+        # Use a visitor to properly track class context
+        self._extract_with_context(tree, functions, func_lines, class_name=None)
 
         return functions, func_lines
+
+    def _extract_with_context(self, node, functions, func_lines, class_name=None):
+        """Recursively extract functions with proper class context.
+
+        Handles nested classes by building full qualified names like:
+        OuterClass.InnerClass.method (matching Python's co_qualname)
+        """
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                # Build nested class name: OuterClass.InnerClass
+                nested_class_name = "{0}.{1}".format(class_name, child.name) if class_name else child.name
+                # Recurse into class with its full nested name as context
+                self._extract_with_context(child, functions, func_lines, class_name=nested_class_name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Build qualified name like co_qualname does
+                if class_name:
+                    full_name = "{0}.{1}".format(class_name, child.name)
+                else:
+                    full_name = child.name
+                functions.add(full_name)
+                func_lines[full_name] = child.lineno
+                # Also recurse into nested functions/classes (keep same class context)
+                self._extract_with_context(child, functions, func_lines, class_name=class_name)
+            else:
+                # Continue recursing for other nodes (e.g., if blocks with class defs)
+                self._extract_with_context(child, functions, func_lines, class_name=class_name)
 
     def get_function_line(self, filepath, function_name):
         """Get the line number for a function in a file."""

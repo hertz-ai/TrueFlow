@@ -94,7 +94,8 @@ class TraceSocketClient(
             sessionId = data.get("session_id")?.asString ?: "",
             correlationId = if (data.get("correlation_id")?.isJsonNull == true) null else data.get("correlation_id")?.asString,
             learningPhase = if (data.get("learning_phase")?.isJsonNull == true) null else data.get("learning_phase")?.asString,
-            traceData = data.get("trace_data")?.asJsonObject  // For cycle_complete events
+            // Handle JsonNull: GSON returns JsonNull for JSON null values, not Kotlin null
+            traceData = data.get("trace_data")?.let { if (it.isJsonNull) null else it.asJsonObject }
         )
     }
 

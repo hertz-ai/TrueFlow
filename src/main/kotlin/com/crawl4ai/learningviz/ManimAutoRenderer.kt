@@ -3,10 +3,30 @@ package com.crawl4ai.learningviz
 import com.intellij.openapi.project.Project
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+
+/**
+ * Safe JSON element accessors that handle JsonNull properly.
+ * GSON's JsonNull is a non-null object, so Kotlin's ?. safe call doesn't protect against it.
+ * These extensions return null for both Kotlin null and JsonNull.
+ */
+private fun JsonElement?.safeAsString(): String? =
+    if (this == null || this.isJsonNull) null else this.asString
+
+private fun JsonElement?.safeAsInt(): Int? =
+    if (this == null || this.isJsonNull) null else this.asInt
+
+private fun JsonElement?.safeAsDouble(): Double? =
+    if (this == null || this.isJsonNull) null else this.asDouble
+
+private fun JsonObject.safeGetString(key: String): String? = this.get(key).safeAsString()
+private fun JsonObject.safeGetInt(key: String): Int? = this.get(key).safeAsInt()
+private fun JsonObject.safeGetDouble(key: String): Double? = this.get(key).safeAsDouble()
 
 /**
  * Auto-renderer that buffers trace events and generates Manim videos.
@@ -66,7 +86,7 @@ class ManimAutoRenderer(
     fun onTraceEvent(event: TraceEvent) {
         // Handle cycle_complete events immediately (contains full trace JSON)
         if (event.type == "cycle_complete" && event.traceData != null) {
-            val correlationId = event.traceData.get("correlation_id")?.asString
+            val correlationId = event.traceData.safeGetString("correlation_id")
             if (correlationId != null) {
                 PluginLogger.info("Received cycle_complete event for: $correlationId, generating video immediately...")
                 processingIds.add(correlationId)
@@ -81,29 +101,30 @@ class ManimAutoRenderer(
 
                         calls?.forEach { callObj ->
                             val obj = callObj.asJsonObject
-                            val file = obj.get("file_path")?.asString ?: ""
-                            val module = obj.get("module")?.asString ?: ""
+                            val file = obj.safeGetString("file_path") ?: ""
+                            val module = obj.safeGetString("module") ?: ""
 
                             // Apply global filter to each call
                             if (!traceFilter.shouldExclude(file) && !traceFilter.shouldExcludeModule(module)) {
                                 filteredCalls.add(obj)
                                 // Also create TraceEvent for path hash calculation
-                            allEvents.add(TraceEvent(
-                                callId = obj.get("call_id")?.asString ?: "",
-                                type = obj.get("type")?.asString ?: "call",
-                                timestamp = obj.get("timestamp")?.asDouble ?: 0.0,
-                                module = module,
-                                function = obj.get("function")?.asString ?: "",
-                                file = file,
-                                line = obj.get("line_number")?.asInt ?: 0,
-                                depth = obj.get("depth")?.asInt ?: 0,
-                                parentId = obj.get("parent_id")?.asString,
-                                correlationId = obj.get("correlation_id")?.asString,
-                                learningPhase = obj.get("learning_phase")?.asString,
-                                sessionId = "",
-                                processId = 0,
-                                traceData = null
-                            ))
+                                // Use safe accessors to handle JsonNull values from Python None
+                                allEvents.add(TraceEvent(
+                                    callId = obj.safeGetString("call_id") ?: "",
+                                    type = obj.safeGetString("type") ?: "call",
+                                    timestamp = obj.safeGetDouble("start_time") ?: obj.safeGetDouble("timestamp") ?: 0.0,
+                                    module = module,
+                                    function = obj.safeGetString("function_name") ?: obj.safeGetString("function") ?: "",
+                                    file = file,
+                                    line = obj.safeGetInt("line_number") ?: obj.safeGetInt("line") ?: 0,
+                                    depth = obj.safeGetInt("depth") ?: 0,
+                                    parentId = obj.safeGetString("parent_id"),  // Can be null
+                                    correlationId = obj.safeGetString("correlation_id"),  // Can be null
+                                    learningPhase = obj.safeGetString("learning_phase"),  // Can be null
+                                    sessionId = "",
+                                    processId = 0,
+                                    traceData = null
+                                ))
                             }
                         }
 
@@ -365,11 +386,13 @@ class ManimAutoRenderer(
                         config.media_dir = str(plugin_media)
                         config.quality = 'medium_quality'
                         config.output_file = 'video_${correlationId}_${pathHash}'
+                        # Disable caching to prevent SVG cache corruption issues
+                        config.disable_caching = True
                         config['video_dir'] = '{media_dir}/videos/{quality}'
                         config['images_dir'] = '{media_dir}/images/{quality}'
                         config['text_dir'] = '{media_dir}/texts'
 
-                        print(f"Manim media configured to: {config.media_dir}/")
+                        print(f"Manim media configured to: {config.media_dir}/ (caching disabled)")
 
                         scene = ProceduralTraceScene('$tracePath')
                         scene.render()
@@ -476,12 +499,14 @@ class ManimAutoRenderer(
                     config.quality = 'high_quality'
                     config.output_file = 'video_${correlationId}_${pathHash}'
                     config.frame_rate = 30
+                    # Disable caching to prevent SVG cache corruption issues
+                    config.disable_caching = True
                     # Override directory templates to remove module_name nesting
                     config['video_dir'] = '{media_dir}/videos/{quality}'
                     config['images_dir'] = '{media_dir}/images/{quality}'
                     config['text_dir'] = '{media_dir}/texts'
 
-                    print(f"Manim media configured to: {config.media_dir}/")
+                    print(f"Manim media configured to: {config.media_dir}/ (caching disabled)")
 
                     # Create and render ultimate architecture scene
                     scene = UltimateArchitectureScene(trace_file='$tracePath')
@@ -506,11 +531,13 @@ class ManimAutoRenderer(
                     config.media_dir = str(plugin_media)
                     config.quality = 'medium_quality'
                     config.output_file = 'video_${correlationId}_${pathHash}'
+                    # Disable caching to prevent SVG cache corruption issues
+                    config.disable_caching = True
                     config['video_dir'] = '{media_dir}/videos/{quality}'
                     config['images_dir'] = '{media_dir}/images/{quality}'
                     config['text_dir'] = '{media_dir}/texts'
 
-                    print(f"Manim media configured to: {config.media_dir}/")
+                    print(f"Manim media configured to: {config.media_dir}/ (caching disabled)")
 
                     scene = SimpleTraceScene(trace_file='$tracePath')
                     scene.render()

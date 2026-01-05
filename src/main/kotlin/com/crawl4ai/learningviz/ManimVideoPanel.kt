@@ -200,23 +200,26 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         // Create tabbed pane with two views
         val tabbedPane = JBTabbedPane()
 
-        // Tab 1: Video List (existing functionality)
-        val videoListPanel = createVideoListPanel()
-        tabbedPane.addTab("Video List", videoListPanel)
-
-        // Tab 2: Interactive Explorer (new Three.js visualization)
+        // Tab 1: Interactive Explorer (default tab - Three.js visualization)
         val interactivePanel = createInteractiveExplorerPanel()
         tabbedPane.addTab("Interactive Explorer", interactivePanel)
+
+        // Tab 2: Video List
+        val videoListPanel = createVideoListPanel()
+        tabbedPane.addTab("Video List", videoListPanel)
 
         add(tabbedPane, BorderLayout.CENTER)
 
         // Listen for tab changes to load data when Interactive Explorer is selected
         tabbedPane.addChangeListener { e ->
-            if (tabbedPane.selectedIndex == 1) {
+            if (tabbedPane.selectedIndex == 0) {
                 // Interactive Explorer tab selected - refresh visualization
                 refreshInteractiveVisualization()
             }
         }
+
+        // Load Interactive Explorer data on startup
+        refreshInteractiveVisualization()
     }
 
     /**
@@ -775,7 +778,9 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         callTree: Map<String, List<String>>,
         functionDefinitions: Map<String, Pair<String, Int>>,  // func -> (file, line)
         whyNotCovered: Map<String, WhyNotCoveredInfo>,
-        resolvedCallGraph: Map<String, List<String>> = emptyMap()  // Static call graph for cross-class connections
+        resolvedCallGraph: Map<String, List<String>> = emptyMap(),  // Static call graph for cross-class connections
+        classInstantiationOrder: Map<String, Double> = emptyMap(),  // className -> first init timestamp (for ordering)
+        functionFirstCalledTimestamp: Map<String, Double> = emptyMap()  // funcKey -> first call timestamp
     ) {
         val coveredFunctions = calledFunctions.keys.toList()
         val deadFunctions = allFunctions.filter { it !in calledFunctions.keys }
@@ -787,6 +792,7 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                 "line" to line,
                 "file" to file,
                 "call_count" to (calledFunctions[func] ?: 0),
+                "first_called" to (functionFirstCalledTimestamp[func]),  // When this function was first invoked
                 "branches" to emptyList<Any>()  // Will be populated by branch analyzer
             )
         }
@@ -817,6 +823,7 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             "resolved_call_graph" to resolvedCallGraph,  // Include for cross-class static connections
             "covered_functions" to coveredFunctions,
             "dead_functions" to deadFunctions,
+            "class_instantiation_order" to classInstantiationOrder,  // For ordering class containers by init time
             "why_not_covered" to whyNotCovered.mapValues { (_, info) ->
                 mapOf(
                     "function" to info.function,
@@ -846,6 +853,20 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         )
 
         val jsonData = gson.toJson(data)
+
+        // Log what we're sending to help debug data flow
+        PluginLogger.info("[ManimVideoPanel] Sending to Interactive Explorer:")
+        PluginLogger.info("[ManimVideoPanel]   allFunctions.size: ${allFunctions.size}")
+        PluginLogger.info("[ManimVideoPanel]   calledFunctions.size: ${calledFunctions.size}")
+        PluginLogger.info("[ManimVideoPanel]   coveredFunctions.size: ${coveredFunctions.size}")
+        PluginLogger.info("[ManimVideoPanel]   deadFunctions.size: ${deadFunctions.size}")
+        PluginLogger.info("[ManimVideoPanel]   callTree.size: ${callTree.size}")
+        if (allFunctions.isNotEmpty()) {
+            PluginLogger.info("[ManimVideoPanel]   Sample allFunctions: ${allFunctions.take(3)}")
+        }
+        if (calledFunctions.isNotEmpty()) {
+            PluginLogger.info("[ManimVideoPanel]   Sample calledFunctions: ${calledFunctions.keys.take(3)}")
+        }
 
         ApplicationManager.getApplication().invokeLater {
             interactiveBrowser?.cefBrowser?.executeJavaScript(

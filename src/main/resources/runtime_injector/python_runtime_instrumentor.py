@@ -702,7 +702,10 @@ class RuntimeInstrumentor(object):
         """Convert file path to module name.
 
         Converts absolute path to relative module path to match Python's __name__.
-        e.g., C:/project/src/crawl4ai/foo.py -> src.crawl4ai.foo
+        Uses project root (cwd) as the base, producing paths like:
+        - src.crawl4ai.foo (if file is in src/crawl4ai/foo.py)
+
+        This must match what Python's __name__ returns at runtime.
         """
         # Get absolute path and normalize
         abs_path = os.path.abspath(filepath)
@@ -766,6 +769,27 @@ class RuntimeInstrumentor(object):
             # Use co_qualname (Python 3.3+) for class-qualified names like "ClassName.method"
             # This matches the format used by static analysis for proper call graph connections
             func_name = getattr(code, 'co_qualname', code.co_name)
+
+            # CRITICAL FIX: co_qualname is NOT reliable for decorated methods, dynamically assigned
+            # methods, or methods from metaclasses. It may return just "method" instead of "ClassName.method".
+            # We need to extract the class name from 'self' or 'cls' in the frame's local variables.
+            if '.' not in func_name and '<' not in func_name:
+                # func_name doesn't have class qualifier, try to get it from self/cls
+                f_locals = frame.f_locals
+                class_name = None
+                if 'self' in f_locals:
+                    try:
+                        class_name = type(f_locals['self']).__name__
+                    except Exception:
+                        pass
+                elif 'cls' in f_locals:
+                    try:
+                        class_name = f_locals['cls'].__name__
+                    except Exception:
+                        pass
+                if class_name:
+                    func_name = "{0}.{1}".format(class_name, func_name)
+
             module = frame.f_globals.get('__name__', '') or ''  # Handle None case
 
             # Skip Python-generated internal functions (comprehensions, lambdas, etc.)
@@ -1069,9 +1093,8 @@ class RuntimeInstrumentor(object):
                             self._auto_end_cycle_by_depth(self.current_correlation_id)
 
                     # Also check traditional exit points
-                    code = frame.f_code
-                    func_name = getattr(code, 'co_qualname', code.co_name)
-                    self._detect_learning_cycle_end(func_name)
+                    # Use the already-corrected function_name from call_record (includes class name)
+                    self._detect_learning_cycle_end(call_record.function_name)
 
                     # Detect patterns again on return (all variables are now available)
                     try:
