@@ -1313,7 +1313,7 @@ function getSidebarHtml(isConnected: boolean): string {
         </button>
         <button class="action-btn" onclick="action('generateVideo')">
             <span class="icon">🎬</span>
-            <span>Generate Manim Video</span>
+            <span>Generate Architecture Video</span>
         </button>
         <button class="action-btn" onclick="action('openAIChat')">
             <span class="icon">🤖</span>
@@ -1863,7 +1863,7 @@ function getTraceViewerHtml(initialTab?: string): string {
         <div class="tab${activeTab === 'sql' ? ' active' : ''}" data-tab="sql">SQL Analyzer</div>
         <div class="tab${activeTab === 'metrics' ? ' active' : ''}" data-tab="metrics">Live Metrics</div>
         <div class="tab${activeTab === 'distributed' ? ' active' : ''}" data-tab="distributed">Distributed</div>
-        <div class="tab${activeTab === 'manim' ? ' active' : ''}" data-tab="manim">Manim Video</div>
+        <div class="tab${activeTab === 'manim' ? ' active' : ''}" data-tab="manim">Architecture Video</div>
     </div>
 
     <!-- Diagram Tab -->
@@ -2013,26 +2013,16 @@ function getTraceViewerHtml(initialTab?: string): string {
         </div>
     </div>
 
-    <!-- Manim Video Tab with Sub-tabs -->
+    <!-- Architecture Video Tab with Sub-tabs -->
     <div class="content${activeTab === 'manim' ? ' active' : ''}" id="manim-content">
         <div class="sub-tab-container">
-            <div class="sub-tab active" data-subtab="video-list">Video List</div>
-            <div class="sub-tab" data-subtab="interactive-explorer">Interactive Explorer</div>
+            <div class="sub-tab active" data-subtab="interactive-explorer">Interactive Explorer</div>
+            <div class="sub-tab" data-subtab="video-list">Video List</div>
             <div class="sub-tab" data-subtab="watch-architecture">📹 Watch Architecture</div>
         </div>
 
-        <!-- Video List Sub-tab -->
-        <div class="sub-content active" id="video-list-subcontent">
-            <p style="margin-bottom: 10px;">Use "TrueFlow: Generate Manim Video" command to create visualizations.</p>
-            <div id="video-container">
-                <div class="placeholder">
-                    <p>Generated execution flow videos will appear here.</p>
-                </div>
-            </div>
-        </div>
-
-        <!-- Interactive Explorer Sub-tab -->
-        <div class="sub-content" id="interactive-explorer-subcontent">
+        <!-- Interactive Explorer Sub-tab (default) -->
+        <div class="sub-content active" id="interactive-explorer-subcontent">
             <div class="explorer-toolbar" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px; background: var(--vscode-editor-lineHighlightBackground); border-radius: 4px; margin-bottom: 8px;">
                 <button onclick="refreshInteractiveExplorer()" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">Refresh</button>
                 <button onclick="openExplorerInBrowser()" title="Open in external browser with 3D view" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">🌐 Open in Browser</button>
@@ -2061,6 +2051,16 @@ function getTraceViewerHtml(initialTab?: string): string {
                 <span><span style="display: inline-block; width: 12px; height: 12px; background: #ef4444; border-radius: 2px; margin-right: 5px;"></span>Orphaned (No Callers)</span>
                 <span><span style="display: inline-block; width: 12px; height: 12px; background: #a78bfa; border-radius: 2px; margin-right: 5px;"></span>Dead Branch</span>
                 <span><span style="display: inline-block; width: 12px; height: 12px; background: #fbbf24; transform: rotate(45deg); margin-right: 5px;"></span>Branch Divergence</span>
+            </div>
+        </div>
+
+        <!-- Video List Sub-tab -->
+        <div class="sub-content" id="video-list-subcontent">
+            <p style="margin-bottom: 10px;">Use "TrueFlow: Generate Architecture Video" command to create visualizations.</p>
+            <div id="video-container">
+                <div class="placeholder">
+                    <p>Generated execution flow videos will appear here.</p>
+                </div>
             </div>
         </div>
 

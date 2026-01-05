@@ -144,6 +144,11 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private val deadCodeTable: JBTable
     private val deadCodeTableModel: DefaultTableModel
     private val deadCodeStatsLabel = JBLabel()
+    // Toggle states for showing different function categories
+    private var showDeadFunctions = true
+    private var showAliveFunctions = true
+    private var showExternalFunctions = true
+    private var showFilteredFunctions = false  // Functions excluded by filters (default off)
 
     // Tab 4: Call Trace
     private val callTracePanel = JBPanel<JBPanel<*>>(BorderLayout())
@@ -196,6 +201,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private var traceSocketClient: TraceSocketClient? = null
     private val socketTraceBuffer = CircularBuffer(10000) // Max 10,000 events
     private var traceEventCount = 0
+    private var qualNameDebugCount = 0  // Debug counter for co_qualname logging
     private val socketTraceParticipants = mutableSetOf<String>() // Track unique modules
     private val socketTraceCalls = mutableMapOf<String, Int>() // Track function call counts
     private val socketTraceAllFunctions = mutableSetOf<String>() // All instrumented functions
@@ -226,6 +232,14 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     // Function registry for dead code detection
     private val socketAllDefinedFunctions = mutableSetOf<String>() // All functions found by static analysis
     private val socketFunctionDefinitions = mutableMapOf<String, Pair<String, Int>>() // funcKey -> (file, line)
+
+    // Class instantiation order tracking - first __init__/constructor call timestamp per class
+    // Used to order class containers in Interactive Explorer by instantiation order
+    private val classFirstInitTimestamp = mutableMapOf<String, Double>() // className -> first init timestamp
+
+    // Function first-called timestamp tracking - when each function was first invoked
+    // Used to show execution order and temporal flow in Interactive Explorer
+    private val functionFirstCalledTimestamp = mutableMapOf<String, Double>() // funcKey -> first call timestamp
 
     // Branch registry for "Why Not Covered" analysis with ACTUAL branch conditions
     data class CallSiteBranchInfo(
@@ -614,8 +628,15 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
         val stats = traceFilter.getStats()
         val isDefault = traceFilter.isDefault()
+        val activePreset = traceFilter.activePresetName
 
-        if (isDefault) {
+        if (activePreset != null) {
+            // Preset active - show preset name
+            filtersAppliedButton.text = "Filters: $activePreset"
+            filtersAppliedButton.background = JBColor(0xE8F5E9, 0x2E4A3E)  // Light green / Dark green
+            filtersAppliedButton.foreground = JBColor(0x2E7D32, 0x81C784)  // Green / Light green
+            filtersAppliedButton.toolTipText = "Preset '$activePreset' active ($stats) - click to manage"
+        } else if (isDefault) {
             // Default filters - white/light background, dark grey text
             filtersAppliedButton.text = "Filters: Default"
             filtersAppliedButton.background = JBColor(0xFFFFFF, 0x4A4A4A)  // White / Dark grey
@@ -803,9 +824,50 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         deadCodeStatsLabel.border = JBUI.Borders.empty(5)
         controlPanel.add(deadCodeStatsLabel, BorderLayout.WEST)
 
+        // Toggle checkboxes panel (center)
+        val togglePanel = JBPanel<JBPanel<*>>()
+        togglePanel.layout = BoxLayout(togglePanel, BoxLayout.X_AXIS)
+        togglePanel.border = JBUI.Borders.empty(0, 10, 0, 10)
+
+        val deadToggle = JCheckBox("DEAD", showDeadFunctions)
+        deadToggle.foreground = JBColor(0xEF4444, 0xF87171)  // Red
+        deadToggle.addActionListener {
+            showDeadFunctions = deadToggle.isSelected
+            updateDeadCodeFromSocketTrace()
+        }
+        togglePanel.add(deadToggle)
+
+        val aliveToggle = JCheckBox("ALIVE", showAliveFunctions)
+        aliveToggle.foreground = JBColor(0x22C55E, 0x4ADE80)  // Green
+        aliveToggle.addActionListener {
+            showAliveFunctions = aliveToggle.isSelected
+            updateDeadCodeFromSocketTrace()
+        }
+        togglePanel.add(aliveToggle)
+
+        val externalToggle = JCheckBox("EXTERNAL", showExternalFunctions)
+        externalToggle.foreground = JBColor(0xF59E0B, 0xFBBF24)  // Amber/orange
+        externalToggle.toolTipText = "Functions traced at runtime but not in static registry"
+        externalToggle.addActionListener {
+            showExternalFunctions = externalToggle.isSelected
+            updateDeadCodeFromSocketTrace()
+        }
+        togglePanel.add(externalToggle)
+
+        val filteredToggle = JCheckBox("FILTERED", showFilteredFunctions)
+        filteredToggle.foreground = JBColor.GRAY
+        filteredToggle.toolTipText = "Functions excluded by global filters (tests, site-packages, etc.)"
+        filteredToggle.addActionListener {
+            showFilteredFunctions = filteredToggle.isSelected
+            updateDeadCodeFromSocketTrace()
+        }
+        togglePanel.add(filteredToggle)
+
+        controlPanel.add(togglePanel, BorderLayout.CENTER)
+
         // Filter info panel (right side)
         val filterInfoPanel = JBPanel<JBPanel<*>>()
-        val filterInfoLabel = JBLabel("Dead code detection uses global filters")
+        val filterInfoLabel = JBLabel("Global filters active")
         filterInfoLabel.foreground = JBColor.GRAY
         filterInfoPanel.add(filterInfoLabel)
 
@@ -967,7 +1029,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         tabbedPane.addTab("SQL Analyzer", sqlAnalyzerPanel)
         tabbedPane.addTab("Live Metrics", liveMetricsPanel)
         tabbedPane.addTab("Distributed", distributedPanel)
-        tabbedPane.addTab("Manim Videos", manimVideoPanel)
+        tabbedPane.addTab("Architecture Video", manimVideoPanel)
         tabbedPane.addTab("AI Explain", aiExplanationPanel)
     }
 
@@ -1239,6 +1301,8 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         socketTraceFileLineMap.clear()
         socketCallTimestamps.clear()
         socketFunctionDurations.clear()
+        classFirstInitTimestamp.clear()
+        functionFirstCalledTimestamp.clear()
         socketTotalDurationMs = 0.0
         socketCompletedCalls = 0
 
@@ -1342,9 +1406,49 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         socketTraceParticipants.add(participantId)
 
         val functionKey = "${event.module}.${event.function}"
-        socketTraceAllFunctions.add(functionKey)
-        socketTraceCalls[functionKey] = (socketTraceCalls[functionKey] ?: 0) + 1
-        socketTraceFileLineMap[functionKey] = Pair(event.file, event.line)
+
+        // Debug: Log first few __init__ calls to verify co_qualname is working
+        if (qualNameDebugCount < 20 && (event.function.contains("init") || event.function.contains("__"))) {
+            PluginLogger.info("[co_qualname DEBUG] module=${event.module}, function=${event.function}, key=$functionKey")
+            qualNameDebugCount++
+        }
+
+        // Skip Python internal pseudo-functions that are NOT actual function calls:
+        // 1. <module> - Module-level code execution during import
+        // 2. Class body execution - When a class is defined, Python executes its body
+        //    These appear as bare class names (no . in function name) without __init__
+        // These clutter coverage stats and don't match the static function registry
+        val isModulePseudoFunction = event.function == "<module>"
+        val isClassBodyExecution = event.function.isNotEmpty() &&
+            !event.function.contains(".") &&
+            !event.function.startsWith("__") &&
+            event.function.first().isUpperCase()  // Class names are typically PascalCase
+
+        if (!isModulePseudoFunction && !isClassBodyExecution) {
+            socketTraceAllFunctions.add(functionKey)
+            socketTraceCalls[functionKey] = (socketTraceCalls[functionKey] ?: 0) + 1
+            socketTraceFileLineMap[functionKey] = Pair(event.file, event.line)
+        } else {
+            // Still track for display purposes but don't count as "called function"
+            PluginLogger.debug("[ToolWindow] Skipping pseudo-function: ${event.function} (module=$isModulePseudoFunction, classBody=$isClassBodyExecution)")
+        }
+
+        // Track first-called timestamp for REAL functions only (skip pseudo-functions)
+        // Used to show execution order and temporal flow in Interactive Explorer
+        if (event.type == "call" && !isModulePseudoFunction && !isClassBodyExecution && functionKey !in functionFirstCalledTimestamp) {
+            functionFirstCalledTimestamp[functionKey] = event.timestamp
+        }
+
+        // Track class instantiation order - record first __init__/constructor call timestamp per class
+        // This is used to order class containers in Interactive Explorer by instantiation order
+        if (event.type == "call" && (event.function == "__init__" || event.function == "constructor")) {
+            // Extract class name from module (e.g., "myapp.services.MyClass")
+            val className = event.module
+            if (className !in classFirstInitTimestamp) {
+                classFirstInitTimestamp[className] = event.timestamp
+                PluginLogger.debug("[ToolWindow] Class instantiation order: $className at ${event.timestamp}")
+            }
+        }
 
         // Track call/return pairs for timing statistics
         when (event.type) {
@@ -1682,6 +1786,12 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
             PluginLogger.info("[ToolWindow] Received function registry: ${socketAllDefinedFunctions.size} functions")
 
+            // Debug: Log sample registry keys to verify format
+            val sampleKeys = socketAllDefinedFunctions.filter { it.contains("__init__") }.take(5)
+            if (sampleKeys.isNotEmpty()) {
+                PluginLogger.info("[ToolWindow] Sample __init__ registry keys: $sampleKeys")
+            }
+
             // Update Dead Code tab immediately
             SwingUtilities.invokeLater {
                 updateDeadCodeFromSocketTrace()
@@ -1774,74 +1884,213 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
     private fun updateDeadCodeFromSocketTrace() {
         // Proper dead code detection using function registry
-        // Both static analysis and runtime traces now use relative module paths (e.g., src.crawl4ai.foo.bar)
-        // so direct comparison works
-
-        val totalDefined = socketAllDefinedFunctions.size
-        val calledCount = socketTraceCalls.size
-        val deadCount = if (totalDefined > 0) totalDefined - calledCount else 0
-
-        if (totalDefined > 0) {
-            val deadCodePercent = (deadCount.toDouble() / totalDefined) * 100.0
-            deadCodeStatsLabel.text = "Functions: $totalDefined total, $calledCount called, $deadCount dead (${String.format("%.1f", deadCodePercent)}%)"
-        } else {
-            deadCodeStatsLabel.text = "Real-time mode: ${socketTraceCalls.size} functions called (waiting for function registry...)"
-        }
-
-        // Clear table
-        deadCodeTableModel.rowCount = 0
+        // Both static analysis and runtime traces use Python's __name__ format (e.g., myapp.services.user)
+        // Static registry uses sys.path to compute module names matching runtime's __name__
 
         // Helper function to check if file should be excluded (uses global filter)
         fun isFileExcluded(filePath: String): Boolean {
             return traceFilter.shouldExclude(filePath)
         }
 
-        // Show DEAD functions first (sorted by module/function, filtered by exclusions)
-        val deadFunctions = socketAllDefinedFunctions.filter { it !in socketTraceCalls }.sorted()
-        for (funcKey in deadFunctions) {
-            val parts = funcKey.split(".")
-            val module = parts.dropLast(1).joinToString(".")
-            val function = parts.lastOrNull() ?: funcKey
-            val (file, line) = socketFunctionDefinitions[funcKey] ?: Pair("-", 0)
-
-            // FILTER: Skip if file matches excluded folders
-            if (isFileExcluded(file)) {
-                continue
-            }
-
-            // Store file and line separately in UserData for navigation, show combined in column
-            val fileLineDisplay = if (file != "-") "$file:$line" else "-"
-            deadCodeTableModel.addRow(arrayOf(
-                "DEAD",
-                module.ifEmpty { "__main__" },
-                function,
-                fileLineDisplay,
-                "navigate" // Placeholder - renderer shows "Go to source" link
-            ))
+        // Helper to check if a function should be excluded based on its file path
+        fun shouldExcludeFunction(funcKey: String): Boolean {
+            val filePath = socketFunctionDefinitions[funcKey]?.first ?: ""
+            return traceFilter.shouldExclude(filePath)
         }
 
-        // Then show ALIVE functions (sorted by call count descending, filtered by exclusions)
-        for ((funcKey, count) in socketTraceCalls.entries.sortedByDescending { it.value }) {
-            val parts = funcKey.split(".")
-            val module = parts.dropLast(1).joinToString(".")
-            val function = parts.lastOrNull() ?: funcKey
-            val (file, line) = socketFunctionDefinitions[funcKey]
-                ?: socketTraceFileLineMap[funcKey]
-                ?: Pair("-", 0)
-
-            // FILTER: Skip if file matches excluded folders
-            if (isFileExcluded(file)) {
-                continue
+        // Build class-inference map FIRST (needed for both Dead Code and Interactive Explorer)
+        // This handles the case where co_qualname returns "method" instead of "ClassName.method"
+        val classInferenceMap = mutableMapOf<String, String>()
+        val ambiguousKeys = mutableSetOf<String>()
+        for (registryKey in socketAllDefinedFunctions) {
+            val parts = registryKey.split(".")
+            if (parts.size >= 2) {
+                val methodName = parts.last()
+                val potentialClassName = parts.getOrNull(parts.size - 2) ?: ""
+                if (potentialClassName.isNotEmpty() && potentialClassName.first().isUpperCase()) {
+                    val moduleParts = parts.dropLast(2)
+                    if (moduleParts.isNotEmpty()) {
+                        val shortKey = moduleParts.joinToString(".") + "." + methodName
+                        if (shortKey in classInferenceMap) {
+                            ambiguousKeys.add(shortKey)
+                        } else {
+                            classInferenceMap[shortKey] = registryKey
+                        }
+                    }
+                }
             }
+        }
+        ambiguousKeys.forEach { classInferenceMap.remove(it) }
 
-            val fileLineDisplay = if (file != "-") "$file:$line" else "-"
-            deadCodeTableModel.addRow(arrayOf(
-                "ALIVE ($count calls)",
-                module.ifEmpty { "__main__" },
-                function,
-                fileLineDisplay,
-                "navigate" // Placeholder - renderer shows "Go to source" link
-            ))
+        // Normalize traced keys using class inference - use this EVERYWHERE
+        val normalizedTraceCalls = mutableMapOf<String, Int>()
+        for ((tracedKey, count) in socketTraceCalls) {
+            val normalizedKey = when {
+                tracedKey in socketAllDefinedFunctions -> tracedKey
+                tracedKey in classInferenceMap -> classInferenceMap[tracedKey]!!
+                else -> tracedKey
+            }
+            normalizedTraceCalls[normalizedKey] = (normalizedTraceCalls[normalizedKey] ?: 0) + count
+        }
+
+        // Compute FILTERED counts using NORMALIZED keys (consistent with Interactive Explorer)
+        val filteredDefinedFunctions = socketAllDefinedFunctions.filter { !shouldExcludeFunction(it) }
+        val filteredCalledFunctions = normalizedTraceCalls.filter { !shouldExcludeFunction(it.key) }
+
+        // Diagnostic logging - KEY MATCH ANALYSIS
+        val exactMatches = socketTraceCalls.keys.count { it in socketAllDefinedFunctions }
+        val classInferredMatches = socketTraceCalls.keys.count { it !in socketAllDefinedFunctions && it in classInferenceMap }
+        // Find traced keys that NEEDED class inference but were BLOCKED by ambiguity
+        val ambiguousBlockedKeys = socketTraceCalls.keys.filter { key ->
+            key !in socketAllDefinedFunctions && key in ambiguousKeys
+        }
+        if (ambiguousBlockedKeys.isNotEmpty()) {
+            PluginLogger.warn("[DeadCode] AMBIGUOUS-BLOCKED traced keys (multiple classes have same method): ${ambiguousBlockedKeys.take(5)}")
+        }
+        val totalMatches = exactMatches + classInferredMatches
+        PluginLogger.info("[DeadCode] RAW socketTraceCalls: ${socketTraceCalls.size}")
+        PluginLogger.info("[DeadCode] Class inference map size: ${classInferenceMap.size}, ambiguous: ${ambiguousKeys.size}")
+        PluginLogger.info("[DeadCode] KEY MATCH: $totalMatches of ${socketTraceCalls.size} (exact: $exactMatches, inferred: $classInferredMatches)")
+        PluginLogger.info("[DeadCode] normalizedTraceCalls: ${normalizedTraceCalls.size}")
+        PluginLogger.info("[DeadCode] filteredDefinedFunctions: ${filteredDefinedFunctions.size}")
+        PluginLogger.info("[DeadCode] filteredCalledFunctions: ${filteredCalledFunctions.size}")
+        if (socketTraceCalls.isNotEmpty()) {
+            PluginLogger.info("[DeadCode] Sample traced keys: ${socketTraceCalls.keys.take(3)}")
+        }
+        if (socketAllDefinedFunctions.isNotEmpty()) {
+            PluginLogger.info("[DeadCode] Sample registry keys: ${socketAllDefinedFunctions.take(3)}")
+        }
+        if (normalizedTraceCalls.isNotEmpty()) {
+            PluginLogger.info("[DeadCode] Sample normalized keys: ${normalizedTraceCalls.keys.take(3)}")
+        }
+        if (classInferenceMap.isNotEmpty()) {
+            PluginLogger.info("[DeadCode] Sample inference: ${classInferenceMap.entries.take(2).map { "${it.key} -> ${it.value}" }}")
+        }
+
+        val totalDefined = filteredDefinedFunctions.size
+        // Only count traced functions that are ALSO in the registry (consistent with Interactive Explorer JS)
+        // This avoids counting dynamically generated functions or functions from non-scanned modules
+        val registryMatchedCalls = filteredCalledFunctions.filterKeys { it in filteredDefinedFunctions }
+        val calledCount = registryMatchedCalls.size
+        val unmatchedTraced = filteredCalledFunctions.size - calledCount
+        val deadCount = if (totalDefined > 0) totalDefined - calledCount else 0
+
+        PluginLogger.info("[DeadCode] Registry-matched calls: $calledCount (unmatched traced: $unmatchedTraced)")
+
+        // Log unmatched traced functions for debugging - these are in trace but not registry
+        if (unmatchedTraced > 0) {
+            val unmatchedKeys = filteredCalledFunctions.keys.filter { it !in filteredDefinedFunctions }
+            PluginLogger.info("[DeadCode] UNMATCHED TRACED (not in registry): ${unmatchedKeys.take(10)}")
+            if (unmatchedKeys.size > 10) {
+                PluginLogger.info("[DeadCode]   ... and ${unmatchedKeys.size - 10} more")
+            }
+        }
+
+        // Calculate counts for each category
+        val excludedCount = socketAllDefinedFunctions.size - filteredDefinedFunctions.size
+
+        if (totalDefined > 0) {
+            val deadCodePercent = (deadCount.toDouble() / totalDefined) * 100.0
+            // Build detailed stats string
+            val parts = mutableListOf<String>()
+            parts.add("$deadCount dead")
+            parts.add("$calledCount alive")
+            if (unmatchedTraced > 0) parts.add("$unmatchedTraced external")
+            if (excludedCount > 0) parts.add("$excludedCount filtered")
+            deadCodeStatsLabel.text = "$totalDefined functions: ${parts.joinToString(", ")} (${String.format("%.1f", deadCodePercent)}% dead)"
+        } else {
+            deadCodeStatsLabel.text = "Real-time mode: ${filteredCalledFunctions.size} functions called (waiting for function registry...)"
+        }
+
+        // Clear table
+        deadCodeTableModel.rowCount = 0
+
+        // Calculate filtered-out functions (for FILTERED toggle)
+        val excludedDefinedFunctions = socketAllDefinedFunctions.filter { shouldExcludeFunction(it) }
+        val excludedCalledFunctions = normalizedTraceCalls.filter { shouldExcludeFunction(it.key) }
+        val filteredOutCount = excludedDefinedFunctions.size + excludedCalledFunctions.size
+
+        // Show DEAD functions (sorted by module/function)
+        val deadFunctions = filteredDefinedFunctions.filter { it !in normalizedTraceCalls }.sorted()
+        if (showDeadFunctions) {
+            for (funcKey in deadFunctions) {
+                val parts = funcKey.split(".")
+                val module = parts.dropLast(1).joinToString(".")
+                val function = parts.lastOrNull() ?: funcKey
+                val (file, line) = socketFunctionDefinitions[funcKey] ?: Pair("-", 0)
+
+                val fileLineDisplay = if (file != "-") "$file:$line" else "-"
+                deadCodeTableModel.addRow(arrayOf(
+                    "DEAD",
+                    module.ifEmpty { "__main__" },
+                    function,
+                    fileLineDisplay,
+                    "navigate"
+                ))
+            }
+        }
+
+        // Show ALIVE functions IN REGISTRY (sorted by call count descending)
+        if (showAliveFunctions) {
+            for ((funcKey, count) in registryMatchedCalls.entries.sortedByDescending { it.value }) {
+                val parts = funcKey.split(".")
+                val module = parts.dropLast(1).joinToString(".")
+                val function = parts.lastOrNull() ?: funcKey
+                val (file, line) = socketFunctionDefinitions[funcKey]
+                    ?: socketTraceFileLineMap[funcKey]
+                    ?: Pair("-", 0)
+
+                val fileLineDisplay = if (file != "-") "$file:$line" else "-"
+                deadCodeTableModel.addRow(arrayOf(
+                    "ALIVE ($count calls)",
+                    module.ifEmpty { "__main__" },
+                    function,
+                    fileLineDisplay,
+                    "navigate"
+                ))
+            }
+        }
+
+        // Show EXTERNAL functions (traced but not in registry) - these are dynamic/unscanned
+        val externalCalls = filteredCalledFunctions.filterKeys { it !in filteredDefinedFunctions }
+        if (showExternalFunctions) {
+            for ((funcKey, count) in externalCalls.entries.sortedByDescending { it.value }) {
+                val parts = funcKey.split(".")
+                val module = parts.dropLast(1).joinToString(".")
+                val function = parts.lastOrNull() ?: funcKey
+                val (file, line) = socketTraceFileLineMap[funcKey] ?: Pair("-", 0)
+
+                val fileLineDisplay = if (file != "-") "$file:$line" else "-"
+                deadCodeTableModel.addRow(arrayOf(
+                    "EXTERNAL ($count calls)",
+                    module.ifEmpty { "__main__" },
+                    function,
+                    fileLineDisplay,
+                    "navigate"
+                ))
+            }
+        }
+
+        // Show FILTERED functions (excluded by global filters) when toggle is on
+        if (showFilteredFunctions) {
+            // Show filtered-out defined functions
+            for (funcKey in excludedDefinedFunctions.sorted()) {
+                val parts = funcKey.split(".")
+                val module = parts.dropLast(1).joinToString(".")
+                val function = parts.lastOrNull() ?: funcKey
+                val (file, line) = socketFunctionDefinitions[funcKey] ?: Pair("-", 0)
+                val called = normalizedTraceCalls.containsKey(funcKey)
+                val status = if (called) "FILTERED (called)" else "FILTERED (dead)"
+
+                val fileLineDisplay = if (file != "-") "$file:$line" else "-"
+                deadCodeTableModel.addRow(arrayOf(
+                    status,
+                    module.ifEmpty { "__main__" },
+                    function,
+                    fileLineDisplay,
+                    "navigate"
+                ))
+            }
         }
 
         // Update Interactive Explorer visualization with current data
@@ -1900,9 +2149,50 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             }
         }
 
+        // Build class-inference map for matching traced keys to registry keys
+        // This handles the case where co_qualname returns "method" instead of "ClassName.method"
+        // Map: "module.method" -> "module.ClassName.method" (only if unambiguous)
+        val classInferenceMap = mutableMapOf<String, String>()
+        val ambiguousKeys = mutableSetOf<String>()
+        for (registryKey in socketAllDefinedFunctions) {
+            val parts = registryKey.split(".")
+            if (parts.size >= 2) {
+                val methodName = parts.last()
+                // Check if second-to-last part looks like a class name (PascalCase or has uppercase)
+                val potentialClassName = parts.getOrNull(parts.size - 2) ?: ""
+                if (potentialClassName.isNotEmpty() && potentialClassName.first().isUpperCase()) {
+                    // This is likely module.ClassName.method format
+                    // Create the short key: module.method (without ClassName)
+                    val moduleParts = parts.dropLast(2)
+                    if (moduleParts.isNotEmpty()) {
+                        val shortKey = moduleParts.joinToString(".") + "." + methodName
+                        if (shortKey in classInferenceMap) {
+                            // Ambiguous - multiple classes have this method
+                            ambiguousKeys.add(shortKey)
+                        } else {
+                            classInferenceMap[shortKey] = registryKey
+                        }
+                    }
+                }
+            }
+        }
+        // Remove ambiguous mappings
+        ambiguousKeys.forEach { classInferenceMap.remove(it) }
+
+        // Normalize traced keys using class inference
+        val normalizedTraceCalls = mutableMapOf<String, Int>()
+        for ((tracedKey, count) in socketTraceCalls) {
+            val normalizedKey = when {
+                tracedKey in socketAllDefinedFunctions -> tracedKey  // Exact match
+                tracedKey in classInferenceMap -> classInferenceMap[tracedKey]!!  // Class-inferred match
+                else -> tracedKey  // No match, keep original
+            }
+            normalizedTraceCalls[normalizedKey] = (normalizedTraceCalls[normalizedKey] ?: 0) + count
+        }
+
         // Apply global filter to all data sources - exclude functions matching filter patterns
         val filteredAllFunctions = socketAllDefinedFunctions.filter { !shouldExcludeFunction(it) }
-        val filteredTraceCalls = socketTraceCalls.filterKeys { !shouldExcludeFunction(it) }
+        val filteredTraceCalls = normalizedTraceCalls.filterKeys { !shouldExcludeFunction(it) }
         val filteredFunctionDefinitions = socketFunctionDefinitions.filterKeys { !shouldExcludeFunction(it) }
         val filteredResolvedCallGraph = socketResolvedCallGraph
             .filterKeys { !shouldExcludeFunction(it) }
@@ -2063,6 +2353,20 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         PluginLogger.info("[InteractiveExplorer]   FILTERED callGraph: ${filteredCallGraph.size}")
         PluginLogger.info("[InteractiveExplorer]   FILTERED resolvedCallGraph: ${filteredResolvedCallGraph.size}")
         PluginLogger.info("[InteractiveExplorer]   whyNotCovered: ${whyNotCovered.size}")
+
+        // KEY MATCH ANALYSIS - detect if traced keys match registry keys
+        val exactMatches = socketTraceCalls.keys.count { it in socketAllDefinedFunctions }
+        val classInferredMatches = socketTraceCalls.keys.count { it !in socketAllDefinedFunctions && it in classInferenceMap }
+        val totalMatches = exactMatches + classInferredMatches
+        val mismatchedKeys = socketTraceCalls.keys.filter { it !in socketAllDefinedFunctions && it !in classInferenceMap }.take(5)
+        PluginLogger.info("[InteractiveExplorer]   KEY MATCH: $totalMatches of ${socketTraceCalls.size} traced functions found in registry")
+        PluginLogger.info("[InteractiveExplorer]   Breakdown: $exactMatches exact, $classInferredMatches class-inferred, ${ambiguousKeys.size} ambiguous (skipped)")
+        if (mismatchedKeys.isNotEmpty()) {
+            PluginLogger.warn("[InteractiveExplorer]   MISMATCHED traced keys (not in registry): $mismatchedKeys")
+            val registrySamples = socketAllDefinedFunctions.take(5)
+            PluginLogger.warn("[InteractiveExplorer]   Sample registry keys: $registrySamples")
+        }
+
         if (filteredAllFunctions.isNotEmpty()) {
             PluginLogger.info("[InteractiveExplorer]   Sample functions: ${filteredAllFunctions.take(5)}")
         }
@@ -2077,7 +2381,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             callTree = filteredCallGraph.mapValues { it.value.toList() },
             functionDefinitions = filteredFunctionDefinitions,
             whyNotCovered = whyNotCovered,
-            resolvedCallGraph = filteredResolvedCallGraph
+            resolvedCallGraph = filteredResolvedCallGraph,
+            classInstantiationOrder = classFirstInitTimestamp,
+            functionFirstCalledTimestamp = functionFirstCalledTimestamp
         )
     }
 
@@ -2116,9 +2422,43 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         }
         socketRootCalls.forEach { traverseNode(it) }
 
+        // Build class-inference map for matching traced keys to registry keys
+        val classInferenceMap = mutableMapOf<String, String>()
+        val ambiguousKeys = mutableSetOf<String>()
+        for (registryKey in socketAllDefinedFunctions) {
+            val parts = registryKey.split(".")
+            if (parts.size >= 2) {
+                val methodName = parts.last()
+                val potentialClassName = parts.getOrNull(parts.size - 2) ?: ""
+                if (potentialClassName.isNotEmpty() && potentialClassName.first().isUpperCase()) {
+                    val moduleParts = parts.dropLast(2)
+                    if (moduleParts.isNotEmpty()) {
+                        val shortKey = moduleParts.joinToString(".") + "." + methodName
+                        if (shortKey in classInferenceMap) {
+                            ambiguousKeys.add(shortKey)
+                        } else {
+                            classInferenceMap[shortKey] = registryKey
+                        }
+                    }
+                }
+            }
+        }
+        ambiguousKeys.forEach { classInferenceMap.remove(it) }
+
+        // Normalize traced keys using class inference
+        val normalizedTraceCalls = mutableMapOf<String, Int>()
+        for ((tracedKey, count) in socketTraceCalls) {
+            val normalizedKey = when {
+                tracedKey in socketAllDefinedFunctions -> tracedKey
+                tracedKey in classInferenceMap -> classInferenceMap[tracedKey]!!
+                else -> tracedKey
+            }
+            normalizedTraceCalls[normalizedKey] = (normalizedTraceCalls[normalizedKey] ?: 0) + count
+        }
+
         // Filter all data sources - exclude functions matching filter patterns
         val filteredFunctions = socketAllDefinedFunctions.filter { !shouldExcludeFunction(it) }.toSet()
-        val filteredTraceCalls = socketTraceCalls.filterKeys { !shouldExcludeFunction(it) }
+        val filteredTraceCalls = normalizedTraceCalls.filterKeys { !shouldExcludeFunction(it) }
         val filteredFunctionDefinitions = socketFunctionDefinitions.filterKeys { !shouldExcludeFunction(it) }
 
         // Filter call graph - only include edges where both caller and callee pass the filter
@@ -2147,7 +2487,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             callTree = filteredCallGraph.mapValues { it.value.toList() },
             functionDefinitions = filteredFunctionDefinitions,
             whyNotCovered = filteredWhyNotCovered,
-            resolvedCallGraph = filteredResolvedCallGraph
+            resolvedCallGraph = filteredResolvedCallGraph,
+            classInstantiationOrder = classFirstInitTimestamp,
+            functionFirstCalledTimestamp = functionFirstCalledTimestamp
         )
 
         PluginLogger.info("[ToolWindow] Refreshed Interactive Explorer with ${filteredFunctions.size} filtered functions")
@@ -3253,6 +3595,81 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
         val mainPanel = JBPanel<JBPanel<*>>(BorderLayout())
         mainPanel.border = JBUI.Borders.empty(10)
+
+        // Preset management panel at top
+        val presetPanel = JBPanel<JBPanel<*>>()
+        presetPanel.layout = BoxLayout(presetPanel, BoxLayout.X_AXIS)
+        presetPanel.border = JBUI.Borders.empty(0, 0, 10, 0)
+
+        presetPanel.add(JBLabel("Preset: "))
+
+        val presetCombo = com.intellij.openapi.ui.ComboBox<String>()
+        presetCombo.isEditable = false
+        val updatePresetCombo = {
+            presetCombo.removeAllItems()
+            presetCombo.addItem("(Custom)")
+            traceFilter.getPresetNames().forEach { presetCombo.addItem(it) }
+            val active = traceFilter.activePresetName
+            if (active != null && traceFilter.hasPreset(active)) {
+                presetCombo.selectedItem = active
+            } else {
+                presetCombo.selectedItem = "(Custom)"
+            }
+        }
+        updatePresetCombo()
+
+        presetCombo.addActionListener {
+            val selected = presetCombo.selectedItem as? String
+            if (selected != null && selected != "(Custom)" && traceFilter.hasPreset(selected)) {
+                traceFilter.loadPreset(selected)
+                dialog.dispose()
+                showFilterManagementDialog() // Re-open to show updated values
+            }
+        }
+        presetPanel.add(presetCombo)
+        presetPanel.add(Box.createRigidArea(Dimension(10, 0)))
+
+        val savePresetButton = JButton("Save As...")
+        savePresetButton.addActionListener {
+            val name = javax.swing.JOptionPane.showInputDialog(
+                dialog,
+                "Enter preset name:",
+                "Save Filter Preset",
+                javax.swing.JOptionPane.PLAIN_MESSAGE
+            )
+            if (!name.isNullOrBlank()) {
+                traceFilter.savePreset(name.trim())
+                updatePresetCombo()
+                javax.swing.JOptionPane.showMessageDialog(
+                    dialog,
+                    "Preset '$name' saved successfully.",
+                    "Preset Saved",
+                    javax.swing.JOptionPane.INFORMATION_MESSAGE
+                )
+            }
+        }
+        presetPanel.add(savePresetButton)
+
+        val deletePresetButton = JButton("Delete")
+        deletePresetButton.addActionListener {
+            val selected = presetCombo.selectedItem as? String
+            if (selected != null && selected != "(Custom)") {
+                val confirm = javax.swing.JOptionPane.showConfirmDialog(
+                    dialog,
+                    "Delete preset '$selected'?",
+                    "Delete Preset",
+                    javax.swing.JOptionPane.YES_NO_OPTION
+                )
+                if (confirm == javax.swing.JOptionPane.YES_OPTION) {
+                    traceFilter.deletePreset(selected)
+                    updatePresetCombo()
+                }
+            }
+        }
+        presetPanel.add(deletePresetButton)
+        presetPanel.add(Box.createHorizontalGlue())
+
+        mainPanel.add(presetPanel, BorderLayout.NORTH)
 
         // Tabbed pane for different filter types
         val filterTabs = JTabbedPane()

@@ -137,18 +137,27 @@ class BranchCoverageAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ClassDef(self, node):
-        """Track class context for method names."""
-        old_class = self._current_class
-        self._current_class = node.name
+        """Track class context for method names.
 
-        # Register the class
-        self.classes[node.name] = {
+        Handles nested classes by building full qualified names like:
+        OuterClass.InnerClass (matching Python's co_qualname)
+        """
+        old_class = self._current_class
+        # Build nested class name to match co_qualname format
+        if self._current_class:
+            self._current_class = f"{self._current_class}.{node.name}"
+        else:
+            self._current_class = node.name
+
+        # Register the class with its full nested name
+        full_class_name = self._current_class
+        self.classes[full_class_name] = {
             'line': node.lineno,
             'methods': [],
             'attributes': {},
             'bases': [self._get_base_name(b) for b in node.bases]
         }
-        self.class_attributes[node.name] = {}
+        self.class_attributes[full_class_name] = {}
 
         self.generic_visit(node)
         self._current_class = old_class
