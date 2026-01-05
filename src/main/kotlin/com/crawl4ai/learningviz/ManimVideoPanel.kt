@@ -66,6 +66,10 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     private var browserPageReady = false
     private var pendingDataRefresh = false
 
+    // Live server for real-time browser viewing
+    private var explorerServer: InteractiveExplorerServer? = null
+    private var liveServerButton: JButton? = null
+
     // Manim output directory (use PluginPaths for single source of truth)
     private val manimOutputDir = PluginPaths.getVideosDir(project)
 
@@ -194,6 +198,9 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         fileWatcherConnection?.disconnect()
         jsQuery?.dispose()
         interactiveBrowser?.dispose()
+        // Stop live server if running
+        explorerServer?.stop()
+        explorerServer = null
     }
 
     private fun createUI() {
@@ -304,6 +311,10 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                         if (frame?.isMain == true) {
                             browserPageReady = true
                             PluginLogger.info("Interactive Explorer page loaded, ready for data (mode: $currentViewMode)")
+
+                            // Inject the cefQuery function for JS to Kotlin communication
+                            injectCefQuery()
+
                             // If we have pending data, send it now based on current view mode
                             if (pendingDataRefresh || visualizationData != null) {
                                 pendingDataRefresh = false
@@ -352,10 +363,17 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             refreshBtn.addActionListener { refreshInteractiveVisualization() }
             buttonsPanel.add(refreshBtn)
 
-            val openInBrowserBtn = JButton("🌐 Open in Browser")
-            openInBrowserBtn.toolTipText = "Open the interactive 3D visualization in external browser"
-            openInBrowserBtn.addActionListener { openExplorerInBrowser() }
-            buttonsPanel.add(openInBrowserBtn)
+            // Open in Browser button - serves live HTML with real-time updates
+            liveServerButton = JButton("🌐 Open in Browser")
+            liveServerButton?.toolTipText = "Open visualization in browser with real-time updates"
+            liveServerButton?.addActionListener { toggleLiveServer() }
+            buttonsPanel.add(liveServerButton)
+
+            // Snapshot export button (static HTML file)
+            val exportSnapshotBtn = JButton("📸 Export Snapshot")
+            exportSnapshotBtn.toolTipText = "Export current visualization as static HTML file"
+            exportSnapshotBtn.addActionListener { exportSnapshot() }
+            buttonsPanel.add(exportSnapshotBtn)
 
             topPanel.add(buttonsPanel, BorderLayout.EAST)
 
@@ -509,9 +527,9 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     }
 
     /**
-     * Opens the interactive flow explorer in the default external browser.
+     * Exports the current visualization as a static HTML snapshot file.
      */
-    private fun openExplorerInBrowser() {
+    private fun exportSnapshot() {
         try {
             // Load the HTML template
             val htmlTemplate = loadInteractiveHtml()
@@ -601,6 +619,167 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     }
 
     /**
+     * Toggles the live server on/off for real-time browser viewing.
+     */
+    private fun toggleLiveServer() {
+        if (explorerServer?.isRunning() == true) {
+            stopLiveServer()
+        } else {
+            startLiveServer()
+        }
+    }
+
+    /**
+     * Starts the live server and opens browser.
+     */
+    private fun startLiveServer() {
+        try {
+            explorerServer = InteractiveExplorerServer(
+                port = 8765,
+                onServerStarted = { url ->
+                    SwingUtilities.invokeLater {
+                        updateLiveServerButton(true, url)
+                        // Open browser automatically
+                        try {
+                            Desktop.getDesktop().browse(java.net.URI(url))
+                        } catch (e: Exception) {
+                            PluginLogger.warn("Could not open browser: ${e.message}")
+                        }
+                    }
+                },
+                onServerStopped = {
+                    SwingUtilities.invokeLater {
+                        updateLiveServerButton(false, null)
+                    }
+                },
+                onError = { e ->
+                    SwingUtilities.invokeLater {
+                        updateLiveServerButton(false, null)
+                        JOptionPane.showMessageDialog(
+                            this,
+                            "Failed to start server: ${e.message}\n\nPort 8765 may already be in use.",
+                            "Server Error",
+                            JOptionPane.ERROR_MESSAGE
+                        )
+                    }
+                }
+            )
+
+            if (explorerServer?.start() == true) {
+                // Push current data if available
+                pushCurrentDataToServer()
+            }
+
+        } catch (e: Exception) {
+            PluginLogger.error("Failed to start live server", e)
+            updateLiveServerButton(false, null)
+        }
+    }
+
+    /**
+     * Stops the live server.
+     */
+    private fun stopLiveServer() {
+        explorerServer?.stop()
+        explorerServer = null
+        updateLiveServerButton(false, null)
+    }
+
+    /**
+     * Updates the browser button appearance.
+     */
+    private fun updateLiveServerButton(isRunning: Boolean, url: String?) {
+        liveServerButton?.apply {
+            if (isRunning && url != null) {
+                text = "✕ Close Browser"
+                toolTipText = "Live at $url - Click to close"
+                background = java.awt.Color(76, 175, 80) // Green (active)
+                foreground = java.awt.Color.WHITE
+                isOpaque = true
+                isContentAreaFilled = true
+            } else {
+                text = "🌐 Open in Browser"
+                toolTipText = "Open visualization in browser with real-time updates"
+                background = null
+                foreground = null
+                isOpaque = false
+                isContentAreaFilled = true
+            }
+            repaint()
+        }
+    }
+
+    /**
+     * Builds the data map for the server from current visualization data.
+     */
+    private fun buildServerDataMap(): Map<String, Any> {
+        return if (visualizationData != null) {
+            mapOf(
+                "functions" to visualizationData!!.functions.mapValues { (_, info) ->
+                    mapOf(
+                        "name" to info.name,
+                        "line" to info.line,
+                        "file" to info.file,
+                        "call_count" to info.callCount,
+                        "branches" to info.branches.map { branch ->
+                            mapOf(
+                                "type" to branch.type,
+                                "line" to branch.line,
+                                "condition" to branch.condition
+                            )
+                        }
+                    )
+                },
+                "call_graph" to visualizationData!!.callGraph,
+                "resolved_call_graph" to visualizationData!!.resolvedCallGraph,
+                "covered_functions" to visualizationData!!.coveredFunctions,
+                "dead_functions" to visualizationData!!.deadFunctions,
+                "why_not_covered" to visualizationData!!.whyNotCovered.mapValues { (_, info) ->
+                    mapOf(
+                        "function" to info.function,
+                        "root_cause" to info.rootCause,
+                        "root_cause_detail" to (info.rootCauseDetail?.let { detail ->
+                            mapOf(
+                                "type" to detail.type,
+                                "caller" to detail.caller,
+                                "line" to detail.line,
+                                "branch_type" to detail.branchType,
+                                "branch_condition" to detail.branchCondition,
+                                "branch_line" to detail.branchLine
+                            )
+                        }),
+                        "reasons" to info.reasons.map { reason ->
+                            mapOf(
+                                "type" to reason.type,
+                                "caller" to reason.caller,
+                                "line" to reason.line,
+                                "branch_type" to reason.branchType,
+                                "branch_condition" to reason.branchCondition,
+                                "explanation" to reason.explanation
+                            )
+                        },
+                        "call_chain" to emptyList<String>()
+                    )
+                },
+                "timestamp" to System.currentTimeMillis()
+            )
+        } else {
+            mapOf("timestamp" to System.currentTimeMillis())
+        }
+    }
+
+    /**
+     * Pushes current visualization data to the live server (if running).
+     */
+    private fun pushCurrentDataToServer() {
+        if (explorerServer?.isRunning() == true) {
+            val data = buildServerDataMap()
+            explorerServer?.pushTraceData(data)
+            PluginLogger.debug("Pushed trace data to live server")
+        }
+    }
+
+    /**
      * Default HTML if resource loading fails.
      */
     private fun getDefaultInteractiveHtml(): String {
@@ -654,10 +833,229 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     val message = json.get("message")?.asString
                     PluginLogger.info("[InteractiveExplorer] $message")
                 }
+                "explain" -> {
+                    // Request AI explanation for a function
+                    val funcName = json.get("function")?.asString
+                    val funcFile = json.get("file")?.asString
+                    val funcLine = json.get("line")?.asInt ?: 0
+                    val isAlive = json.get("isAlive")?.asBoolean ?: false
+                    val isDead = json.get("isDead")?.asBoolean ?: false
+                    val callCount = json.get("callCount")?.asInt ?: 0
+                    val whyNotCovered = json.get("whyNotCovered")?.asString
+
+                    if (funcName != null) {
+                        handleExplainRequest(funcName, funcFile, funcLine, isAlive, isDead, callCount, whyNotCovered)
+                    }
+                }
             }
         } catch (e: Exception) {
             PluginLogger.error("Failed to handle JS callback", e)
         }
+    }
+
+    /**
+     * Handles AI explanation request from Interactive Explorer.
+     * Checks if LLM server is running and sends appropriate response.
+     */
+    private fun handleExplainRequest(
+        funcName: String,
+        funcFile: String?,
+        funcLine: Int,
+        isAlive: Boolean,
+        isDead: Boolean,
+        callCount: Int,
+        whyNotCovered: String?
+    ) {
+        ApplicationManager.getApplication().invokeLater {
+            // Check if LLM server is running by looking for AIExplanationPanel
+            val toolWindowManager = com.intellij.openapi.wm.ToolWindowManager.getInstance(project)
+            val toolWindow = toolWindowManager.getToolWindow("TrueFlow")
+
+            // Try to find AIExplanationPanel and check server status
+            val aiPanel = findAIExplanationPanel()
+            val serverRunning = aiPanel?.isServerRunning() ?: false
+
+            if (!serverRunning) {
+                // Show prompt in Interactive Explorer to start server
+                showLLMNotRunningMessage()
+            } else {
+                // Server is running, request explanation
+                requestAIExplanation(funcName, funcFile, funcLine, isAlive, isDead, callCount, whyNotCovered, aiPanel!!)
+            }
+        }
+    }
+
+    /**
+     * Find the AIExplanationPanel instance.
+     */
+    private fun findAIExplanationPanel(): AIExplanationPanel? {
+        val toolWindowManager = com.intellij.openapi.wm.ToolWindowManager.getInstance(project)
+        val toolWindow = toolWindowManager.getToolWindow("TrueFlow") ?: return null
+
+        // The AIExplanationPanel is in the AI Explainer tab
+        val content = toolWindow.contentManager.contents
+        for (c in content) {
+            val component = c.component
+            if (component is javax.swing.JTabbedPane) {
+                for (i in 0 until component.tabCount) {
+                    val tabComponent = component.getComponentAt(i)
+                    if (tabComponent is AIExplanationPanel) {
+                        return tabComponent
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Show message in Interactive Explorer that LLM server needs to be started.
+     */
+    private fun showLLMNotRunningMessage() {
+        val message = """
+            {
+                "type": "llm_status",
+                "status": "not_running",
+                "message": "AI server is not running. Please go to 'AI Explainer' tab and click 'Start Server' to enable AI explanations."
+            }
+        """.trimIndent()
+
+        interactiveBrowser?.cefBrowser?.executeJavaScript(
+            "if (typeof handleLLMStatus === 'function') { handleLLMStatus($message); }",
+            "", 0
+        )
+    }
+
+    /**
+     * Request AI explanation for a function.
+     */
+    private fun requestAIExplanation(
+        funcName: String,
+        funcFile: String?,
+        funcLine: Int,
+        isAlive: Boolean,
+        isDead: Boolean,
+        callCount: Int,
+        whyNotCovered: String?,
+        aiPanel: AIExplanationPanel
+    ) {
+        // Show loading state
+        val loadingMessage = """
+            {
+                "type": "llm_status",
+                "status": "loading",
+                "message": "Asking AI to explain $funcName..."
+            }
+        """.trimIndent()
+
+        interactiveBrowser?.cefBrowser?.executeJavaScript(
+            "if (typeof handleLLMStatus === 'function') { handleLLMStatus($loadingMessage); }",
+            "", 0
+        )
+
+        // Build context for the explanation
+        val context = buildString {
+            append("Function: $funcName\n")
+            if (funcFile != null) append("File: $funcFile\n")
+            if (funcLine > 0) append("Line: $funcLine\n")
+            append("Status: ${if (isAlive) "Executed" else "Not Executed"}\n")
+            if (callCount > 0) append("Call count: $callCount\n")
+            if (isDead && whyNotCovered != null) {
+                append("Why not covered: $whyNotCovered\n")
+            }
+        }
+
+        // Use AIExplanationPanel's explain functionality
+        java.util.concurrent.CompletableFuture.runAsync {
+            try {
+                // Read the function source code if file is available
+                val sourceCode = if (funcFile != null && funcLine > 0) {
+                    try {
+                        val file = java.io.File(funcFile)
+                        if (file.exists()) {
+                            val lines = file.readLines()
+                            val startLine = maxOf(0, funcLine - 1)
+                            val endLine = minOf(lines.size, funcLine + 20)
+                            lines.subList(startLine, endLine).joinToString("\n")
+                        } else ""
+                    } catch (e: Exception) { "" }
+                } else ""
+
+                val prompt = buildString {
+                    append("Explain this function's purpose and behavior:\n\n")
+                    append("Context:\n$context\n")
+                    if (sourceCode.isNotEmpty()) {
+                        append("\nSource code:\n```\n$sourceCode\n```\n")
+                    }
+                    append("\nProvide a concise explanation of what this function does.")
+                    if (isDead) {
+                        append(" Also explain why it might not be executed and suggest how to test it.")
+                    }
+                }
+
+                // Call the LLM via AIExplanationPanel's askQuestion method
+                aiPanel.askQuestion(prompt, sourceCode, null) { response ->
+                    // Send response back to Interactive Explorer
+                    val escapedResponse = response.replace("\\", "\\\\")
+                        .replace("\"", "\\\"")
+                        .replace("\n", "\\n")
+                        .replace("\r", "")
+
+                    val responseMessage = """
+                        {
+                            "type": "llm_response",
+                            "function": "$funcName",
+                            "explanation": "$escapedResponse"
+                        }
+                    """.trimIndent()
+
+                    ApplicationManager.getApplication().invokeLater {
+                        interactiveBrowser?.cefBrowser?.executeJavaScript(
+                            "if (typeof handleLLMResponse === 'function') { handleLLMResponse($responseMessage); }",
+                            "", 0
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                PluginLogger.error("Failed to get AI explanation", e)
+                val errorMessage = """
+                    {
+                        "type": "llm_status",
+                        "status": "error",
+                        "message": "Failed to get AI explanation: ${e.message?.replace("\"", "'")}"
+                    }
+                """.trimIndent()
+
+                ApplicationManager.getApplication().invokeLater {
+                    interactiveBrowser?.cefBrowser?.executeJavaScript(
+                        "if (typeof handleLLMStatus === 'function') { handleLLMStatus($errorMessage); }",
+                        "", 0
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Inject the cefQuery function into JavaScript for JS to Kotlin communication.
+     */
+    private fun injectCefQuery() {
+        if (jsQuery == null || interactiveBrowser == null) return
+
+        val jsCode = jsQuery!!.inject("request",
+            "window.cefQueryCallback",
+            "(function(error_code, error_message) { console.error('cefQuery failed:', error_code, error_message); })"
+        )
+
+        // Wrap to create window.cefQuery function
+        val wrappedJs = """
+            window.cefQuery = function(params) {
+                $jsCode
+            };
+            console.log('[Explorer] cefQuery function injected');
+        """.trimIndent()
+
+        interactiveBrowser?.cefBrowser?.executeJavaScript(wrappedJs, "", 0)
     }
 
     /**
@@ -816,6 +1214,9 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             deadFunctions = deadFunctions,
             whyNotCovered = whyNotCovered
         )
+
+        // Push to live server if running
+        pushCurrentDataToServer()
 
         val data = mapOf(
             "functions" to functions,

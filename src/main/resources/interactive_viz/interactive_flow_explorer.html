@@ -124,6 +124,69 @@
             fill: currentColor;
         }
 
+        .nav-btn.has-dropdown {
+            padding-right: 6px;
+        }
+
+        .nav-btn .dropdown-arrow {
+            font-size: 9px;
+            margin-left: 2px;
+            opacity: 0.7;
+        }
+
+        /* Navigation dropdown */
+        .nav-dropdown {
+            background: rgba(30, 30, 40, 0.98);
+            border: 1px solid #5a5a7a;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            min-width: 150px;
+            max-width: 250px;
+            max-height: 200px;
+            overflow-y: auto;
+            padding: 4px;
+        }
+
+        .nav-dropdown-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 12px;
+            color: #ccc;
+            transition: background 0.15s;
+        }
+
+        .nav-dropdown-item:hover {
+            background: rgba(99, 102, 241, 0.3);
+            color: #fff;
+        }
+
+        .nav-dropdown-item .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .nav-dropdown-item .status-dot.alive {
+            background: #4ade80;
+        }
+
+        .nav-dropdown-item .status-dot.dead {
+            background: #ef4444;
+        }
+
+        .nav-dropdown-item.alive {
+            border-left: 2px solid #4ade80;
+        }
+
+        .nav-dropdown-item.dead {
+            border-left: 2px solid #ef4444;
+        }
+
         /* Path highlight legend in panel */
         .path-legend {
             display: flex;
@@ -1068,16 +1131,29 @@
                     TWO: THREE.TOUCH.DOLLY_PAN
                 };
 
-                // Add keyboard pan support (WASD and arrow keys)
-                this.keyPanSpeed = 0.5;
+                // Add keyboard pan support (WASD and arrow keys) with acceleration
+                this.keyPanSpeed = 0.15;  // Base speed (slower start)
+                this.keyPanMaxSpeed = 2.0;  // Maximum speed after acceleration
+                this.keyPanAccelTime = 800;  // Time in ms to reach max speed
                 this.keysPressed = {};
+                this.keyPressStart = {};  // Track when each key was first pressed
 
                 // Zoom limits
                 this.minZoom = 5;    // Closest zoom
                 this.maxZoom = 200;  // Furthest zoom
 
                 document.addEventListener('keydown', (e) => {
-                    this.keysPressed[e.key.toLowerCase()] = true;
+                    // Ignore keyboard events when typing in input fields
+                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+                        return;
+                    }
+
+                    const key = e.key.toLowerCase();
+                    // Track when key was first pressed (for acceleration)
+                    if (!this.keysPressed[key]) {
+                        this.keyPressStart[key] = performance.now();
+                    }
+                    this.keysPressed[key] = true;
 
                     // Ctrl+Plus or Ctrl+= to zoom in
                     if ((e.ctrlKey || e.metaKey) && (e.key === '+' || e.key === '=' || e.key === 'NumpadAdd')) {
@@ -1101,7 +1177,9 @@
                     }
                 });
                 document.addEventListener('keyup', (e) => {
-                    this.keysPressed[e.key.toLowerCase()] = false;
+                    const key = e.key.toLowerCase();
+                    this.keysPressed[key] = false;
+                    delete this.keyPressStart[key];  // Clear acceleration tracking
                 });
 
                 // Request render when controls change
@@ -1361,7 +1439,7 @@
                         <div class="tooltip-nav">
                             <div class="tooltip-nav-btn ${parent ? '' : 'disabled'}" data-action="parent" data-target="${parent || ''}">
                                 <span class="nav-icon parent">↑</span>
-                                <span class="nav-label">Parent</span>
+                                <span class="nav-label">Caller</span>
                                 <span class="nav-target">${parent ? this.formatColoredFunctionName(parent, 'fn-small', true) : '<span style="color:#6b7280">No caller</span>'}</span>
                                 ${parent ? '<span class="nav-arrow">→</span>' : ''}
                             </div>
@@ -1373,7 +1451,7 @@
                             </div>
                             <div class="tooltip-nav-btn ${downstream ? '' : 'disabled'}" data-action="downstream" data-target="${downstream || ''}">
                                 <span class="nav-icon downstream">↓</span>
-                                <span class="nav-label">Calls</span>
+                                <span class="nav-label">Callee</span>
                                 <span class="nav-target">${downstream ? this.formatColoredFunctionName(downstream, 'fn-small', true) : '<span style="color:#6b7280">No callees</span>'}</span>
                                 ${downstream ? '<span class="nav-arrow">→</span>' : ''}
                             </div>
@@ -1763,6 +1841,7 @@
              * Handle selection of a search result
              */
             selectSearchResult(type, name) {
+                console.log('[selectSearchResult] type:', type, 'name:', name);
                 this.hideSearchResults();
                 document.getElementById('search-box').value = '';
                 document.getElementById('search-clear').classList.remove('visible');
@@ -1773,6 +1852,7 @@
                 } else {
                     // Focus on function node
                     const node = this.nodes.get(name);
+                    console.log('[selectSearchResult] node found:', !!node);
                     if (node) {
                         // Make node visible if hidden by toggle
                         if (!node.visible) {
@@ -1780,8 +1860,10 @@
                             node.material.opacity = node.userData.isDead ? 0.7 : 1.0;
                             node.material.needsUpdate = true;
                         }
+                        console.log('[selectSearchResult] calling selectNode and focusOnNode');
                         this.selectNode(node);
                         this.focusOnNode(node);
+                        console.log('[selectSearchResult] done');
                     }
                 }
             }
@@ -1946,14 +2028,42 @@
 
                 this.data = data;
 
-                // Normalize: prefer resolved_call_graph over raw call_graph for better cross-class connections
+                // MERGE call graphs: runtime call_graph + static resolved_call_graph
+                // This ensures we have BOTH runtime-observed calls AND statically-analyzed potential calls
+                const mergedCallGraph = { ...(data.call_graph || {}) };
+
+                // Merge resolved_call_graph (static analysis)
                 if (data.resolved_call_graph && Object.keys(data.resolved_call_graph).length > 0) {
-                    console.log('[Explorer] Using resolved_call_graph for cross-class connections');
-                    this.data.call_graph = data.resolved_call_graph;
-                } else if (data.global_resolved_call_graph && Object.keys(data.global_resolved_call_graph).length > 0) {
-                    console.log('[Explorer] Using global_resolved_call_graph for cross-class connections');
-                    this.data.call_graph = data.global_resolved_call_graph;
+                    console.log('[Explorer] Merging resolved_call_graph for cross-class connections');
+                    Object.entries(data.resolved_call_graph).forEach(([caller, callees]) => {
+                        if (!mergedCallGraph[caller]) {
+                            mergedCallGraph[caller] = [];
+                        }
+                        callees.forEach(callee => {
+                            if (!mergedCallGraph[caller].includes(callee)) {
+                                mergedCallGraph[caller].push(callee);
+                            }
+                        });
+                    });
                 }
+
+                // Merge global_resolved_call_graph if available
+                if (data.global_resolved_call_graph && Object.keys(data.global_resolved_call_graph).length > 0) {
+                    console.log('[Explorer] Merging global_resolved_call_graph');
+                    Object.entries(data.global_resolved_call_graph).forEach(([caller, callees]) => {
+                        if (!mergedCallGraph[caller]) {
+                            mergedCallGraph[caller] = [];
+                        }
+                        callees.forEach(callee => {
+                            if (!mergedCallGraph[caller].includes(callee)) {
+                                mergedCallGraph[caller].push(callee);
+                            }
+                        });
+                    });
+                }
+
+                this.data.call_graph = mergedCallGraph;
+                console.log('[Explorer] Merged call graph has', Object.keys(mergedCallGraph).length, 'callers');
 
                 // Ensure ALL functions from call graph exist in functions object
                 // Note: Call graph is already filtered at source (Python analyzer) to only include project functions
@@ -2118,9 +2228,26 @@
                             edgeOpacity = 0.3;
                         }
 
-                        edge.material.color.setHex(edgeColor);
-                        edge.material.opacity = edgeOpacity;
-                        edge.material.needsUpdate = true;
+                        // Edge is a Group - get line and arrows from userData
+                        const line = edge.userData?.line || edge;
+                        const outArrow = edge.userData?.outArrow;
+                        const inArrow = edge.userData?.inArrow;
+
+                        if (line?.material) {
+                            line.material.color.setHex(edgeColor);
+                            line.material.opacity = edgeOpacity;
+                            line.material.needsUpdate = true;
+                        }
+                        if (outArrow?.material) {
+                            outArrow.material.color.setHex(edgeColor);
+                            outArrow.material.opacity = edgeOpacity * 0.9;
+                            outArrow.material.needsUpdate = true;
+                        }
+                        if (inArrow?.material) {
+                            inArrow.material.color.setHex(edgeColor);
+                            inArrow.material.opacity = edgeOpacity * 0.9;
+                            inArrow.material.needsUpdate = true;
+                        }
                         edgesRepainted++;
                         edgeIndex++;
                     });
@@ -2526,7 +2653,7 @@
                             edgeColor = 0x4ade80;  // Green for active call paths
                         }
 
-                        const edge = this.createEdge(callerNode, calleeNode, edgeColor);
+                        const edge = this.createEdge(callerNode, calleeNode, edgeColor, caller, callee);
                         this.edges.push(edge);
                         this.scene.add(edge);
 
@@ -2620,7 +2747,7 @@
                 const newDistance = Math.max(this.minZoom, currentDistance * 0.7);  // Zoom in by 30%
 
                 const newPos = this.controls.target.clone().sub(direction.multiplyScalar(newDistance));
-                this.animateCameraTo(newPos, this.controls.target.clone());
+                this.animateCameraToVectors(newPos, this.controls.target.clone());
             }
 
             /**
@@ -2634,7 +2761,7 @@
                 const newDistance = Math.min(this.maxZoom, currentDistance * 1.4);  // Zoom out by 40%
 
                 const newPos = this.controls.target.clone().sub(direction.multiplyScalar(newDistance));
-                this.animateCameraTo(newPos, this.controls.target.clone());
+                this.animateCameraToVectors(newPos, this.controls.target.clone());
             }
 
             /**
@@ -2668,14 +2795,14 @@
                 const targetPos = new THREE.Vector3(centerX, centerY + 10, viewDistance);
                 const targetLookAt = new THREE.Vector3(centerX, centerY, 0);
 
-                this.animateCameraTo(targetPos, targetLookAt);
+                this.animateCameraToVectors(targetPos, targetLookAt);
                 console.log('[Explorer] Recentered view on', this.nodes.size, 'nodes');
             }
 
             /**
-             * Animate camera to a new position smoothly
+             * Animate camera to a new position smoothly (Vector3 version)
              */
-            animateCameraTo(targetPosition, targetLookAt) {
+            animateCameraToVectors(targetPosition, targetLookAt) {
                 const startPos = this.camera.position.clone();
                 const startTarget = this.controls.target.clone();
                 const duration = 300;
@@ -3106,7 +3233,7 @@
                 return mesh;
             }
 
-            createEdge(fromNode, toNode, edgeColor = 0x4a4a6a) {
+            createEdge(fromNode, toNode, edgeColor = 0x4a4a6a, callerName = null, calleeName = null) {
                 // Orthogonal edge routing - only horizontal and vertical lines (no diagonals)
                 const from = fromNode.position.clone();
                 const to = toNode.position.clone();
@@ -3132,7 +3259,51 @@
 
                 const line = new THREE.Line(geometry, material);
                 line.frustumCulled = false;  // Prevent edge disappearing
-                return line;
+
+                // Store caller/callee info for proper highlighting
+                line.userData = {
+                    caller: callerName || fromNode.userData?.name,
+                    callee: calleeName || toNode.userData?.name,
+                    originalColor: edgeColor,
+                    originalOpacity: material.opacity
+                };
+
+                // Create arrow group to hold line + arrows
+                const edgeGroup = new THREE.Group();
+                edgeGroup.add(line);
+
+                // Add outbound arrow near caller (small triangle pointing away)
+                const outArrowPos = new THREE.Vector3(from.x, from.y - 0.5, from.z + 0.1);
+                const outArrow = this.createArrowHead(outArrowPos, Math.PI, edgeColor, 0.15);  // Pointing down
+                edgeGroup.add(outArrow);
+
+                // Add inbound arrow near callee (triangle pointing into node)
+                const inArrowPos = new THREE.Vector3(to.x, to.y + 0.5, to.z + 0.1);
+                const inArrow = this.createArrowHead(inArrowPos, Math.PI, edgeColor, 0.2);  // Pointing down into callee
+                edgeGroup.add(inArrow);
+
+                // Copy userData to group
+                edgeGroup.userData = line.userData;
+                edgeGroup.userData.line = line;
+                edgeGroup.userData.outArrow = outArrow;
+                edgeGroup.userData.inArrow = inArrow;
+                edgeGroup.frustumCulled = false;
+
+                return edgeGroup;
+            }
+
+            createArrowHead(position, rotation, color, size = 0.2) {
+                const geometry = new THREE.ConeGeometry(size, size * 1.5, 3);
+                const material = new THREE.MeshBasicMaterial({
+                    color: color,
+                    transparent: true,
+                    opacity: 0.8
+                });
+                const cone = new THREE.Mesh(geometry, material);
+                cone.position.copy(position);
+                cone.rotation.x = rotation;
+                cone.frustumCulled = false;
+                return cone;
             }
 
             createBranchPointMarker(fromNode, toNode) {
@@ -3539,6 +3710,8 @@
             }
 
             selectNode(node) {
+                console.log('[selectNode] Called with:', node?.userData?.name);
+
                 // Clear previous selection
                 if (this.selectedNode) {
                     this.selectedNode.material.emissive.setHex(0x000000);
@@ -3553,6 +3726,7 @@
                 // Find upstream and downstream paths
                 const upstreamNodes = new Set(this.findUpstreamPath(funcName));
                 const downstreamNodes = new Set(this.findDownstreamPath(funcName));
+                console.log('[selectNode] upstream:', upstreamNodes.size, 'downstream:', downstreamNodes.size);
 
                 // Store current highlight info
                 this.currentHighlight = {
@@ -3563,6 +3737,7 @@
 
                 // Apply path highlighting
                 this.highlightPath(upstreamNodes, downstreamNodes, funcName, true);
+                console.log('[selectNode] needsRender after highlightPath:', this.needsRender);
 
                 // Show info panel with navigation
                 this.showInfoPanel(node.userData);
@@ -3612,6 +3787,7 @@
                     this.camera.position.lerpVectors(startPos, targetPosition, easeT);
                     this.controls.target.lerpVectors(startTarget, endTarget, easeT);
                     this.controls.update();
+                    this.needsRender = true;  // Request render during animation
 
                     if (t < 1) {
                         requestAnimationFrame(animate);
@@ -3646,21 +3822,40 @@
                 html += '<svg viewBox="0 0 24 24"><path d="M12 2L2 12h3v8h14v-8h3L12 2zm0 2.8L19 12h-2v7H7v-7H5l7-7.2z"/></svg>';
                 html += 'Root</button>';
 
-                // Jump to Parent button (disabled if no parent)
-                html += `<button class="nav-btn" ${hasParent ? 'onclick="explorer.navigateToParent()" title="Jump to immediate caller"' : 'disabled title="No parent caller"'}>`;
+                // Jump to Caller button - shows dropdown if multiple callers
+                const allParents = this.findAllParents(funcName);
+                const parentCount = allParents.length;
+                const parentLabel = parentCount > 1 ? `Caller (${parentCount})` : 'Caller';
+                const parentAction = parentCount > 1 ? 'onclick="explorer.showParentDropdown(event)"' : (parentCount === 1 ? 'onclick="explorer.navigateToParent()"' : 'disabled');
+                const parentTitle = parentCount > 1 ? `Select from ${parentCount} callers` : (parentCount === 1 ? 'Jump to caller' : 'No callers');
+                html += `<button class="nav-btn${parentCount > 1 ? ' has-dropdown' : ''}" ${parentAction} title="${parentTitle}">`;
                 html += '<svg viewBox="0 0 24 24"><path d="M7 14l5-5 5 5H7z"/></svg>';
-                html += 'Parent</button>';
+                html += parentLabel;
+                if (parentCount > 1) html += '<span class="dropdown-arrow">▾</span>';
+                html += '</button>';
 
-                // Jump to Downstream button (disabled if no children)
-                html += `<button class="nav-btn" ${hasDownstream ? 'onclick="explorer.navigateToDownstream()" title="Jump to first callee"' : 'disabled title="No callees"'}>`;
+                // Jump to Callee button - shows dropdown if multiple callees
+                const allChildren = this.findAllChildren(funcName);
+                const childCount = allChildren.length;
+                const childLabel = childCount > 1 ? `Callee (${childCount})` : 'Callee';
+                const childAction = childCount > 1 ? 'onclick="explorer.showChildDropdown(event)"' : (childCount === 1 ? 'onclick="explorer.navigateToDownstream()"' : 'disabled');
+                const childTitle = childCount > 1 ? `Select from ${childCount} callees` : (childCount === 1 ? 'Jump to callee' : 'No callees');
+                html += `<button class="nav-btn${childCount > 1 ? ' has-dropdown' : ''}" ${childAction} title="${childTitle}">`;
                 html += '<svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5H7z"/></svg>';
-                html += 'Child</button>';
+                html += childLabel;
+                if (childCount > 1) html += '<span class="dropdown-arrow">▾</span>';
+                html += '</button>';
 
-                // Animate Flow button
+                // Animate Flow button - animates camera along the complete call path
                 const hasFlow = upstreamCount > 0 || downstreamCount > 0;
-                html += `<button class="nav-btn${this.isAnimatingFlow ? ' active' : ''}" ${hasFlow ? 'onclick="explorer.isAnimatingFlow ? explorer.stopDataFlowAnimation() : explorer.animateDataFlow()" title="Animate camera along data flow"' : 'disabled title="No data flow to animate"'}>`;
+                html += `<button class="nav-btn${this.isAnimatingFlow ? ' active' : ''}" ${hasFlow ? 'onclick="explorer.isAnimatingFlow ? explorer.stopDataFlowAnimation() : explorer.animateDataFlow()" title="Fly-through animation: camera follows the call path from root caller through all callees"' : 'disabled title="No data flow to animate"'}>`;
                 html += '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7L8 5z"/></svg>';
-                html += this.isAnimatingFlow ? 'Stop' : 'Flow</button>';
+                html += this.isAnimatingFlow ? 'Stop' : 'Animate</button>';
+
+                // Explain with AI button - works in both IDE (cefQuery) and browser (HTTP API) modes
+                html += `<button class="nav-btn ai-explain-btn" onclick="explorer.explainWithAI()" title="Ask AI to explain this function's purpose and behavior">`;
+                html += '<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>';
+                html += 'Explain</button>';
 
                 html += '</div>';
 
@@ -3669,10 +3864,10 @@
                     html += '<div class="path-legend">';
                     html += '<div class="path-legend-item"><div class="path-legend-dot selected"></div>Selected</div>';
                     if (upstreamCount > 0) {
-                        html += `<div class="path-legend-item"><div class="path-legend-dot upstream"></div>Callers (${upstreamCount})</div>`;
+                        html += `<div class="path-legend-item"><div class="path-legend-dot upstream"></div>Callers incl. transitive (${upstreamCount})</div>`;
                     }
                     if (downstreamCount > 0) {
-                        html += `<div class="path-legend-item"><div class="path-legend-dot downstream"></div>Callees (${downstreamCount})</div>`;
+                        html += `<div class="path-legend-item"><div class="path-legend-dot downstream"></div>Callees incl. transitive (${downstreamCount})</div>`;
                     }
                     html += '</div>';
                 }
@@ -3794,28 +3989,46 @@
                 const now = performance.now();
                 const elapsed = now - this.lastRenderTime;
 
-                // Handle keyboard panning (WASD or arrow keys)
+                // Handle keyboard panning (WASD or arrow keys) with acceleration
                 let keyboardPan = false;
                 if (this.keysPressed) {
-                    const panAmount = this.keyPanSpeed * (elapsed / 16);  // Normalize to 60fps
-                    if (this.keysPressed['w'] || this.keysPressed['arrowup']) {
-                        this.controls.target.y += panAmount;
-                        this.camera.position.y += panAmount;
+                    const frameNorm = elapsed / 16;  // Normalize to 60fps
+
+                    // Helper to calculate accelerated pan for a key
+                    const getAcceleratedPan = (key) => {
+                        if (!this.keysPressed[key]) return 0;
+                        const holdTime = now - (this.keyPressStart[key] || now);
+                        // Ease-in: start slow, accelerate over time (like video seeking)
+                        const t = Math.min(holdTime / this.keyPanAccelTime, 1);
+                        const eased = t * t;  // Quadratic ease-in
+                        const speed = this.keyPanSpeed + (this.keyPanMaxSpeed - this.keyPanSpeed) * eased;
+                        return speed * frameNorm;
+                    };
+
+                    // Calculate pan amounts for each direction
+                    const panUp = getAcceleratedPan('w') || getAcceleratedPan('arrowup');
+                    const panDown = getAcceleratedPan('s') || getAcceleratedPan('arrowdown');
+                    const panLeft = getAcceleratedPan('a') || getAcceleratedPan('arrowleft');
+                    const panRight = getAcceleratedPan('d') || getAcceleratedPan('arrowright');
+
+                    if (panUp) {
+                        this.controls.target.y += panUp;
+                        this.camera.position.y += panUp;
                         keyboardPan = true;
                     }
-                    if (this.keysPressed['s'] || this.keysPressed['arrowdown']) {
-                        this.controls.target.y -= panAmount;
-                        this.camera.position.y -= panAmount;
+                    if (panDown) {
+                        this.controls.target.y -= panDown;
+                        this.camera.position.y -= panDown;
                         keyboardPan = true;
                     }
-                    if (this.keysPressed['a'] || this.keysPressed['arrowleft']) {
-                        this.controls.target.x -= panAmount;
-                        this.camera.position.x -= panAmount;
+                    if (panLeft) {
+                        this.controls.target.x -= panLeft;
+                        this.camera.position.x -= panLeft;
                         keyboardPan = true;
                     }
-                    if (this.keysPressed['d'] || this.keysPressed['arrowright']) {
-                        this.controls.target.x += panAmount;
-                        this.camera.position.x += panAmount;
+                    if (panRight) {
+                        this.controls.target.x += panRight;
+                        this.camera.position.x += panRight;
                         keyboardPan = true;
                     }
                     if (keyboardPan) {
@@ -3937,18 +4150,145 @@
              * Find the immediate parent (caller) of a function
              */
             findImmediateParent(funcName) {
-                const reverseGraph = this.buildReverseCallGraph();
-                const callers = reverseGraph[funcName] || [];
+                const callers = this.findAllParents(funcName);
                 return callers.length > 0 ? callers[0] : null;
+            }
+
+            /**
+             * Find ALL parents (callers) of a function
+             */
+            findAllParents(funcName) {
+                const reverseGraph = this.buildReverseCallGraph();
+                return reverseGraph[funcName] || [];
             }
 
             /**
              * Find the first downstream callee of a function
              */
             findFirstDownstream(funcName) {
-                const callGraph = this.data?.call_graph || {};
-                const callees = callGraph[funcName] || [];
+                const callees = this.findAllChildren(funcName);
                 return callees.length > 0 ? callees[0] : null;
+            }
+
+            /**
+             * Find ALL children (callees) of a function
+             */
+            findAllChildren(funcName) {
+                const callGraph = this.data?.call_graph || {};
+                return callGraph[funcName] || [];
+            }
+
+            /**
+             * Navigate to a specific parent by name
+             */
+            navigateToSpecificParent(parentName) {
+                const parentNode = this.nodes.get(parentName);
+                if (parentNode) {
+                    this.selectNode(parentNode);
+                    this.focusOnNode(parentNode);
+                }
+                this.hideDropdowns();
+            }
+
+            /**
+             * Navigate to a specific child by name
+             */
+            navigateToSpecificChild(childName) {
+                const childNode = this.nodes.get(childName);
+                if (childNode) {
+                    this.selectNode(childNode);
+                    this.focusOnNode(childNode);
+                }
+                this.hideDropdowns();
+            }
+
+            /**
+             * Show parent dropdown
+             */
+            showParentDropdown(event) {
+                event.stopPropagation();
+                const funcName = this.selectedNode?.userData?.name;
+                if (!funcName) return;
+
+                const parents = this.findAllParents(funcName);
+                if (parents.length <= 1) {
+                    // Just navigate directly if only one parent
+                    if (parents.length === 1) this.navigateToSpecificParent(parents[0]);
+                    return;
+                }
+
+                this.showNavigationDropdown(event.target, parents, 'parent');
+            }
+
+            /**
+             * Show child dropdown
+             */
+            showChildDropdown(event) {
+                event.stopPropagation();
+                const funcName = this.selectedNode?.userData?.name;
+                if (!funcName) return;
+
+                const children = this.findAllChildren(funcName);
+                if (children.length <= 1) {
+                    // Just navigate directly if only one child
+                    if (children.length === 1) this.navigateToSpecificChild(children[0]);
+                    return;
+                }
+
+                this.showNavigationDropdown(event.target, children, 'child');
+            }
+
+            /**
+             * Show navigation dropdown near button
+             */
+            showNavigationDropdown(button, items, type) {
+                this.hideDropdowns();
+
+                const dropdown = document.createElement('div');
+                dropdown.className = 'nav-dropdown';
+                dropdown.id = 'nav-dropdown';
+
+                items.forEach(item => {
+                    const node = this.nodes.get(item);
+                    const isAlive = node?.userData?.isAlive;
+                    const statusClass = isAlive ? 'alive' : 'dead';
+                    const shortName = item.split('.').pop();
+
+                    const option = document.createElement('div');
+                    option.className = `nav-dropdown-item ${statusClass}`;
+                    option.innerHTML = `<span class="status-dot ${statusClass}"></span>${shortName}`;
+                    option.title = item;
+                    option.onclick = () => {
+                        if (type === 'parent') {
+                            this.navigateToSpecificParent(item);
+                        } else {
+                            this.navigateToSpecificChild(item);
+                        }
+                    };
+                    dropdown.appendChild(option);
+                });
+
+                // Position dropdown near button
+                const rect = button.getBoundingClientRect();
+                dropdown.style.position = 'fixed';
+                dropdown.style.left = `${rect.left}px`;
+                dropdown.style.top = `${rect.bottom + 5}px`;
+                dropdown.style.zIndex = '10000';
+
+                document.body.appendChild(dropdown);
+
+                // Close on outside click
+                setTimeout(() => {
+                    document.addEventListener('click', this.hideDropdowns, { once: true });
+                }, 0);
+            }
+
+            /**
+             * Hide any open dropdowns
+             */
+            hideDropdowns() {
+                const dropdown = document.getElementById('nav-dropdown');
+                if (dropdown) dropdown.remove();
             }
 
             /**
@@ -4032,22 +4372,17 @@
                     material.needsUpdate = true;
                 });
 
-                // Update edge appearances
-                const callGraph = this.data?.call_graph || {};
-                let edgeIndex = 0;
-                const allHighlighted = new Set([selectedName, ...upstreamNodes, ...downstreamNodes]);
+                // Update edge appearances - use stored caller/callee in userData
+                this.edges.forEach(edge => {
+                    try {
+                        const caller = edge.userData?.caller;
+                        const callee = edge.userData?.callee;
+                        if (!caller || !callee) return;
 
-                Object.entries(callGraph).forEach(([caller, callees]) => {
-                    callees.forEach(callee => {
-                        if (edgeIndex >= this.edges.length) return;
-                        const edge = this.edges[edgeIndex];
-
-                        // Store original color
-                        if (!edge.userData) edge.userData = {};
-                        if (!edge.userData.originalColor) {
-                            edge.userData.originalColor = edge.material.color.getHex();
-                            edge.userData.originalOpacity = edge.material.opacity;
-                        }
+                        // Get the line and arrows from the edge group (or edge itself if old-style)
+                        const line = edge.userData?.line || edge;
+                        const outArrow = edge.userData?.outArrow;
+                        const inArrow = edge.userData?.inArrow;
 
                         if (highlight) {
                             // Check if edge is part of highlighted path
@@ -4057,26 +4392,61 @@
                                 downstreamNodes.has(callee);
                             const isDirectConnection = caller === selectedName || callee === selectedName;
 
+                            let edgeHighlightColor = null;
+                            let edgeOpacity = 0.1;  // Default dim
+
                             if (isUpstreamEdge) {
-                                edge.material.color.setHex(upstreamColor);
-                                edge.material.opacity = 0.9;
-                                edge.material.linewidth = 3;
+                                edgeHighlightColor = upstreamColor;
+                                edgeOpacity = 0.9;
                             } else if (isDownstreamEdge || isDirectConnection) {
-                                edge.material.color.setHex(downstreamColor);
-                                edge.material.opacity = 0.9;
-                                edge.material.linewidth = 3;
-                            } else {
-                                // Dim other edges
-                                edge.material.opacity = 0.1;
+                                edgeHighlightColor = downstreamColor;
+                                edgeOpacity = 0.9;
+                            }
+
+                            // Apply to line
+                            if (line?.material) {
+                                if (edgeHighlightColor) {
+                                    line.material.color.setHex(edgeHighlightColor);
+                                }
+                                line.material.opacity = edgeOpacity;
+                                line.material.needsUpdate = true;
+                            }
+
+                            // Apply to arrows (if they exist)
+                            if (outArrow?.material) {
+                                if (edgeHighlightColor) outArrow.material.color.setHex(edgeHighlightColor);
+                                outArrow.material.opacity = edgeOpacity;
+                                outArrow.material.needsUpdate = true;
+                            }
+                            if (inArrow?.material) {
+                                if (edgeHighlightColor) inArrow.material.color.setHex(edgeHighlightColor);
+                                inArrow.material.opacity = edgeOpacity;
+                                inArrow.material.needsUpdate = true;
                             }
                         } else {
-                            // Restore original
-                            edge.material.color.setHex(edge.userData.originalColor);
-                            edge.material.opacity = edge.userData.originalOpacity;
+                            // Restore original appearance
+                            const origColor = edge.userData?.originalColor || 0x4a4a6a;
+                            const origOpacity = edge.userData?.originalOpacity || 0.6;
+
+                            if (line?.material) {
+                                line.material.color.setHex(origColor);
+                                line.material.opacity = origOpacity;
+                                line.material.needsUpdate = true;
+                            }
+                            if (outArrow?.material) {
+                                outArrow.material.color.setHex(origColor);
+                                outArrow.material.opacity = 0.8;
+                                outArrow.material.needsUpdate = true;
+                            }
+                            if (inArrow?.material) {
+                                inArrow.material.color.setHex(origColor);
+                                inArrow.material.opacity = 0.8;
+                                inArrow.material.needsUpdate = true;
+                            }
                         }
-                        edge.material.needsUpdate = true;
-                        edgeIndex++;
-                    });
+                    } catch (e) {
+                        console.warn('[Explorer] Error updating edge:', e);
+                    }
                 });
 
                 this.needsRender = true;
@@ -4220,6 +4590,173 @@
                 this.isAnimatingFlow = false;
                 this.controls.enabled = true;
             }
+
+            /**
+             * Request AI explanation for the currently selected node.
+             * This calls back to Kotlin via the injected cefQuery function.
+             */
+            explainWithAI() {
+                if (!this.selectedNode) {
+                    console.log('[Explorer] No node selected for AI explanation');
+                    return;
+                }
+
+                const data = this.selectedNode.userData;
+                const funcName = data.name;
+                const funcFile = data.info?.file || '';
+                const funcLine = data.info?.line || 0;
+                const isAlive = data.isAlive || false;
+                const isDead = data.isDead || false;
+                const callCount = data.info?.call_count || 0;
+                const whyNotCovered = data.whyNotCovered?.root_cause || '';
+
+                console.log('[Explorer] Requesting AI explanation for:', funcName);
+
+                // Build context for the AI
+                const context = `Status: ${isAlive ? 'Executed' : 'Not executed'}
+Call count: ${callCount}
+${isDead && whyNotCovered ? 'Why not covered: ' + whyNotCovered : ''}`;
+
+                // Call back to Kotlin via cefQuery (injected by JCEF) if in IDE mode
+                if (typeof window.cefQuery === 'function') {
+                    window.cefQuery({
+                        request: JSON.stringify({
+                            action: 'explain',
+                            function: funcName,
+                            file: funcFile,
+                            line: funcLine,
+                            isAlive: isAlive,
+                            isDead: isDead,
+                            callCount: callCount,
+                            whyNotCovered: whyNotCovered
+                        }),
+                        onSuccess: function(response) {
+                            console.log('[Explorer] AI explanation request sent');
+                        },
+                        onFailure: function(error_code, error_message) {
+                            console.error('[Explorer] AI explanation request failed:', error_message);
+                            explorer.showLLMMessage('Error: ' + error_message, 'error');
+                        }
+                    });
+                } else {
+                    // Browser mode - use HTTP API
+                    this.explainWithHttpAPI(funcName, funcFile, context);
+                }
+            }
+
+            /**
+             * Request AI explanation via HTTP API (browser mode).
+             */
+            async explainWithHttpAPI(funcName, funcFile, context) {
+                this.showLLMMessage('Checking AI availability...', 'loading');
+
+                try {
+                    // First check if AI is available
+                    const statusResp = await fetch('/api/ai/status');
+                    const status = await statusResp.json();
+
+                    if (!status.available) {
+                        this.showLLMMessage(
+                            'AI not available. Start the AI server from the TrueFlow AI Explanations tab.',
+                            'not_running'
+                        );
+                        return;
+                    }
+
+                    this.showLLMMessage('Getting AI explanation...', 'loading');
+
+                    // Request explanation
+                    const explainResp = await fetch('/api/ai/explain', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            function: funcName,
+                            file: funcFile,
+                            context: context
+                        })
+                    });
+
+                    const result = await explainResp.json();
+
+                    if (result.success && result.explanation) {
+                        this.showAIExplanation(funcName, result.explanation);
+                    } else {
+                        this.showLLMMessage(
+                            result.error || 'Failed to get explanation',
+                            'error'
+                        );
+                    }
+
+                } catch (error) {
+                    console.error('[Explorer] HTTP API error:', error);
+                    this.showLLMMessage(
+                        'Failed to connect to AI server: ' + error.message,
+                        'error'
+                    );
+                }
+            }
+
+            /**
+             * Show LLM status message in the info panel.
+             */
+            showLLMMessage(message, type) {
+                const content = document.getElementById('info-content');
+                if (!content) return;
+
+                const colorMap = {
+                    'loading': '#60a5fa',
+                    'success': '#4ade80',
+                    'error': '#f87171',
+                    'info': '#fbbf24',
+                    'not_running': '#f97316'
+                };
+                const color = colorMap[type] || '#888';
+
+                // Append or update the AI section
+                let aiSection = content.querySelector('.ai-explanation-section');
+                if (!aiSection) {
+                    aiSection = document.createElement('div');
+                    aiSection.className = 'ai-explanation-section';
+                    aiSection.style.cssText = 'margin-top: 12px; padding-top: 12px; border-top: 1px solid #4a4a6a;';
+                    content.appendChild(aiSection);
+                }
+
+                aiSection.innerHTML = `
+                    <h4 style="color: ${color}; margin-bottom: 8px; font-size: 12px;">
+                        ${type === 'loading' ? '⏳' : type === 'error' ? '❌' : type === 'not_running' ? '⚠️' : 'ℹ️'} AI Explanation
+                    </h4>
+                    <div style="color: #ccc; font-size: 11px; line-height: 1.5;">${message}</div>
+                `;
+            }
+
+            /**
+             * Show AI explanation response.
+             */
+            showAIExplanation(funcName, explanation) {
+                const content = document.getElementById('info-content');
+                if (!content) return;
+
+                // Replace loading message with actual response
+                let aiSection = content.querySelector('.ai-explanation-section');
+                if (!aiSection) {
+                    aiSection = document.createElement('div');
+                    aiSection.className = 'ai-explanation-section';
+                    aiSection.style.cssText = 'margin-top: 12px; padding-top: 12px; border-top: 1px solid #4a4a6a;';
+                    content.appendChild(aiSection);
+                }
+
+                // Format the explanation with markdown-like rendering
+                const formattedExplanation = explanation
+                    .replace(/\n/g, '<br>')
+                    .replace(/`([^`]+)`/g, '<code style="background: rgba(0,0,0,0.3); padding: 2px 4px; border-radius: 3px;">$1</code>');
+
+                aiSection.innerHTML = `
+                    <h4 style="color: #4ade80; margin-bottom: 8px; font-size: 12px;">✨ AI Explanation</h4>
+                    <div style="color: #ccc; font-size: 11px; line-height: 1.6; max-height: 200px; overflow-y: auto;">
+                        ${formattedExplanation}
+                    </div>
+                `;
+            }
         }
 
         // Initialize
@@ -4233,6 +4770,28 @@
                 explorer.loadData(data);
             } catch (e) {
                 console.error('Failed to load visualization data:', e);
+            }
+        };
+
+        // Handle LLM status updates from Kotlin
+        window.handleLLMStatus = function(statusData) {
+            try {
+                const data = typeof statusData === 'string' ? JSON.parse(statusData) : statusData;
+                console.log('[Explorer] LLM Status:', data.status, data.message);
+                explorer.showLLMMessage(data.message, data.status);
+            } catch (e) {
+                console.error('Failed to handle LLM status:', e);
+            }
+        };
+
+        // Handle LLM response from Kotlin
+        window.handleLLMResponse = function(responseData) {
+            try {
+                const data = typeof responseData === 'string' ? JSON.parse(responseData) : responseData;
+                console.log('[Explorer] LLM Response for:', data.function);
+                explorer.showAIExplanation(data.function, data.explanation);
+            } catch (e) {
+                console.error('Failed to handle LLM response:', e);
             }
         };
 

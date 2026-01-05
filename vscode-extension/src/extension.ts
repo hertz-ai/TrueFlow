@@ -2,9 +2,11 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as https from 'https';
+import * as net from 'net';
 import * as child_process from 'child_process';
 import { TraceSocketClient, TraceEvent, PerformanceData } from './TraceSocketClient';
 import { AIExplanationProvider } from './AIExplanationWebview';
+import { InteractiveExplorerServer } from './InteractiveExplorerServer';
 
 // Model presets for AI explanation
 interface ModelPreset {
@@ -77,7 +79,13 @@ let currentContextSelection: number = 0;
 let traceViewerPanel: vscode.WebviewPanel | undefined;
 let traceSocketClient: TraceSocketClient | undefined;
 let statusBarItem: vscode.StatusBarItem;
+let mcpStatusBarItem: vscode.StatusBarItem;
 let sidebarProvider: TrueFlowSidebarProvider | undefined;
+let explorerServer: InteractiveExplorerServer | undefined;
+
+// Track active processes started by this VS Code instance (without tracing)
+let activeProcessesWithoutTracing = new Set<string>();
+let statusBarPulseInterval: NodeJS.Timeout | undefined;
 
 // Global trace filter state (applies to all tabs)
 interface TraceFilter {
@@ -175,6 +183,19 @@ class TrueFlowSidebarProvider implements vscode.WebviewViewProvider {
     }
 }
 
+// Server auto-detection state
+let serverDetectionInterval: NodeJS.Timeout | undefined;
+let lastServerNotificationTime = 0;
+let lastServerDetectedPort = 0;  // Store detected port for direct connect
+const SERVER_DETECTION_INTERVAL_MS = 3000;
+const SERVER_NOTIFICATION_COOLDOWN_MS = 60000;
+let serverNotificationShown = false;
+
+// Task/run detection state
+let taskDetectionDisabled = false;
+let lastTaskNotificationTime = 0;
+const TASK_NOTIFICATION_COOLDOWN_MS = 60000;
+
 export function activate(context: vscode.ExtensionContext) {
     console.log('TrueFlow extension is now active');
 
@@ -185,6 +206,13 @@ export function activate(context: vscode.ExtensionContext) {
     statusBarItem.command = 'trueflow.connectSocket';
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
+
+    // MCP/AI Server status bar item
+    mcpStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+    mcpStatusBarItem.text = '$(circle-outline) MCP';
+    mcpStatusBarItem.tooltip = 'MCP/AI Server: Not running - start llama.cpp on port 8080 for AI features';
+    mcpStatusBarItem.show();
+    context.subscriptions.push(mcpStatusBarItem);
 
     // Initialize socket client
     traceSocketClient = new TraceSocketClient();
@@ -214,6 +242,12 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Watch for trace file changes
     setupTraceWatcher(context);
+
+    // Start server auto-detection
+    startServerDetection(context);
+
+    // Listen for task/terminal executions to detect un-traced runs
+    setupTaskDetection(context);
 }
 
 function setupSocketClientHandlers(): void {
@@ -313,10 +347,11 @@ function setupSocketClientHandlers(): void {
     });
 }
 
-async function connectToSocket(): Promise<void> {
+async function connectToSocket(detectedPort?: number): Promise<void> {
     const config = vscode.workspace.getConfiguration('trueflow');
     const host = config.get<string>('socketHost', 'localhost');
-    const port = config.get<number>('socketPort', 5678);
+    // Use: 1) explicit detectedPort, 2) stored lastServerDetectedPort, 3) config
+    const port = detectedPort ?? (lastServerDetectedPort > 0 ? lastServerDetectedPort : config.get<number>('socketPort', 5678));
 
     if (traceSocketClient?.isConnected()) {
         vscode.window.showInformationMessage('Already connected to trace server');
@@ -747,6 +782,83 @@ async function openExplorerInExternalBrowser(context: vscode.ExtensionContext, d
     }
 }
 
+/**
+ * Toggle the live server for real-time browser viewing.
+ */
+function toggleExplorerLiveServer(
+    context: vscode.ExtensionContext,
+    data: any,
+    panel: vscode.WebviewPanel | undefined
+): void {
+    if (explorerServer?.isRunning()) {
+        // Stop the server
+        explorerServer.stop();
+        explorerServer = undefined;
+
+        // Update button in webview
+        panel?.webview.postMessage({
+            type: 'liveServerStatus',
+            isRunning: false,
+            url: null
+        });
+
+        vscode.window.showInformationMessage('TrueFlow live server stopped');
+    } else {
+        // Start the server
+        const resourcesPath = path.join(context.extensionPath, 'resources');
+
+        explorerServer = new InteractiveExplorerServer(
+            8765,
+            resourcesPath,
+            (url) => {
+                // Server started - update button and open browser
+                panel?.webview.postMessage({
+                    type: 'liveServerStatus',
+                    isRunning: true,
+                    url: url
+                });
+
+                // Open browser
+                vscode.env.openExternal(vscode.Uri.parse(url));
+                vscode.window.showInformationMessage(`TrueFlow live server running at ${url}`);
+            },
+            () => {
+                // Server stopped
+                panel?.webview.postMessage({
+                    type: 'liveServerStatus',
+                    isRunning: false,
+                    url: null
+                });
+            },
+            (error) => {
+                // Error
+                vscode.window.showErrorMessage(`Failed to start live server: ${error.message}`);
+                panel?.webview.postMessage({
+                    type: 'liveServerStatus',
+                    isRunning: false,
+                    url: null
+                });
+            }
+        );
+
+        explorerServer.start();
+
+        // Push initial data
+        if (data) {
+            explorerServer.pushTraceData(data);
+        }
+    }
+}
+
+/**
+ * Push current trace data to the live server (if running).
+ */
+function pushToLiveServer(data: any): void {
+    if (explorerServer?.isRunning()) {
+        explorerServer.pushTraceData(data);
+    }
+}
+
 function generateStandaloneExplorerHtml(data: any): string {
     // Generate a standalone HTML with Three.js for the 3D explorer
     return `<!DOCTYPE html>
@@ -858,8 +970,13 @@ function showTraceViewer(context: vscode.ExtensionContext, initialTab?: string):
                 vscode.window.showInformationMessage(message.message);
                 break;
             case 'openExplorerInBrowser':
-                // Open interactive flow explorer in external browser
+            case 'exportSnapshot':
+                // Open interactive flow explorer in external browser (static snapshot)
                 openExplorerInExternalBrowser(context, message.data);
+                break;
+            case 'toggleLiveServer':
+                // Toggle the live server for real-time browser viewing
+                toggleExplorerLiveServer(context, message.data, traceViewerPanel);
                 break;
             case 'getExplorerHtml':
                 // Load the Three.js interactive flow explorer HTML for iframe embedding
@@ -2025,7 +2142,8 @@ function getTraceViewerHtml(initialTab?: string): string {
         <div class="sub-content active" id="interactive-explorer-subcontent">
             <div class="explorer-toolbar" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px; background: var(--vscode-editor-lineHighlightBackground); border-radius: 4px; margin-bottom: 8px;">
                 <button onclick="refreshInteractiveExplorer()" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">Refresh</button>
-                <button onclick="openExplorerInBrowser()" title="Open in external browser with 3D view" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">🌐 Open in Browser</button>
+                <button id="live-server-btn" onclick="toggleLiveServer()" title="Open visualization in browser with real-time updates" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">🌐 Open in Browser</button>
+                <button onclick="exportSnapshot()" title="Export current visualization as static HTML file" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px;">📸 Export Snapshot</button>
                 <select id="explorer-filter-coverage" onchange="applyExplorerFilters()" style="background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 5px 8px; border-radius: 4px; font-size: 11px;">
                     <option value="all">All Functions</option>
                     <option value="covered">Covered Only</option>
@@ -3859,8 +3977,47 @@ function getTraceViewerHtml(initialTab?: string): string {
             URL.revokeObjectURL(url);
         }
 
-        function openExplorerInBrowser() {
-            // Build data for the 3D explorer
+        // Live server state
+        let liveServerRunning = false;
+
+        function toggleLiveServer() {
+            // Build current data for the server
+            const data = {
+                functions: explorerData.functions,
+                call_graph: explorerData.callGraph,
+                resolved_call_graph: resolvedCallGraphData,
+                covered_functions: explorerData.coveredFunctions,
+                dead_functions: explorerData.deadFunctions,
+                why_not_covered: explorerData.whyNotCovered,
+                timestamp: Date.now()
+            };
+
+            vscode.postMessage({
+                type: 'toggleLiveServer',
+                data: data
+            });
+        }
+
+        function updateLiveServerButton(isRunning, url) {
+            const btn = document.getElementById('live-server-btn');
+            if (btn) {
+                liveServerRunning = isRunning;
+                if (isRunning && url) {
+                    btn.textContent = '✕ Close Browser';
+                    btn.title = 'Live at ' + url + ' - Click to close';
+                    btn.style.background = '#4CAF50';
+                    btn.style.color = 'white';
+                } else {
+                    btn.textContent = '🌐 Open in Browser';
+                    btn.title = 'Open visualization in browser with real-time updates';
+                    btn.style.background = '';
+                    btn.style.color = '';
+                }
+            }
+        }
+
+        function exportSnapshot() {
+            // Build data for the 3D explorer (static snapshot)
             const data = {
                 functions: explorerData.functions,
                 call_graph: explorerData.callGraph,
@@ -3872,9 +4029,14 @@ function getTraceViewerHtml(initialTab?: string): string {
 
             // Request the HTML template from the extension
             vscode.postMessage({
-                type: 'openExplorerInBrowser',
+                type: 'exportSnapshot',
                 data: data
             });
+        }
+
+        // Keep old function name for backward compatibility
+        function openExplorerInBrowser() {
+            exportSnapshot();
         }
 
         function openWatchInBrowser() {
@@ -4350,6 +4512,13 @@ function getTraceViewerHtml(initialTab?: string): string {
                         handleExplorerHtmlResponse(message.html);
                     }
                     break;
+
+                case 'liveServerStatus':
+                    // Update the live server button state
+                    if (typeof updateLiveServerButton === 'function') {
+                        updateLiveServerButton(message.isRunning, message.url);
+                    }
+                    break;
             }
         });
 
@@ -4626,7 +4795,348 @@ function getHomeDir(): string {
     return process.env.HOME || process.env.USERPROFILE || '';
 }
 
+// === Server Auto-Detection ===
+
+function startServerDetection(context: vscode.ExtensionContext): void {
+    // Check immediately on start
+    checkForTraceServer();
+
+    // Then check periodically
+    serverDetectionInterval = setInterval(() => {
+        checkForTraceServer();
+    }, SERVER_DETECTION_INTERVAL_MS);
+
+    context.subscriptions.push({
+        dispose: () => {
+            if (serverDetectionInterval) {
+                clearInterval(serverDetectionInterval);
+            }
+        }
+    });
+}
+
+async function checkForTraceServer(): Promise<void> {
+    // Check MCP/AI server status (llama.cpp on port 8080)
+    const mcpPort = 8080;
+    const mcpAvailable = await isPortListening('127.0.0.1', mcpPort);
+    if (mcpAvailable) {
+        mcpStatusBarItem.text = '$(circle-filled) MCP';
+        mcpStatusBarItem.tooltip = `MCP/AI Server running on port ${mcpPort} (llama.cpp)`;
+        mcpStatusBarItem.backgroundColor = undefined;
+    } else {
+        mcpStatusBarItem.text = '$(circle-outline) MCP';
+        mcpStatusBarItem.tooltip = 'MCP/AI Server: Not running - start llama.cpp on port 8080 for AI features';
+        mcpStatusBarItem.backgroundColor = undefined;
+    }
+
+    // Check if we should pulse for auto-integrate (Python running without tracing)
+    const isIntegrated = isProjectAlreadyIntegrated();
+    const shouldPulse = activeProcessesWithoutTracing.size > 0 && !isIntegrated;
+    updateStatusBarPulse(shouldPulse);
+
+    // Don't check if already connected
+    if (traceSocketClient?.isConnected()) {
+        serverNotificationShown = false;  // Reset for next time
+        return;
+    }
+
+    const port = 5678;  // Default TrueFlow port
+    const isAvailable = await isPortListening('127.0.0.1', port);
+
+    if (isAvailable) {
+        lastServerDetectedPort = port;  // Store detected port for direct connect
+        const now = Date.now();
+        if (!serverNotificationShown && now - lastServerNotificationTime > SERVER_NOTIFICATION_COOLDOWN_MS) {
+            serverNotificationShown = true;
+            lastServerNotificationTime = now;
+            showServerDetectedNotification(port);
+        }
+    } else {
+        lastServerDetectedPort = 0;  // Reset when server not available
+        serverNotificationShown = false;
+    }
+}
+
+let pulsePhase = 0;
+function updateStatusBarPulse(shouldPulse: boolean): void {
+    if (shouldPulse && !statusBarPulseInterval) {
+        // Start pulsing
+        pulsePhase = 0;
+        statusBarPulseInterval = setInterval(() => {
+            pulsePhase = (pulsePhase + 1) % 4;
+            const icons = ['$(circle-outline)', '$(circle-small)', '$(circle-filled)', '$(circle-small)'];
+            statusBarItem.text = `${icons[pulsePhase]} TrueFlow - Setup Required`;
+            statusBarItem.tooltip = 'Python process running without TrueFlow tracing. Click to auto-integrate.';
+            statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        }, 500);
+    } else if (!shouldPulse && statusBarPulseInterval) {
+        // Stop pulsing
+        clearInterval(statusBarPulseInterval);
+        statusBarPulseInterval = undefined;
+        if (!traceSocketClient?.isConnected()) {
+            statusBarItem.text = '$(debug-disconnect) TrueFlow';
+            statusBarItem.tooltip = 'TrueFlow: Click to connect to trace server';
+            statusBarItem.backgroundColor = undefined;
+        }
+    }
+}
+
+function isPortListening(host: string, port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const socket = new net.Socket();
+
+        socket.setTimeout(1000);
+
+        socket.on('connect', () => {
+            socket.destroy();
+            resolve(true);
+        });
+
+        socket.on('timeout', () => {
+            socket.destroy();
+            resolve(false);
+        });
+
+        socket.on('error', () => {
+            socket.destroy();
+            resolve(false);
+        });
+
+        socket.connect(port, host);
+    });
+}
+
+function showServerDetectedNotification(port: number): void {
+    const message = `TrueFlow trace server detected on port ${port}. Connect to start receiving traces.`;
+
+    vscode.window.showInformationMessage(message, 'Connect Now', 'Ignore').then(selection => {
+        if (selection === 'Connect Now') {
+            connectToSocket(port);  // Pass detected port directly
+        }
+    });
+
+    // Also update status bar to flash
+    const originalText = statusBarItem.text;
+    statusBarItem.text = '$(zap) Server Detected!';
+    statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+
+    setTimeout(() => {
+        if (!traceSocketClient?.isConnected()) {
+            statusBarItem.text = originalText;
+            statusBarItem.backgroundColor = undefined;
+        }
+    }, 3000);
+}
+
+// === Task/Run Detection ===
+
+function setupTaskDetection(context: vscode.ExtensionContext): void {
+    // Listen for task executions
+    context.subscriptions.push(
+        vscode.tasks.onDidStartTask(event => {
+            checkTaskForTracing(event.execution.task);
+        })
+    );
+
+    // Listen for task end to remove from active processes
+    context.subscriptions.push(
+        vscode.tasks.onDidEndTask(event => {
+            const taskId = `task:${event.execution.task.name}`;
+            activeProcessesWithoutTracing.delete(taskId);
+        })
+    );
+
+    // Listen for debug sessions
+    context.subscriptions.push(
+        vscode.debug.onDidStartDebugSession(session => {
+            checkDebugSessionForTracing(session);
+        })
+    );
+
+    // Listen for debug session end to remove from active processes
+    context.subscriptions.push(
+        vscode.debug.onDidTerminateDebugSession(session => {
+            const sessionId = `debug:${session.id}`;
+            activeProcessesWithoutTracing.delete(sessionId);
+        })
+    );
+
+    // Listen for terminal creation (catches manual runs)
+    context.subscriptions.push(
+        vscode.window.onDidOpenTerminal(terminal => {
+            // We can't easily inspect terminal commands, but we can prompt
+            // for projects that aren't integrated
+            checkProjectIntegration();
+        })
+    );
+}
+
+function checkTaskForTracing(task: vscode.Task): void {
+    // Check if this is a supported task type
+    // TrueFlow supports Python, Java, and Kotlin
+    const taskDef = task.definition;
+    const taskType = taskDef.type?.toLowerCase() || '';
+    const taskName = task.name.toLowerCase();
+
+    // Python support
+    const isPythonTask = taskType.includes('python') ||
+                        taskName.endsWith('.py') ||
+                        taskType.includes('pytest') ||
+                        taskType.includes('django') ||
+                        taskType.includes('flask');
+
+    // Java/Kotlin support
+    const isJvmTask = taskType.includes('java') ||
+                     taskType.includes('kotlin') ||
+                     taskType.includes('gradle') ||
+                     taskType.includes('maven') ||
+                     taskName.endsWith('.java') ||
+                     taskName.endsWith('.kt');
+
+    if (!isPythonTask && !isJvmTask) return;
+
+    // Check if tracing is enabled (look for env vars in task definition)
+    const hasTracing = checkTaskHasTracing(task);
+
+    // Track process for pulsing status bar
+    const taskId = `task:${task.name}`;
+    if (!hasTracing) {
+        activeProcessesWithoutTracing.add(taskId);
+    } else {
+        activeProcessesWithoutTracing.delete(taskId);
+    }
+
+    if (taskDetectionDisabled) return;
+
+    const now = Date.now();
+    if (now - lastTaskNotificationTime < TASK_NOTIFICATION_COOLDOWN_MS) return;
+
+    if (hasTracing) return;
+
+    // Show notification
+    lastTaskNotificationTime = now;
+    showTaskTracingNotification(task.name);
+}
+
+function checkTaskHasTracing(task: vscode.Task): boolean {
+    const taskDef = task.definition as any;
+
+    // Check for TrueFlow environment variables (Python and general)
+    const envMarkers = [
+        'PYCHARM_PLUGIN_TRACE_ENABLED',
+        'TRUEFLOW_TRACE_ENABLED',
+        'CRAWL4AI_TRACE',
+        'TRUEFLOW_JAVA_AGENT'
+    ];
+
+    if (taskDef.env) {
+        for (const marker of envMarkers) {
+            if (taskDef.env[marker]) return true;
+        }
+    }
+
+    // Check options.env
+    if (taskDef.options?.env) {
+        for (const marker of envMarkers) {
+            if (taskDef.options.env[marker]) return true;
+        }
+    }
+
+    // Check for Java agent in args/vmArgs
+    const args = taskDef.args?.join(' ') || '';
+    const vmArgs = taskDef.vmArgs?.join(' ') || '';
+    const allArgs = `${args} ${vmArgs}`.toLowerCase();
+
+    if (allArgs.includes('-javaagent:') && allArgs.includes('trueflow')) {
+        return true;
+    }
+    if (allArgs.includes('-dtrueflow.enabled=true')) {
+        return true;
+    }
+
+    return false;
+}
+
+function checkDebugSessionForTracing(session: vscode.DebugSession): void {
+    // Check supported debug types (Python and JVM)
+    const debugType = session.type.toLowerCase();
+    const supportedTypes = ['python', 'debugpy', 'java', 'kotlin'];
+
+    if (!supportedTypes.some(t => debugType.includes(t))) return;
+
+    // Check if this is a TrueFlow-enabled launch config
+    const config = session.configuration;
+
+    // Check env variables
+    const hasEnvTracing = config.env?.PYCHARM_PLUGIN_TRACE_ENABLED ||
+                         config.env?.TRUEFLOW_TRACE_ENABLED ||
+                         config.env?.TRUEFLOW_JAVA_AGENT;
+
+    // Check for [TrueFlow] in name
+    const hasNameMarker = config.name?.includes('[TrueFlow]');
+
+    // Check for Java agent in vmArgs
+    const vmArgs = (config.vmArgs || []).join(' ').toLowerCase();
+    const hasJavaAgent = vmArgs.includes('-javaagent:') && vmArgs.includes('trueflow');
+
+    const hasTracing = hasEnvTracing || hasNameMarker || hasJavaAgent;
+
+    // Track process for pulsing status bar
+    const sessionId = `debug:${session.id}`;
+    if (!hasTracing) {
+        activeProcessesWithoutTracing.add(sessionId);
+    } else {
+        activeProcessesWithoutTracing.delete(sessionId);
+    }
+
+    if (taskDetectionDisabled) return;
+
+    const now = Date.now();
+    if (now - lastTaskNotificationTime < TASK_NOTIFICATION_COOLDOWN_MS) return;
+
+    if (hasTracing) return;
+
+    // Show notification
+    lastTaskNotificationTime = now;
+    showTaskTracingNotification(session.name);
+}
+
+function checkProjectIntegration(): void {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) return;
+
+    const pluginDir = path.join(workspaceFolder.uri.fsPath, '.pycharm_plugin');
+    const trueflowDir = path.join(workspaceFolder.uri.fsPath, '.trueflow');
+
+    if (fs.existsSync(pluginDir) || fs.existsSync(trueflowDir)) return;
+
+    // Project not integrated - could show a subtle hint
+    // But don't spam the user
+}
+
+function showTaskTracingNotification(taskName: string): void {
+    const message = `Running '${taskName}' without TrueFlow tracing. Enable tracing to visualize execution flow.`;
+
+    vscode.window.showInformationMessage(message, 'Auto-Integrate', "Don't Ask Again", 'Ignore').then(selection => {
+        if (selection === 'Auto-Integrate') {
+            vscode.commands.executeCommand('trueflow.autoIntegrate');
+        } else if (selection === "Don't Ask Again") {
+            taskDetectionDisabled = true;
+        }
+    });
+}
+
 export function deactivate() {
+    // Stop server detection
+    if (serverDetectionInterval) {
+        clearInterval(serverDetectionInterval);
+    }
+
+    // Stop status bar pulse animation
+    if (statusBarPulseInterval) {
+        clearInterval(statusBarPulseInterval);
+    }
+
     if (traceViewerPanel) {
         traceViewerPanel.dispose();
     }
@@ -4635,5 +5145,10 @@ export function deactivate() {
     }
     if (llmServerProcess) {
         llmServerProcess.kill();
+    }
+    // Stop the interactive explorer live server
+    if (explorerServer) {
+        explorerServer.stop();
+        explorerServer = undefined;
     }
 }

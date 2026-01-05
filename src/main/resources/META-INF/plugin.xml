@@ -92,7 +92,18 @@
         <!-- Project Service -->
         <projectService
                 serviceImplementation="com.crawl4ai.learningviz.TraceWatcherService"/>
+
+        <!-- Notification Group for server detection -->
+        <notificationGroup id="TrueFlow Notifications"
+                           displayType="BALLOON"
+                           isLogByDefault="false"/>
     </extensions>
+
+    <!-- Execution Listener for detecting un-traced runs -->
+    <projectListeners>
+        <listener class="com.crawl4ai.learningviz.TracingExecutionListener"
+                  topic="com.intellij.execution.ExecutionListener"/>
+    </projectListeners>
 
     <actions>
         <!-- Tool Window Actions -->

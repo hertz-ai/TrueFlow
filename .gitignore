@@ -50,6 +50,11 @@ media/
 *.png
 *.svg
 
+
+*.md
+*.vsix
+*.jar
+
 # Logs
 *.log
 logs/

@@ -1,5 +1,7 @@
 package com.crawl4ai.learningviz
 
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.SimpleToolWindowPanel
@@ -18,6 +20,8 @@ import java.awt.Font
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.io.File
+import java.net.Socket
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.swing.*
@@ -191,6 +195,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private var totalTimeLabel = JBLabel("Total Time: 0ms")
     private var avgTimeLabel = JBLabel("Avg Time: 0ms")
     private var deadCodePercentLabel = JBLabel("Dead Code: 0%")
+    private var mcpStatusLabel = JBLabel("MCP: -")
     private var filterStatsLabel = JBLabel("Filters: None")
 
     private var currentTraceDirectory: File? = null
@@ -285,6 +290,21 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private var autoRefreshInterval = 10000 // Default 10 seconds
     private var autoRefreshEnabled = true
 
+    // Server auto-detection
+    private var serverDetectionTimer: javax.swing.Timer? = null
+    private var serverDetectionEnabled = true
+    private val serverDetectionInterval = 3000 // Check every 3 seconds
+    private val lastServerDetectedPort = AtomicInteger(0)
+    private val serverNotificationShown = AtomicBoolean(false)
+    private val defaultTracePort = 5678
+
+    // Button pulse animation
+    private var buttonPulseTimer: javax.swing.Timer? = null
+    private var integratePulseTimer: javax.swing.Timer? = null
+    private var pulsePhase = 0
+    private var integratePulsePhase = 0
+    private lateinit var autoIntegrateButton: JButton
+
     init {
         // Initialize paths and deploy resources
         PluginPaths.initializeAll(project)
@@ -353,6 +373,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
         // Start auto-refresh
         startAutoRefresh()
+
+        // Start server auto-detection
+        startServerDetection()
     }
 
     private fun createToolbar() {
@@ -361,7 +384,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
 
         // Auto-integrate button (highlighted - primary action)
         val isIntegrated = isProjectAlreadyIntegrated()
-        val autoIntegrateButton = JButton(if (isIntegrated) "Re-Integrate" else "Auto-Integrate into Repo")
+        autoIntegrateButton = JButton(if (isIntegrated) "Re-Integrate" else "Auto-Integrate into Repo")
         autoIntegrateButton.toolTipText = if (isIntegrated)
             "TrueFlow is already set up. Click to reconfigure or update."
         else
@@ -369,13 +392,25 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         autoIntegrateButton.addActionListener {
             openAutoIntegrateDialog()
         }
+        autoIntegrateButton.isOpaque = true
+        autoIntegrateButton.isContentAreaFilled = true
         // Green if not integrated (call to action), gray if already done
+        // Pulse only starts when a compatible app is detected (in checkForTraceServer)
         if (isIntegrated) {
             autoIntegrateButton.background = java.awt.Color(100, 100, 100) // Gray - already done
             autoIntegrateButton.foreground = java.awt.Color.WHITE
+            autoIntegrateButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                javax.swing.BorderFactory.createLineBorder(java.awt.Color(80, 80, 80), 2),
+                javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+            )
         } else {
-            autoIntegrateButton.background = java.awt.Color(76, 175, 80) // Green highlight - action needed
+            // Static green initially - pulse starts when compatible app detected
+            autoIntegrateButton.background = java.awt.Color(76, 175, 80)
             autoIntegrateButton.foreground = java.awt.Color.WHITE
+            autoIntegrateButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                javax.swing.BorderFactory.createLineBorder(java.awt.Color(56, 142, 60), 2),
+                javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+            )
         }
         toolbar.add(autoIntegrateButton)
 
@@ -389,7 +424,14 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
                 updateAttachButtonState(false)
             } else {
                 // Not connected, so attach
-                showAttachDialog()
+                val detectedPort = lastServerDetectedPort.get()
+                if (detectedPort > 0) {
+                    // Server already detected - connect directly without dialog
+                    connectToTraceServer("127.0.0.1", detectedPort)
+                } else {
+                    // No server detected - show dialog to enter host/port
+                    showAttachDialog()
+                }
             }
         }
         attachButton.background = java.awt.Color(33, 150, 243) // Blue highlight
@@ -440,6 +482,20 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private fun openAutoIntegrateDialog() {
         val dialog = AutoIntegrationDialog(project)
         dialog.show()
+
+        // After dialog closes, check if integration was successful and update button
+        if (isProjectAlreadyIntegrated()) {
+            stopIntegratePulse()
+            autoIntegrateButton.text = "Re-Integrate"
+            autoIntegrateButton.toolTipText = "TrueFlow is already set up. Click to reconfigure or update."
+            autoIntegrateButton.background = java.awt.Color(100, 100, 100) // Gray - already done
+            autoIntegrateButton.foreground = java.awt.Color.WHITE
+            autoIntegrateButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                javax.swing.BorderFactory.createLineBorder(java.awt.Color(80, 80, 80), 2),
+                javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+            )
+            autoIntegrateButton.repaint()
+        }
     }
 
     /**
@@ -534,6 +590,14 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         deadCodePercentLabel.font = boldFont
         deadCodePercentLabel.foreground = JBColor(0xCC6600, 0xFFAA33)
         row2.add(deadCodePercentLabel)
+
+        row2.add(createSeparator())
+
+        // MCP server status - gray when off, green when on
+        mcpStatusLabel.font = smallFont
+        mcpStatusLabel.foreground = JBColor(0x888888, 0x888888)
+        mcpStatusLabel.toolTipText = "MCP Server status - run 'python trueflow_mcp_server.py' to start"
+        row2.add(mcpStatusLabel)
 
         row2.add(createSeparator())
 
@@ -1998,8 +2062,11 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             if (unmatchedTraced > 0) parts.add("$unmatchedTraced external")
             if (excludedCount > 0) parts.add("$excludedCount filtered")
             deadCodeStatsLabel.text = "$totalDefined functions: ${parts.joinToString(", ")} (${String.format("%.1f", deadCodePercent)}% dead)"
+            // Also update overview stats panel
+            deadCodePercentLabel.text = "Dead Code: ${String.format("%.1f", deadCodePercent)}%"
         } else {
             deadCodeStatsLabel.text = "Real-time mode: ${filteredCalledFunctions.size} functions called (waiting for function registry...)"
+            deadCodePercentLabel.text = "Dead Code: -%"
         }
 
         // Clear table
@@ -2856,6 +2923,386 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         }
     }
 
+    // === Server Auto-Detection ===
+
+    private fun startServerDetection() {
+        stopServerDetection()
+
+        if (!serverDetectionEnabled) return
+
+        serverDetectionTimer = javax.swing.Timer(serverDetectionInterval) {
+            // Run detection in background thread to avoid blocking UI
+            Thread {
+                checkForTraceServer()
+            }.start()
+        }
+        serverDetectionTimer?.isRepeats = true
+        serverDetectionTimer?.start()
+
+        // Also check immediately on start
+        Thread {
+            checkForTraceServer()
+        }.start()
+    }
+
+    private fun stopServerDetection() {
+        serverDetectionTimer?.stop()
+        serverDetectionTimer = null
+    }
+
+    private fun checkForTraceServer() {
+        // Check MCP/AI server status (llama.cpp on port 8080)
+        val mcpPort = 8080
+        val mcpAvailable = isPortListening("127.0.0.1", mcpPort)
+        SwingUtilities.invokeLater {
+            if (mcpAvailable) {
+                mcpStatusLabel.text = "MCP: ●"
+                mcpStatusLabel.foreground = JBColor(0x228B22, 0x66CC66)  // Green
+                mcpStatusLabel.toolTipText = "MCP/AI Server running on port $mcpPort (llama.cpp)"
+            } else {
+                mcpStatusLabel.text = "MCP: ○"
+                mcpStatusLabel.foreground = JBColor(0x888888, 0x888888)  // Gray
+                mcpStatusLabel.toolTipText = "MCP/AI Server not running - start llama.cpp on port $mcpPort for AI features"
+            }
+        }
+
+        // Don't check if already connected
+        if (currentTraceMode == TraceMode.SOCKET_REALTIME && traceSocketClient?.isConnected() == true) {
+            serverNotificationShown.set(false) // Reset so we can notify again after disconnect
+            SwingUtilities.invokeLater { resetAttachButtonStyle() }
+            return
+        }
+
+        val port = defaultTracePort
+        val isAvailable = isPortListening("127.0.0.1", port)
+
+        // Check if we should pulse the Auto-Integrate button
+        // Conditions: Python/Java app running WITHOUT tracing AND not integrated yet AND panel visible
+        val hasProcessRunningWithoutTracing = hasActiveProcessWithoutTracing()
+        val shouldPulseIntegrate = hasProcessRunningWithoutTracing && !isProjectAlreadyIntegrated() && mainPanel.isShowing
+        SwingUtilities.invokeLater {
+            if (shouldPulseIntegrate) {
+                if (integratePulseTimer == null) {
+                    startIntegratePulse()
+                }
+            } else {
+                if (integratePulseTimer != null) {
+                    stopIntegratePulse()
+                    // Reset to static state
+                    if (::autoIntegrateButton.isInitialized) {
+                        if (isProjectAlreadyIntegrated()) {
+                            autoIntegrateButton.background = java.awt.Color(100, 100, 100)
+                            autoIntegrateButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                                javax.swing.BorderFactory.createLineBorder(java.awt.Color(80, 80, 80), 2),
+                                javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                            )
+                        } else {
+                            autoIntegrateButton.background = java.awt.Color(76, 175, 80)
+                            autoIntegrateButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                                javax.swing.BorderFactory.createLineBorder(java.awt.Color(56, 142, 60), 2),
+                                javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                            )
+                        }
+                        autoIntegrateButton.repaint()
+                    }
+                }
+            }
+        }
+
+        if (isAvailable) {
+            // Server detected - keep button in "detected" state
+            SwingUtilities.invokeLater { setAttachButtonServerDetected(port) }
+
+            // Show notification only once per detection
+            if (lastServerDetectedPort.get() != port || !serverNotificationShown.getAndSet(true)) {
+                lastServerDetectedPort.set(port)
+                SwingUtilities.invokeLater {
+                    showServerDetectedNotification(port)
+                }
+            }
+        } else {
+            // Server not available - reset to normal state
+            if (lastServerDetectedPort.get() == port) {
+                lastServerDetectedPort.set(0)
+                serverNotificationShown.set(false)
+                SwingUtilities.invokeLater { resetAttachButtonStyle() }
+            }
+        }
+    }
+
+    private fun isPortListening(host: String, port: Int): Boolean {
+        return try {
+            Socket(host, port).use { socket ->
+                socket.isConnected
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Check if there's an active Python or Java process running WITHOUT TrueFlow tracing.
+     * Uses ExecutionManager to find running configurations started by THIS IDE for THIS project.
+     */
+    private fun hasActiveProcessWithoutTracing(): Boolean {
+        return try {
+            val executionManager = com.intellij.execution.ExecutionManager.getInstance(project)
+            val runningProcesses = executionManager.getRunningProcesses()
+
+            for (handler in runningProcesses) {
+                if (!handler.isProcessTerminated) {
+                    val cmdLine = handler.toString().lowercase()
+
+                    // Check if it's a Python process
+                    val isPython = cmdLine.contains("python") ||
+                                   cmdLine.contains(".py") ||
+                                   cmdLine.contains("pytest") ||
+                                   cmdLine.contains("flask") ||
+                                   cmdLine.contains("django") ||
+                                   cmdLine.contains("uvicorn") ||
+                                   cmdLine.contains("gunicorn")
+
+                    // Check if it's a Java/Kotlin process
+                    val isJava = cmdLine.contains("java") ||
+                                 cmdLine.contains("kotlin") ||
+                                 cmdLine.contains("gradle") ||
+                                 cmdLine.contains("maven") ||
+                                 cmdLine.contains(".jar") ||
+                                 cmdLine.contains("spring") ||
+                                 cmdLine.contains("tomcat")
+
+                    if (isPython) {
+                        // Check if Python tracing is NOT enabled
+                        val hasTracing = cmdLine.contains("pycharm_plugin") ||
+                                         cmdLine.contains("trueflow") ||
+                                         cmdLine.contains("crawl4ai_trace") ||
+                                         cmdLine.contains("sitecustomize") ||
+                                         cmdLine.contains("python_runtime_instrumentor")
+
+                        if (!hasTracing) {
+                            PluginLogger.debug("[ToolWindow] Found Python process without tracing")
+                            return true
+                        }
+                    }
+
+                    if (isJava) {
+                        // Check if Java agent tracing is NOT enabled
+                        val hasTracing = cmdLine.contains("-javaagent") &&
+                                         (cmdLine.contains("trueflow") || cmdLine.contains("trueflow-agent"))
+
+                        if (!hasTracing) {
+                            PluginLogger.debug("[ToolWindow] Found Java process without tracing")
+                            return true
+                        }
+                    }
+                }
+            }
+            false
+        } catch (e: Exception) {
+            PluginLogger.debug("[ToolWindow] Error checking for processes: ${e.message}")
+            false
+        }
+    }
+
+    private fun showServerDetectedNotification(port: Int) {
+        try {
+            val notificationGroup = NotificationGroupManager.getInstance()
+                .getNotificationGroup("TrueFlow Notifications")
+
+            val notification = notificationGroup.createNotification(
+                "TrueFlow Trace Server Detected",
+                "A trace server is running on port $port. Click to attach.",
+                NotificationType.INFORMATION
+            )
+
+            // Add action to attach
+            notification.addAction(object : com.intellij.notification.NotificationAction("Attach Now") {
+                override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent, notification: com.intellij.notification.Notification) {
+                    notification.expire()
+                    connectToTraceServer("127.0.0.1", port)
+                }
+            })
+
+            // Add action to dismiss and stop detection temporarily
+            notification.addAction(object : com.intellij.notification.NotificationAction("Ignore") {
+                override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent, notification: com.intellij.notification.Notification) {
+                    notification.expire()
+                    // Mark as shown so we don't immediately re-notify
+                    serverNotificationShown.set(true)
+                }
+            })
+
+            notification.notify(project)
+
+            // Also flash the attach button
+            flashAttachButton()
+
+        } catch (e: Exception) {
+            PluginLogger.warn("[ServerDetection] Failed to show notification: ${e.message}")
+            // Fallback: just flash the button
+            flashAttachButton()
+        }
+    }
+
+    /**
+     * Set the attach button to "Server Detected" state with pulsing green animation.
+     */
+    private fun setAttachButtonServerDetected(port: Int) {
+        attachButton.text = "⚡ Server Detected (port $port)"
+        attachButton.toolTipText = "Click to attach to the detected trace server on port $port"
+
+        // Use opaque background for proper fill color
+        attachButton.isOpaque = true
+        attachButton.isContentAreaFilled = true
+        attachButton.foreground = java.awt.Color.WHITE
+
+        // Start pulsing animation
+        startButtonPulse()
+    }
+
+    /**
+     * Start continuous pulse animation for the button (both fill and border).
+     */
+    private fun startButtonPulse() {
+        stopButtonPulse()
+
+        pulsePhase = 0
+        buttonPulseTimer = javax.swing.Timer(100) { // 100ms interval for smooth animation
+            pulsePhase = (pulsePhase + 1) % 20  // 20 phases = 2 second cycle
+
+            // Calculate pulse intensity (0.0 to 1.0, smooth sine wave)
+            val intensity = (Math.sin(pulsePhase * Math.PI / 10) + 1) / 2
+
+            // Interpolate between bright green and darker green for fill
+            val bgR = (76 + (120 - 76) * intensity).toInt()   // 76 to 120
+            val bgG = (175 + (220 - 175) * intensity).toInt() // 175 to 220
+            val bgB = (80 + (100 - 80) * intensity).toInt()   // 80 to 100
+
+            // Interpolate border color (darker green to bright yellow-green)
+            val borderR = (56 + (180 - 56) * intensity).toInt()
+            val borderG = (142 + (230 - 142) * intensity).toInt()
+            val borderB = (60 + (80 - 60) * intensity).toInt()
+
+            SwingUtilities.invokeLater {
+                attachButton.background = java.awt.Color(bgR, bgG, bgB)
+                attachButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                    javax.swing.BorderFactory.createLineBorder(java.awt.Color(borderR, borderG, borderB), 2),
+                    javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                )
+                attachButton.repaint()
+            }
+        }
+        buttonPulseTimer?.start()
+    }
+
+    /**
+     * Stop the button pulse animation.
+     */
+    private fun stopButtonPulse() {
+        buttonPulseTimer?.stop()
+        buttonPulseTimer = null
+    }
+
+    /**
+     * Start continuous pulse animation for the Auto-Integrate button (both fill and border).
+     */
+    private fun startIntegratePulse() {
+        stopIntegratePulse()
+
+        integratePulsePhase = 0
+        integratePulseTimer = javax.swing.Timer(100) { // 100ms interval for smooth animation
+            integratePulsePhase = (integratePulsePhase + 1) % 20  // 20 phases = 2 second cycle
+
+            // Calculate pulse intensity (0.0 to 1.0, smooth sine wave)
+            val intensity = (Math.sin(integratePulsePhase * Math.PI / 10) + 1) / 2
+
+            // Interpolate between darker green and brighter green for fill
+            val bgR = (56 + (100 - 56) * intensity).toInt()   // 56 to 100
+            val bgG = (142 + (200 - 142) * intensity).toInt() // 142 to 200
+            val bgB = (60 + (90 - 60) * intensity).toInt()    // 60 to 90
+
+            // Interpolate border color (dark green to bright teal)
+            val borderR = (40 + (80 - 40) * intensity).toInt()
+            val borderG = (120 + (200 - 120) * intensity).toInt()
+            val borderB = (50 + (120 - 50) * intensity).toInt()
+
+            SwingUtilities.invokeLater {
+                if (::autoIntegrateButton.isInitialized) {
+                    autoIntegrateButton.background = java.awt.Color(bgR, bgG, bgB)
+                    autoIntegrateButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                        javax.swing.BorderFactory.createLineBorder(java.awt.Color(borderR, borderG, borderB), 2),
+                        javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                    )
+                    autoIntegrateButton.repaint()
+                }
+            }
+        }
+        integratePulseTimer?.start()
+    }
+
+    /**
+     * Stop the integrate button pulse animation.
+     */
+    private fun stopIntegratePulse() {
+        integratePulseTimer?.stop()
+        integratePulseTimer = null
+    }
+
+    /**
+     * Reset the attach button to normal "Attach to Server" state.
+     */
+    private fun resetAttachButtonStyle() {
+        // Stop any pulsing animation
+        stopButtonPulse()
+
+        // Don't reset if connected (use updateAttachButtonState for that)
+        if (currentTraceMode == TraceMode.SOCKET_REALTIME && traceSocketClient?.isConnected() == true) {
+            return
+        }
+
+        attachButton.text = "Attach to Server"
+        attachButton.toolTipText = "Connect to running Python process via socket (real-time tracing)"
+
+        attachButton.isOpaque = true
+        attachButton.isContentAreaFilled = true
+        attachButton.background = java.awt.Color(33, 150, 243) // Blue
+        attachButton.foreground = java.awt.Color.WHITE
+
+        // Reset border to match
+        attachButton.border = javax.swing.BorderFactory.createCompoundBorder(
+            javax.swing.BorderFactory.createLineBorder(java.awt.Color(25, 118, 210), 2),
+            javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+        )
+
+        attachButton.repaint()
+    }
+
+    /**
+     * Flash the attach button briefly to draw attention (called on initial detection).
+     */
+    private fun flashAttachButton() {
+        // Button is already pulsing from setAttachButtonServerDetected
+        // Do an extra bright flash to draw attention
+        SwingUtilities.invokeLater {
+            attachButton.background = java.awt.Color(255, 235, 59) // Bright yellow
+            attachButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                javax.swing.BorderFactory.createLineBorder(java.awt.Color(255, 193, 7), 3), // Orange-yellow
+                javax.swing.BorderFactory.createEmptyBorder(3, 7, 3, 7)
+            )
+            attachButton.repaint()
+        }
+
+        // Resume normal pulsing after brief flash
+        javax.swing.Timer(300) {
+            if (lastServerDetectedPort.get() > 0) {
+                startButtonPulse()
+            }
+        }.apply {
+            isRepeats = false
+            start()
+        }
+    }
+
     private fun loadPlantUMLDiagram(file: File) {
         val diagram = plantUMLParser.parsePlantUML(file) ?: return
 
@@ -3272,17 +3719,32 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     }
 
     private fun updateAttachButtonState(connected: Boolean) {
+        // Stop pulse animation when state changes
+        stopButtonPulse()
+
+        attachButton.isOpaque = true
+        attachButton.isContentAreaFilled = true
+
         if (connected) {
             attachButton.text = "Detach from Server"
             attachButton.background = java.awt.Color(244, 67, 54) // Red for disconnect
             attachButton.foreground = java.awt.Color.WHITE
             attachButton.toolTipText = "Disconnect from trace server"
+            attachButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                javax.swing.BorderFactory.createLineBorder(java.awt.Color(198, 40, 40), 2),
+                javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+            )
         } else {
             attachButton.text = "Attach to Server"
             attachButton.background = java.awt.Color(33, 150, 243) // Blue for connect
             attachButton.foreground = java.awt.Color.WHITE
             attachButton.toolTipText = "Connect to running Python process via socket (real-time tracing)"
+            attachButton.border = javax.swing.BorderFactory.createCompoundBorder(
+                javax.swing.BorderFactory.createLineBorder(java.awt.Color(25, 118, 210), 2),
+                javax.swing.BorderFactory.createEmptyBorder(4, 8, 4, 8)
+            )
         }
+        attachButton.repaint()
     }
 
     private fun toggleAutoTracing(enabled: Boolean) {
@@ -3866,6 +4328,12 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     fun getContent(): JComponent = mainPanel
 
     fun dispose() {
+        // Stop timers
+        stopAutoRefresh()
+        stopServerDetection()
+        stopButtonPulse()
+        stopIntegratePulse()
+
         // Dispose ManimVideoPanel file watcher
         manimVideoPanel.dispose()
 

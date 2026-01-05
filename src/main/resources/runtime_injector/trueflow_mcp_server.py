@@ -62,6 +62,13 @@ class TrueFlowState:
     performance_data: dict = field(default_factory=dict)
     dead_code_data: dict = field(default_factory=dict)
     call_trace_data: list = field(default_factory=list)
+    # Call graph structures (matching Interactive Explorer)
+    call_graph: dict = field(default_factory=dict)  # caller -> [callees]
+    reverse_call_graph: dict = field(default_factory=dict)  # callee -> [callers]
+    covered_functions: set = field(default_factory=set)  # Functions that have been executed
+    function_info: dict = field(default_factory=dict)  # func_name -> {file, line, module}
+    # Stack tracking for building call graph
+    _call_stack: list = field(default_factory=list)  # Stack of (call_id, func_name)
 
 
 # Global state
@@ -225,11 +232,14 @@ async def _read_trace_events():
 
 
 def _update_analytics(event: dict):
-    """Update performance and dead code analytics from event."""
+    """Update performance, call graph, and dead code analytics from event."""
     global state
 
     func_key = f"{event.get('module', 'unknown')}.{event.get('function', 'unknown')}"
+    event_type = event.get("type", "")
+    call_id = event.get("call_id")
 
+    # Initialize performance data for new functions
     if func_key not in state.performance_data:
         state.performance_data[func_key] = {
             "calls": 0,
@@ -240,22 +250,59 @@ def _update_analytics(event: dict):
             "line": event.get("line", 0)
         }
 
+    # Store function info (file, line, module)
+    if func_key not in state.function_info:
+        state.function_info[func_key] = {
+            "file": event.get("file", ""),
+            "line": event.get("line", 0),
+            "module": event.get("module", "unknown")
+        }
+
     perf = state.performance_data[func_key]
-    perf["calls"] += 1
 
-    if event.get("type") == "return" and "duration_ms" in event:
-        duration = event["duration_ms"]
-        perf["total_ms"] += duration
-        perf["min_ms"] = min(perf["min_ms"], duration)
-        perf["max_ms"] = max(perf["max_ms"], duration)
+    # Handle call events - build call graph
+    if event_type == "call":
+        perf["calls"] += 1
+        state.covered_functions.add(func_key)
 
-    # Track call hierarchy for dead code analysis
+        # Build call graph from stack
+        if state._call_stack:
+            caller = state._call_stack[-1][1]  # Get caller function name
+            # Add to call_graph (caller -> callees)
+            if caller not in state.call_graph:
+                state.call_graph[caller] = []
+            if func_key not in state.call_graph[caller]:
+                state.call_graph[caller].append(func_key)
+
+            # Add to reverse_call_graph (callee -> callers)
+            if func_key not in state.reverse_call_graph:
+                state.reverse_call_graph[func_key] = []
+            if caller not in state.reverse_call_graph[func_key]:
+                state.reverse_call_graph[func_key].append(caller)
+
+        # Push to stack
+        state._call_stack.append((call_id, func_key))
+
+    # Handle return events
+    elif event_type == "return":
+        if "duration_ms" in event:
+            duration = event["duration_ms"]
+            perf["total_ms"] += duration
+            perf["min_ms"] = min(perf["min_ms"], duration)
+            perf["max_ms"] = max(perf["max_ms"], duration)
+
+        # Pop from stack
+        if state._call_stack and state._call_stack[-1][0] == call_id:
+            state._call_stack.pop()
+
+    # Track call hierarchy for detailed analysis
     state.call_trace_data.append({
         "function": func_key,
         "depth": event.get("depth", 0),
         "parent_id": event.get("parent_id"),
-        "call_id": event.get("call_id"),
-        "timestamp": event.get("timestamp")
+        "call_id": call_id,
+        "timestamp": event.get("timestamp"),
+        "type": event_type
     })
 
 
@@ -1083,6 +1130,741 @@ Then connect with: trace_connect()
 """
 
     return instructions
+
+
+# ============================================================================
+# INTERACTIVE EXPLORER TOOLS (for LLM-driven code exploration)
+# Uses exact same call_graph logic as Interactive Explorer HTML
+# ============================================================================
+
+def _find_matching_function(function_name: str) -> str:
+    """Find exact or partial match in covered functions."""
+    # Try exact match first
+    if function_name in state.covered_functions:
+        return function_name
+    # Try partial match
+    for func in state.covered_functions:
+        if function_name.lower() in func.lower():
+            return func
+    return ""
+
+
+def _find_all_children(func_name: str) -> list:
+    """Find ALL children (callees) of a function - matches Interactive Explorer findAllChildren()."""
+    return state.call_graph.get(func_name, [])
+
+
+def _find_all_parents(func_name: str) -> list:
+    """Find ALL parents (callers) of a function - matches Interactive Explorer findAllParents()."""
+    return state.reverse_call_graph.get(func_name, [])
+
+
+def _find_downstream_path(func_name: str, visited: set = None) -> list:
+    """
+    Find all downstream nodes (callees) recursively.
+    Matches Interactive Explorer findDownstreamPath().
+    """
+    if visited is None:
+        visited = set()
+    if func_name in visited:
+        return []
+    visited.add(func_name)
+
+    callees = state.call_graph.get(func_name, [])
+    downstream = []
+
+    for callee in callees:
+        downstream.append(callee)
+        downstream.extend(_find_downstream_path(callee, visited))
+
+    return list(set(downstream))
+
+
+def _find_upstream_path(func_name: str, visited: set = None) -> list:
+    """
+    Find all upstream nodes (callers) recursively.
+    Matches Interactive Explorer findUpstreamPath().
+    """
+    if visited is None:
+        visited = set()
+    if func_name in visited:
+        return []
+    visited.add(func_name)
+
+    callers = state.reverse_call_graph.get(func_name, [])
+    upstream = []
+
+    for caller in callers:
+        upstream.append(caller)
+        upstream.extend(_find_upstream_path(caller, visited))
+
+    return list(set(upstream))
+
+
+def _find_root_caller(func_name: str) -> str:
+    """
+    Find the root caller (entry point) for a function.
+    Matches Interactive Explorer findRootCaller().
+    """
+    current = func_name
+    visited = set()
+
+    while True:
+        if current in visited:
+            break
+        visited.add(current)
+
+        callers = state.reverse_call_graph.get(current, [])
+        if not callers:
+            return current  # No callers - this is the root
+
+        # Follow the first caller (primary path)
+        current = callers[0]
+
+    return current
+
+
+@server.tool()
+async def explorer_get_function_details(function_name: str) -> str:
+    """
+    Get detailed information about a specific function from trace data.
+
+    Use this when an LLM needs to understand what a function does, its performance,
+    who calls it, and what it calls. Uses exact same call_graph logic as Interactive Explorer.
+
+    Args:
+        function_name: Full or partial function name (e.g., "MyClass.method" or just "method")
+
+    Returns:
+        JSON with function details: file, line, calls, performance, callees, callers
+    """
+    global state
+
+    if not state.call_graph and not state.performance_data:
+        return "No trace data available. Connect to trace server and collect events first."
+
+    # Find matching functions
+    matches = []
+    for func_key in state.covered_functions:
+        if function_name.lower() in func_key.lower():
+            perf_data = state.performance_data.get(func_key, {})
+            func_info = state.function_info.get(func_key, {})
+
+            # Get callees and callers using call_graph (same as Interactive Explorer)
+            callees = _find_all_children(func_key)
+            callers = _find_all_parents(func_key)
+
+            avg_ms = perf_data.get("total_ms", 0) / perf_data.get("calls", 1) if perf_data.get("calls", 0) > 0 else 0
+
+            matches.append({
+                "function": func_key,
+                "file": func_info.get("file", perf_data.get("file", "unknown")),
+                "line": func_info.get("line", perf_data.get("line", 0)),
+                "module": func_info.get("module", ""),
+                "calls": perf_data.get("calls", 0),
+                "total_ms": round(perf_data.get("total_ms", 0), 2),
+                "avg_ms": round(avg_ms, 2),
+                "max_ms": round(perf_data.get("max_ms", 0), 2),
+                "callees": callees[:20],
+                "callers": callers[:20],
+                "callees_count": len(callees),
+                "callers_count": len(callers),
+                "is_entry_point": len(callers) == 0
+            })
+
+    if not matches:
+        return f"No function matching '{function_name}' found in traces."
+
+    # Sort by calls (most called first)
+    matches.sort(key=lambda x: x["calls"], reverse=True)
+
+    return json.dumps({
+        "query": function_name,
+        "matches": matches[:10],
+        "total_matches": len(matches)
+    }, indent=2)
+
+
+@server.tool()
+async def explorer_get_callees(function_name: str, max_depth: int = 2) -> str:
+    """
+    Get all functions called by a specific function (outgoing call edges).
+
+    Use this to understand what other code a function depends on.
+    Uses exact same call_graph logic as Interactive Explorer findDownstreamPath().
+
+    Args:
+        function_name: Function to analyze
+        max_depth: How deep to follow the call chain (default: 2)
+
+    Returns:
+        JSON tree of called functions with their metrics
+    """
+    global state
+
+    if not state.call_graph:
+        return "No call graph data available. Connect to trace server and collect events first."
+
+    # Find exact function
+    func = _find_matching_function(function_name)
+    if not func:
+        return f"Function '{function_name}' not found in traces."
+
+    def build_callee_tree(func_name: str, depth: int, visited: set) -> list:
+        if depth > max_depth or func_name in visited:
+            return []
+        visited.add(func_name)
+
+        result = []
+        callees = _find_all_children(func_name)
+
+        for callee in callees:
+            perf = state.performance_data.get(callee, {})
+            result.append({
+                "function": callee,
+                "calls": perf.get("calls", 0),
+                "total_ms": round(perf.get("total_ms", 0), 2),
+                "is_covered": callee in state.covered_functions,
+                "children": build_callee_tree(callee, depth + 1, visited.copy()) if depth + 1 <= max_depth else []
+            })
+
+        return result
+
+    tree = build_callee_tree(func, 0, set())
+
+    # Also get flat list of all downstream functions
+    all_downstream = _find_downstream_path(func)
+
+    return json.dumps({
+        "function": func,
+        "max_depth": max_depth,
+        "callees_tree": tree,
+        "all_downstream": all_downstream[:50],
+        "total_downstream": len(all_downstream)
+    }, indent=2)
+
+
+@server.tool()
+async def explorer_get_callers(function_name: str, max_depth: int = 2) -> str:
+    """
+    Get all functions that call a specific function (incoming call edges).
+
+    Use this to understand what code depends on a function.
+    Uses exact same call_graph logic as Interactive Explorer findUpstreamPath().
+
+    Args:
+        function_name: Function to analyze
+        max_depth: How deep to follow the caller chain (default: 2)
+
+    Returns:
+        JSON tree of calling functions
+    """
+    global state
+
+    if not state.reverse_call_graph:
+        return "No call graph data available. Connect to trace server and collect events first."
+
+    # Find exact function
+    func = _find_matching_function(function_name)
+    if not func:
+        return f"Function '{function_name}' not found in traces."
+
+    def build_caller_tree(func_name: str, depth: int, visited: set) -> list:
+        if depth > max_depth or func_name in visited:
+            return []
+        visited.add(func_name)
+
+        result = []
+        callers = _find_all_parents(func_name)
+
+        for caller in callers:
+            perf = state.performance_data.get(caller, {})
+            result.append({
+                "function": caller,
+                "calls": perf.get("calls", 0),
+                "total_ms": round(perf.get("total_ms", 0), 2),
+                "is_covered": caller in state.covered_functions,
+                "callers": build_caller_tree(caller, depth + 1, visited.copy()) if depth + 1 <= max_depth else []
+            })
+
+        return result
+
+    tree = build_caller_tree(func, 0, set())
+
+    # Also get flat list of all upstream functions and root caller
+    all_upstream = _find_upstream_path(func)
+    root = _find_root_caller(func)
+
+    return json.dumps({
+        "function": func,
+        "max_depth": max_depth,
+        "callers_tree": tree,
+        "all_upstream": all_upstream[:50],
+        "total_upstream": len(all_upstream),
+        "root_caller": root if root != func else None
+    }, indent=2)
+
+
+@server.tool()
+async def explorer_search(query: str, search_type: str = "function") -> str:
+    """
+    Search for functions, modules, or files in the trace data.
+
+    Use this to find code elements by name or pattern.
+    Uses same data structures as Interactive Explorer.
+
+    Args:
+        query: Search query (partial match supported)
+        search_type: What to search - function, module, file, all
+
+    Returns:
+        JSON array of matching items with metadata
+    """
+    global state
+
+    results = []
+    query_lower = query.lower()
+
+    for func_key in state.covered_functions:
+        perf_data = state.performance_data.get(func_key, {})
+        func_info = state.function_info.get(func_key, {})
+
+        match = False
+        module_name = func_key.rsplit(".", 1)[0] if "." in func_key else ""
+        func_name = func_key.rsplit(".", 1)[-1] if "." in func_key else func_key
+        file_path = func_info.get("file", perf_data.get("file", ""))
+
+        if search_type in ["function", "all"] and query_lower in func_name.lower():
+            match = True
+        if search_type in ["module", "all"] and query_lower in module_name.lower():
+            match = True
+        if search_type in ["file", "all"] and query_lower in file_path.lower():
+            match = True
+
+        if match:
+            callees = _find_all_children(func_key)
+            callers = _find_all_parents(func_key)
+            results.append({
+                "function": func_key,
+                "module": module_name,
+                "name": func_name,
+                "file": file_path,
+                "line": func_info.get("line", perf_data.get("line", 0)),
+                "calls": perf_data.get("calls", 0),
+                "total_ms": round(perf_data.get("total_ms", 0), 2),
+                "callees_count": len(callees),
+                "callers_count": len(callers),
+                "is_entry_point": len(callers) == 0
+            })
+
+    # Sort by calls (most called first)
+    results.sort(key=lambda x: x["calls"], reverse=True)
+
+    return json.dumps({
+        "query": query,
+        "search_type": search_type,
+        "results": results[:50],
+        "total_matches": len(results)
+    }, indent=2)
+
+
+@server.tool()
+async def explorer_get_hot_paths(limit: int = 10) -> str:
+    """
+    Get the most frequently executed code paths (hot paths).
+
+    Use this to identify performance-critical execution flows.
+    Analyzes call_graph to find heavily traversed paths.
+
+    Args:
+        limit: Number of hot paths to return
+
+    Returns:
+        JSON array of hot paths with call sequences and metrics
+    """
+    global state
+
+    if not state.call_graph:
+        return "No call graph data available."
+
+    # Find entry points (functions with no callers)
+    entry_points = [f for f in state.covered_functions if not _find_all_parents(f)]
+
+    # Build paths from each entry point
+    paths = []
+
+    for entry in entry_points:
+        # DFS to collect all paths from this entry
+        def collect_paths(func: str, current_path: list, visited: set):
+            if func in visited or len(current_path) > 10:
+                return
+            visited.add(func)
+            current_path.append(func)
+
+            callees = _find_all_children(func)
+            if not callees:
+                # Leaf node - record path
+                perf = state.performance_data.get(func, {})
+                path_total_ms = sum(state.performance_data.get(f, {}).get("total_ms", 0) for f in current_path)
+                path_total_calls = min(state.performance_data.get(f, {}).get("calls", 0) for f in current_path) if current_path else 0
+                paths.append({
+                    "entry_point": entry,
+                    "path": " -> ".join(current_path[:5]) + ("..." if len(current_path) > 5 else ""),
+                    "functions": current_path.copy(),
+                    "depth": len(current_path),
+                    "path_total_ms": round(path_total_ms, 2),
+                    "min_calls_in_path": path_total_calls
+                })
+            else:
+                for callee in callees[:5]:  # Limit branching
+                    collect_paths(callee, current_path.copy(), visited.copy())
+
+        collect_paths(entry, [], set())
+
+    # Sort by execution frequency (min_calls_in_path as proxy)
+    paths.sort(key=lambda x: x["min_calls_in_path"], reverse=True)
+
+    return json.dumps({
+        "hot_paths": paths[:limit],
+        "total_paths_analyzed": len(paths),
+        "entry_points": entry_points[:20]
+    }, indent=2)
+
+
+@server.tool()
+async def explorer_get_coverage_summary() -> str:
+    """
+    Get code coverage summary from trace data.
+
+    Use this to understand what percentage of code has been executed.
+    Uses same call_graph analysis as Interactive Explorer.
+
+    Returns:
+        JSON with coverage statistics by module and overall
+    """
+    global state
+
+    if not state.covered_functions:
+        return "No trace data available."
+
+    # Find entry points (no callers) and leaf nodes (no callees)
+    entry_points = []
+    leaf_nodes = []
+    for func in state.covered_functions:
+        callers = _find_all_parents(func)
+        callees = _find_all_children(func)
+        if not callers:
+            entry_points.append(func)
+        if not callees:
+            leaf_nodes.append(func)
+
+    # Group by module
+    modules = {}
+    for func_key in state.covered_functions:
+        perf_data = state.performance_data.get(func_key, {})
+        module = func_key.rsplit(".", 1)[0] if "." in func_key else "unknown"
+        if module not in modules:
+            modules[module] = {
+                "functions_covered": 0,
+                "total_calls": 0,
+                "total_ms": 0,
+                "entry_points": 0,
+                "functions": []
+            }
+        modules[module]["functions_covered"] += 1
+        modules[module]["total_calls"] += perf_data.get("calls", 0)
+        modules[module]["total_ms"] += perf_data.get("total_ms", 0)
+        modules[module]["functions"].append(func_key.rsplit(".", 1)[-1])
+        if func_key in entry_points:
+            modules[module]["entry_points"] += 1
+
+    # Calculate totals
+    total_functions = len(state.covered_functions)
+    total_calls = sum(state.performance_data.get(f, {}).get("calls", 0) for f in state.covered_functions)
+    total_ms = sum(state.performance_data.get(f, {}).get("total_ms", 0) for f in state.covered_functions)
+
+    # Call graph stats
+    total_edges = sum(len(callees) for callees in state.call_graph.values())
+
+    # Add dead code info if available
+    dead_code_info = {}
+    if state.dead_code_data:
+        dead_code_info = {
+            "total_defined": state.dead_code_data.get("total_defined", 0),
+            "dead_count": state.dead_code_data.get("dead_count", 0),
+            "coverage_percent": state.dead_code_data.get("coverage_percent", 0)
+        }
+
+    # Sort modules by activity
+    module_summary = [
+        {
+            "module": m,
+            "functions_covered": d["functions_covered"],
+            "total_calls": d["total_calls"],
+            "total_ms": round(d["total_ms"], 2),
+            "entry_points": d["entry_points"]
+        }
+        for m, d in sorted(modules.items(), key=lambda x: x[1]["total_calls"], reverse=True)
+    ][:20]
+
+    return json.dumps({
+        "summary": {
+            "total_functions_executed": total_functions,
+            "total_function_calls": total_calls,
+            "total_execution_time_ms": round(total_ms, 2),
+            "unique_modules": len(modules),
+            "call_graph_edges": total_edges,
+            "entry_points_count": len(entry_points),
+            "leaf_nodes_count": len(leaf_nodes)
+        },
+        "entry_points": entry_points[:10],
+        "dead_code": dead_code_info,
+        "modules": module_summary
+    }, indent=2)
+
+
+@server.tool()
+async def explorer_explain_function(function_name: str) -> str:
+    """
+    Get an AI-powered explanation of a function's behavior based on trace data.
+
+    Combines trace context with AI to explain what a function does,
+    its performance characteristics, and its role in the codebase.
+
+    Args:
+        function_name: Function to explain
+
+    Returns:
+        AI-generated explanation with trace context
+    """
+    global state
+
+    # Get function details first
+    details_json = await explorer_get_function_details(function_name)
+    details = json.loads(details_json)
+
+    if "matches" not in details or not details["matches"]:
+        return f"Function '{function_name}' not found in traces."
+
+    func_info = details["matches"][0]
+
+    # Build context for AI
+    context = f"""
+Function: {func_info['function']}
+File: {func_info['file']}:{func_info['line']}
+
+Performance Metrics:
+- Called {func_info['calls']} times
+- Total time: {func_info['total_ms']}ms
+- Average time: {func_info['avg_ms']}ms per call
+- Max time: {func_info['max_ms']}ms
+
+Calls these functions ({func_info['callees_count']} callees):
+{', '.join(func_info['callees'][:10]) if func_info['callees'] else 'None recorded'}
+
+Called by ({func_info['callers_count']} callers):
+{', '.join(func_info['callers'][:10]) if func_info['callers'] else 'Entry point or not recorded'}
+"""
+
+    # Try to get AI explanation
+    try:
+        import urllib.request
+
+        prompt = f"""Based on the runtime trace data below, explain what this function does and its role in the codebase.
+Focus on:
+1. What the function's purpose appears to be
+2. Its performance characteristics (is it called often? is it slow?)
+3. Its dependencies (what it calls) and dependents (what calls it)
+4. Any potential concerns (e.g., called too often, takes too long)
+
+{context}
+
+Provide a concise technical explanation."""
+
+        payload = json.dumps({
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 512,
+            "temperature": 0.7
+        }).encode('utf-8')
+
+        req = urllib.request.Request(
+            "http://127.0.0.1:8080/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+
+        response = urllib.request.urlopen(req, timeout=60)
+        result = json.loads(response.read().decode('utf-8'))
+        ai_explanation = result["choices"][0]["message"]["content"]
+
+        return json.dumps({
+            "function": func_info['function'],
+            "metrics": {
+                "calls": func_info['calls'],
+                "total_ms": func_info['total_ms'],
+                "avg_ms": func_info['avg_ms']
+            },
+            "ai_explanation": ai_explanation
+        }, indent=2)
+
+    except Exception as e:
+        # Return just the metrics if AI is not available
+        return json.dumps({
+            "function": func_info['function'],
+            "metrics": func_info,
+            "ai_explanation": f"AI server not available: {str(e)}. Start with ai_server_start().",
+            "context": context
+        }, indent=2)
+
+
+@server.tool()
+async def explorer_get_call_graph(module_filter: str = "") -> str:
+    """
+    Get the full call graph structure as used by Interactive Explorer.
+
+    Use this to understand the overall code structure and relationships.
+    This is the same data structure that Interactive Explorer visualizes as 3D nodes.
+
+    Args:
+        module_filter: Optional filter to only include functions from specific module
+
+    Returns:
+        JSON with call_graph (caller->callees) and reverse_call_graph (callee->callers)
+    """
+    global state
+
+    if not state.call_graph:
+        return "No call graph data available. Connect to trace server and collect events first."
+
+    # Apply module filter if provided
+    if module_filter:
+        filter_lower = module_filter.lower()
+        filtered_call_graph = {
+            caller: [c for c in callees if filter_lower in c.lower()]
+            for caller, callees in state.call_graph.items()
+            if filter_lower in caller.lower()
+        }
+        filtered_reverse = {
+            callee: [c for c in callers if filter_lower in c.lower()]
+            for callee, callers in state.reverse_call_graph.items()
+            if filter_lower in callee.lower()
+        }
+        filtered_functions = [f for f in state.covered_functions if filter_lower in f.lower()]
+    else:
+        filtered_call_graph = dict(state.call_graph)
+        filtered_reverse = dict(state.reverse_call_graph)
+        filtered_functions = list(state.covered_functions)
+
+    # Find entry points and leaf nodes
+    entry_points = [f for f in filtered_functions if f not in filtered_reverse or not filtered_reverse[f]]
+    leaf_nodes = [f for f in filtered_functions if f not in filtered_call_graph or not filtered_call_graph[f]]
+
+    return json.dumps({
+        "call_graph": filtered_call_graph,
+        "reverse_call_graph": filtered_reverse,
+        "functions": filtered_functions[:100],
+        "total_functions": len(filtered_functions),
+        "total_edges": sum(len(v) for v in filtered_call_graph.values()),
+        "entry_points": entry_points[:20],
+        "leaf_nodes": leaf_nodes[:20],
+        "module_filter": module_filter or "none"
+    }, indent=2)
+
+
+@server.tool()
+async def explorer_find_path(source: str, target: str) -> str:
+    """
+    Find the call path between two functions.
+
+    Use this to understand how one function reaches another through the call chain.
+    Similar to navigating between nodes in Interactive Explorer.
+
+    Args:
+        source: Starting function name
+        target: Target function name to reach
+
+    Returns:
+        JSON with the path from source to target (if reachable)
+    """
+    global state
+
+    if not state.call_graph:
+        return "No call graph data available."
+
+    # Find exact matches
+    source_func = _find_matching_function(source)
+    target_func = _find_matching_function(target)
+
+    if not source_func:
+        return f"Source function '{source}' not found in traces."
+    if not target_func:
+        return f"Target function '{target}' not found in traces."
+
+    # BFS to find shortest path from source to target (downstream)
+    def find_downstream_path():
+        queue = [(source_func, [source_func])]
+        visited = {source_func}
+
+        while queue:
+            current, path = queue.pop(0)
+            if current == target_func:
+                return path
+
+            for callee in state.call_graph.get(current, []):
+                if callee not in visited:
+                    visited.add(callee)
+                    queue.append((callee, path + [callee]))
+
+        return None
+
+    # BFS to find path from source to target (upstream - target calls source)
+    def find_upstream_path():
+        queue = [(source_func, [source_func])]
+        visited = {source_func}
+
+        while queue:
+            current, path = queue.pop(0)
+            if current == target_func:
+                return list(reversed(path))
+
+            for caller in state.reverse_call_graph.get(current, []):
+                if caller not in visited:
+                    visited.add(caller)
+                    queue.append((caller, path + [caller]))
+
+        return None
+
+    downstream_path = find_downstream_path()
+    upstream_path = find_upstream_path()
+
+    result = {
+        "source": source_func,
+        "target": target_func
+    }
+
+    if downstream_path:
+        result["downstream_path"] = {
+            "direction": f"{source_func} calls ... calls {target_func}",
+            "path": downstream_path,
+            "length": len(downstream_path) - 1,
+            "path_string": " -> ".join(downstream_path)
+        }
+
+    if upstream_path:
+        result["upstream_path"] = {
+            "direction": f"{target_func} calls ... calls {source_func}",
+            "path": upstream_path,
+            "length": len(upstream_path) - 1,
+            "path_string": " -> ".join(upstream_path)
+        }
+
+    if not downstream_path and not upstream_path:
+        result["reachable"] = False
+        result["message"] = f"No call path exists between {source_func} and {target_func}"
+    else:
+        result["reachable"] = True
+
+    return json.dumps(result, indent=2)
 
 
 # ============================================================================
