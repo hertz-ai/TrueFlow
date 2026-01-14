@@ -719,6 +719,7 @@
             border-radius: 8px;
             padding: 12px;
             z-index: 100;
+            max-width: 220px;
         }
 
         #legend h4 {
@@ -868,6 +869,7 @@
             font-size: 11px;
             color: #888;
             z-index: 100;
+            max-width: 280px;
         }
 
         /* Loading overlay */
@@ -965,7 +967,7 @@
                 <button id="btn-zoom-in" class="view-btn" title="Zoom In (Ctrl++)">+</button>
                 <button id="btn-zoom-out" class="view-btn" title="Zoom Out (Ctrl+-)">−</button>
                 <button id="btn-recenter" class="view-btn" title="Recenter View (Ctrl+0)">⌖</button>
-                <button id="btn-entry-points" class="view-btn entry-points" title="Go to Entry Points (Ctrl+E)">▶</button>
+                <button id="btn-hub-node" class="view-btn entry-points" title="Go to Hub Node - highest transitive callees (Ctrl+E)">▶</button>
             </div>
         </div>
 
@@ -979,36 +981,44 @@
 
         <div id="legend">
             <h4>Legend</h4>
+            <div style="font-size: 10px; color: #888; margin-bottom: 4px;">NODE STATUS</div>
             <div class="legend-item">
                 <div class="legend-color" style="background: #4ade80;"></div>
-                <span>Executed (Alive)</span>
-            </div>
-            <div class="legend-item">
-                <div class="legend-color" style="background: #ef4444;"></div>
-                <span>Orphaned (No Callers)</span>
-            </div>
-            <div class="legend-item">
-                <div class="legend-color" style="background: #a78bfa;"></div>
-                <span>Dead Branch (Not Taken)</span>
+                <span>Covered - Executed at runtime</span>
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background: #fbbf24;"></div>
-                <span>Partially Covered</span>
+                <span>Partial - Has untested branches</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ef4444;"></div>
+                <span>Orphaned - No callers in code</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #a78bfa;"></div>
+                <span>Dead Branch - Caller skipped this</span>
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background: #6b7280;"></div>
-                <span>Cascading Dead</span>
+                <span>Cascading Dead - Caller dead</span>
             </div>
             <div style="border-top: 1px solid #4a4a6a; margin: 8px 0; padding-top: 8px;">
-                <div style="font-size: 10px; color: #888; margin-bottom: 4px;">MARKERS</div>
+                <div style="font-size: 10px; color: #888; margin-bottom: 4px;">MODIFIERS</div>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #4ade80; border: 3px solid #f97316; box-sizing: border-box;"></div>
+                <span>Ring = Has dead callers</span>
+            </div>
+            <div style="border-top: 1px solid #4a4a6a; margin: 8px 0; padding-top: 8px;">
+                <div style="font-size: 10px; color: #888; margin-bottom: 4px;">SHAPES</div>
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background: #fbbf24; clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);"></div>
-                <span>Branch Divergence Point</span>
+                <span>Diamond = Has if/else/loops</span>
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background: #4ade80; clip-path: polygon(50% 100%, 0% 30%, 50% 0%, 100% 30%);"></div>
-                <span>Entry Point (Called from outside)</span>
+                <span>Pyramid = Entry point</span>
             </div>
             <div style="border-top: 1px solid #4a4a6a; margin: 8px 0; padding-top: 8px;">
                 <div style="font-size: 10px; color: #888; margin-bottom: 4px;">CLASS CONTAINERS</div>
@@ -1170,10 +1180,10 @@
                         e.preventDefault();
                         this.recenterView();
                     }
-                    // Ctrl+E to go to entry points
+                    // Ctrl+E to go to hub node (highest transitive callees)
                     if ((e.ctrlKey || e.metaKey) && e.key === 'e') {
                         e.preventDefault();
-                        this.focusOnEntryPoints();
+                        this.focusOnHubNode();
                     }
                 });
                 document.addEventListener('keyup', (e) => {
@@ -1583,7 +1593,7 @@
                 const btnZoomIn = document.getElementById('btn-zoom-in');
                 const btnZoomOut = document.getElementById('btn-zoom-out');
                 const btnRecenter = document.getElementById('btn-recenter');
-                const btnEntryPoints = document.getElementById('btn-entry-points');
+                const btnHubNode = document.getElementById('btn-hub-node');
 
                 if (btnZoomIn) {
                     btnZoomIn.addEventListener('click', () => this.zoomIn());
@@ -1594,8 +1604,8 @@
                 if (btnRecenter) {
                     btnRecenter.addEventListener('click', () => this.recenterView());
                 }
-                if (btnEntryPoints) {
-                    btnEntryPoints.addEventListener('click', () => this.focusOnEntryPoints());
+                if (btnHubNode) {
+                    btnHubNode.addEventListener('click', () => this.focusOnHubNode());
                 }
             }
 
@@ -2572,12 +2582,40 @@
                 const classInstantiationOrder = this.data.class_instantiation_order || {};
                 const positions = this.calculateLayoutWithClasses(functions, callGraph, classFunctions, classInstantiationOrder);
 
-                // Create nodes
+                // Create nodes (reuse reverseCallGraph built above for entry points)
                 Object.entries(functions).forEach(([name, info]) => {
                     const pos = positions[name] || { x: 0, y: 0, z: 0 };
                     const isAlive = coveredFunctions.has(name);
                     const isDead = deadFunctions.has(name);
                     const hasBranches = (info.branches || []).length > 0;
+
+                    // Check for partial incoming coverage:
+                    // If function is alive but has potential callers that are dead (not executed),
+                    // it means some paths to this function were not taken
+                    let hasDeadIncomingPaths = false;
+                    let hasUncalledCoveredCallers = false;
+                    if (isAlive) {
+                        const potentialCallers = reverseCallGraph[name] || [];
+                        if (potentialCallers.length > 0) {
+                            // Check if any potential caller is dead
+                            const deadCallers = potentialCallers.filter(c => deadFunctions.has(c) || !coveredFunctions.has(c));
+                            hasDeadIncomingPaths = deadCallers.length > 0;
+
+                            // Also check if any covered caller has this function as callee but might not have called it
+                            // (indicated by the caller having other dead callees - meaning it made branch decisions)
+                            const coveredCallers = potentialCallers.filter(c => coveredFunctions.has(c));
+                            for (const caller of coveredCallers) {
+                                const callees = callGraph[caller] || [];
+                                const hasDeadCallees = callees.some(c => deadFunctions.has(c) && c !== name);
+                                if (hasDeadCallees) {
+                                    // This covered caller has dead callees, suggesting branch decisions were made
+                                    // The alive function might have been called, but there's partial coverage context
+                                    hasUncalledCoveredCallers = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
                     // For dead functions, analyze why they're not covered if server didn't provide info
                     let whyInfo = whyNotCovered[name] || null;
@@ -2598,13 +2636,18 @@
                         console.log('[DeadNode]', name, 'deadType:', deadType, 'hasWhyInfo:', !!whyInfo);
                     }
 
-                    const node = this.createNode(name, info, pos, isAlive, isDead, hasBranches, deadType);
+                    // Mark as partial if: has own branches OR has dead incoming paths
+                    const hasPartialCoverage = hasBranches || hasDeadIncomingPaths;
+
+                    const node = this.createNode(name, info, pos, isAlive, isDead, hasPartialCoverage, deadType, hasDeadIncomingPaths);
                     node.userData = {
                         name,
                         info,
                         isAlive,
                         isDead,
                         deadType,
+                        hasDeadIncomingPaths,
+                        hasUncalledCoveredCallers,
                         whyNotCovered: whyInfo
                     };
 
@@ -2679,7 +2722,7 @@
                 console.log('[Explorer] Created', this.entryPointMarkers.length, 'entry point markers');
 
                 // Focus camera on entry points (root nodes) to show temporal flow start
-                this.focusOnEntryPoints();
+                this.focusOnHubNode();
             }
 
             /**
@@ -2734,6 +2777,48 @@
                 this.needsRender = true;
 
                 console.log('[Explorer] Focused on', entryCount, 'entry points at x:', centerX.toFixed(1));
+            }
+
+            /**
+             * Focus on the hub node - the node with the highest transitive callees count.
+             * This is typically the most "important" function that affects the most downstream code.
+             */
+            focusOnHubNode() {
+                const callGraph = this.data?.call_graph || {};
+
+                // Calculate transitive callee count for each function
+                let hubNode = null;
+                let maxCalleeCount = -1;
+
+                // Get all function names from nodes
+                const functionNames = Array.from(this.nodes.keys());
+
+                for (const funcName of functionNames) {
+                    // Count transitive callees using findDownstreamPath
+                    const downstreamPath = this.findDownstreamPath(funcName, new Set());
+                    const calleeCount = downstreamPath.length;
+
+                    if (calleeCount > maxCalleeCount) {
+                        maxCalleeCount = calleeCount;
+                        hubNode = funcName;
+                    }
+                }
+
+                if (!hubNode) {
+                    console.log('[Explorer] No hub node found, recentering view');
+                    this.centerCamera();
+                    return;
+                }
+
+                // Get the node and focus on it
+                const node = this.nodes.get(hubNode);
+                if (node) {
+                    this.selectNode(node);
+                    this.focusOnNode(node);
+                    console.log('[Explorer] Focused on hub node:', hubNode, 'with', maxCalleeCount, 'transitive callees');
+                } else {
+                    this.centerCamera();
+                }
             }
 
             /**
@@ -2960,10 +3045,12 @@
                 const edgesMaterial = new THREE.LineBasicMaterial({
                     color: containerColor,
                     transparent: true,
-                    opacity: 0.5
+                    opacity: 0.5,
+                    depthTest: true,
+                    depthWrite: false
                 });
                 const wireframe = new THREE.LineSegments(edgesGeometry, edgesMaterial);
-                wireframe.frustumCulled = false;
+                wireframe.renderOrder = -1;
                 container.add(wireframe);
 
                 // Add label above the container
@@ -3144,10 +3231,10 @@
                 return positions;
             }
 
-            createNode(name, info, position, isAlive, isDead, hasBranches, deadType = null) {
+            createNode(name, info, position, isAlive, isDead, hasPartialCoverage, deadType = null, hasDeadIncomingPaths = false) {
                 // Determine color based on status
-                // Partially covered = alive + has branches (some branches may not have been taken)
-                const isPartial = isAlive && hasBranches;
+                // Partially covered = alive + (has branches OR has dead incoming paths)
+                const isPartial = isAlive && hasPartialCoverage;
 
                 let color;
                 let colorName;
@@ -3177,6 +3264,8 @@
                 }
 
                 // Create geometry (box for regular, octahedron for branch points)
+                // Shape based on actual branches in the function, not partial coverage
+                const hasBranches = (info.branches || []).length > 0;
                 let geometry;
                 if (hasBranches) {
                     geometry = new THREE.OctahedronGeometry(0.8);
@@ -3186,14 +3275,15 @@
 
                 const material = new THREE.MeshLambertMaterial({
                     color: color,
-                    transparent: true,
-                    opacity: isDead ? 0.7 : 1.0
+                    transparent: isDead,  // Only transparent if dead (for opacity < 1)
+                    opacity: isDead ? 0.7 : 1.0,
+                    depthTest: true,
+                    depthWrite: !isDead  // Write depth for solid nodes
                 });
 
                 const mesh = new THREE.Mesh(geometry, material);
                 mesh.position.set(position.x, position.y, position.z);
-                mesh.frustumCulled = false;  // Prevent disappearing at certain angles
-                mesh.renderOrder = 1;  // Render nodes after containers
+                mesh.renderOrder = isDead ? 1 : 2;  // Solid nodes render later
 
                 // Add text label
                 const canvas = document.createElement('canvas');
@@ -3230,6 +3320,25 @@
                 sprite.frustumCulled = false;  // Prevent label disappearing
                 mesh.add(sprite);
 
+                // Add orange ring if node has dead incoming paths (some callers are dead)
+                if (hasDeadIncomingPaths && isAlive) {
+                    const ringGeometry = new THREE.TorusGeometry(1.2, 0.06, 6, 16);  // Reduced segments for perf
+                    const ringMaterial = new THREE.MeshBasicMaterial({
+                        color: 0xf97316,  // Orange
+                        transparent: true,
+                        opacity: 0.9,
+                        depthTest: true,
+                        depthWrite: true
+                    });
+                    const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+                    ring.rotation.x = Math.PI / 2;  // Lay flat around the node
+                    ring.renderOrder = 3;  // Render after nodes
+                    mesh.add(ring);
+                }
+
+                // Set node render order (after edges)
+                mesh.renderOrder = 2;
+
                 return mesh;
             }
 
@@ -3254,11 +3363,17 @@
                 const material = new THREE.LineBasicMaterial({
                     color: edgeColor,
                     transparent: true,
-                    opacity: edgeColor === 0x4a4a6a ? 0.6 : 0.8  // More visible for colored edges
+                    opacity: edgeColor === 0x4a4a6a ? 0.6 : 0.8,  // More visible for colored edges
+                    depthTest: true,
+                    depthWrite: false,  // Edges behind nodes
+                    polygonOffset: true,
+                    polygonOffsetFactor: 1,
+                    polygonOffsetUnits: 1
                 });
 
                 const line = new THREE.Line(geometry, material);
-                line.frustumCulled = false;  // Prevent edge disappearing
+                line.renderOrder = 0;  // Render edges first (behind nodes)
+                line.frustumCulled = false;  // Keep disabled to prevent disappearing
 
                 // Store caller/callee info for proper highlighting
                 line.userData = {
@@ -3293,16 +3408,18 @@
             }
 
             createArrowHead(position, rotation, color, size = 0.2) {
-                const geometry = new THREE.ConeGeometry(size, size * 1.5, 3);
+                const geometry = new THREE.ConeGeometry(size, size * 1.5, 3);  // Already minimal (3 sides = triangle)
                 const material = new THREE.MeshBasicMaterial({
                     color: color,
                     transparent: true,
-                    opacity: 0.8
+                    opacity: 0.8,
+                    depthTest: true,
+                    depthWrite: false
                 });
                 const cone = new THREE.Mesh(geometry, material);
                 cone.position.copy(position);
                 cone.rotation.x = rotation;
-                cone.frustumCulled = false;
+                cone.renderOrder = 1;  // Between edges (0) and nodes (2)
                 return cone;
             }
 
@@ -3320,17 +3437,17 @@
                 const geometry = new THREE.OctahedronGeometry(0.3);
                 geometry.scale(1, 0.5, 1);
 
-                const material = new THREE.MeshLambertMaterial({
+                const material = new THREE.MeshBasicMaterial({  // BasicMaterial for performance
                     color: 0xfbbf24,  // Amber for branch point warning
                     transparent: true,
                     opacity: 0.9,
-                    emissive: 0xfbbf24,
-                    emissiveIntensity: 0.3
+                    depthTest: true,
+                    depthWrite: false
                 });
 
                 const mesh = new THREE.Mesh(geometry, material);
                 mesh.position.copy(position);
-                mesh.frustumCulled = false;  // Prevent marker disappearing
+                mesh.renderOrder = 1;  // Between edges and nodes
 
                 // Store reference to connected nodes for tooltip
                 mesh.userData = {
@@ -3616,6 +3733,8 @@
                     const containerIntersects = this.raycaster.intersectObjects(this.classContainers);
                     if (containerIntersects.length > 0) {
                         const container = containerIntersects[0].object;
+                        // Clear any node selection first
+                        this.deselectNode();
                         // Center camera on class container
                         this.focusOnNode(container);
                         // Show class info in details panel
@@ -3872,9 +3991,10 @@
                     html += '</div>';
                 }
 
-                // Basic info - determine status (partial = alive + has branches)
+                // Basic info - determine status (partial = alive + has branches OR dead incoming paths)
                 const hasBranches = data.info && (data.info.branches || []).length > 0;
-                const isPartial = data.isAlive && hasBranches;
+                const hasDeadIncomingPaths = data.hasDeadIncomingPaths || false;
+                const isPartial = data.isAlive && (hasBranches || hasDeadIncomingPaths);
                 let statusText, statusColor;
                 if (data.isDead) {
                     // Different status for orphaned vs dead branch
@@ -4328,6 +4448,9 @@
              * @param {boolean} highlight - true to highlight, false to reset
              */
             highlightPath(upstreamNodes, downstreamNodes, selectedName, highlight) {
+                console.log('[highlightPath] highlight:', highlight, 'selected:', selectedName,
+                    'upstream:', upstreamNodes.size, 'downstream:', downstreamNodes.size);
+
                 const upstreamColor = 0xfbbf24;  // Amber for callers
                 const downstreamColor = 0x60a5fa;  // Blue for callees
                 const selectedColor = 0x22d3ee;  // Cyan for selected
@@ -4335,14 +4458,18 @@
                 const highlightOpacity = 1.0;
 
                 // Update node appearances
+                let logCount = 0;
                 this.nodes.forEach((node, name) => {
                     const material = node.material;
-                    const originalColor = node.userData.originalColor || material.color.getHex();
+                    const currentColorHex = material.color.getHex();
 
                     // Store original color if not already stored
                     if (!node.userData.originalColor) {
-                        node.userData.originalColor = material.color.getHex();
+                        node.userData.originalColor = currentColorHex;
                         node.userData.originalOpacity = material.opacity;
+                        if (logCount < 3) {
+                            console.log('[highlightPath] Storing originalColor for', name, ':', currentColorHex.toString(16));
+                        }
                     }
 
                     if (highlight) {
@@ -4350,26 +4477,37 @@
                             material.color.setHex(selectedColor);
                             material.opacity = highlightOpacity;
                             material.emissive.setHex(0x115555);
+                            material.transparent = true;  // Enable transparency for highlight effect
                         } else if (upstreamNodes.has(name)) {
                             material.color.setHex(upstreamColor);
                             material.opacity = highlightOpacity;
                             material.emissive.setHex(0x332200);
+                            material.transparent = true;
                         } else if (downstreamNodes.has(name)) {
                             material.color.setHex(downstreamColor);
                             material.opacity = highlightOpacity;
                             material.emissive.setHex(0x112233);
+                            material.transparent = true;
                         } else {
-                            // Dim other nodes
+                            // Dim other nodes - need to restore their original COLOR first
+                            material.color.setHex(node.userData.originalColor);
                             material.opacity = defaultNodeOpacity;
                             material.emissive.setHex(0x000000);
+                            material.transparent = true;  // Enable transparency for dimming
                         }
                     } else {
                         // Restore original appearance
+                        if (logCount < 3) {
+                            console.log('[highlightPath] Restoring', name, 'from', currentColorHex.toString(16), 'to', node.userData.originalColor?.toString(16));
+                        }
                         material.color.setHex(node.userData.originalColor);
                         material.opacity = node.userData.originalOpacity || 1.0;
                         material.emissive.setHex(0x000000);
+                        // Restore original transparency state
+                        material.transparent = (node.userData.originalOpacity || 1.0) < 1.0;
                     }
                     material.needsUpdate = true;
+                    logCount++;
                 });
 
                 // Update edge appearances - use stored caller/callee in userData
@@ -4456,9 +4594,13 @@
              * Clear all path highlighting
              */
             clearPathHighlight() {
+                console.log('[clearPathHighlight] currentHighlight:', this.currentHighlight ? this.currentHighlight.selected : 'null');
                 if (this.currentHighlight) {
+                    console.log('[clearPathHighlight] Restoring', this.nodes.size, 'nodes to original colors');
                     this.highlightPath(new Set(), new Set(), '', false);
                     this.currentHighlight = null;
+                } else {
+                    console.log('[clearPathHighlight] No currentHighlight, skipping restore');
                 }
             }
 
@@ -4608,14 +4750,95 @@
                 const isAlive = data.isAlive || false;
                 const isDead = data.isDead || false;
                 const callCount = data.info?.call_count || 0;
-                const whyNotCovered = data.whyNotCovered?.root_cause || '';
+                const whyNotCovered = data.whyNotCovered || {};
+                const rootCause = whyNotCovered.root_cause || '';
+                const rootCauseDetail = whyNotCovered.root_cause_detail || {};
+                const chain = whyNotCovered.chain || [];
+                const hasDeadIncomingPaths = data.hasDeadIncomingPaths || false;
+
+                // Find which callers are dead vs alive (for partial coverage explanation)
+                const deadCallers = [];
+                const aliveCallers = [];
+                if (isAlive && hasDeadIncomingPaths) {
+                    const allCallers = this.findAllParents(funcName);
+                    const coveredFunctions = new Set(this.data?.covered_functions || []);
+                    allCallers.forEach(caller => {
+                        if (coveredFunctions.has(caller)) {
+                            aliveCallers.push(caller);
+                        } else {
+                            deadCallers.push(caller);
+                        }
+                    });
+                }
+
+                // Get upstream path (all callers) and downstream path (all callees)
+                const upstreamPath = this.findUpstreamPath(funcName, new Set());
+                const downstreamPath = this.findDownstreamPath(funcName, new Set());
+
+                // Get direct callers and callees
+                const directCallers = this.findAllParents(funcName);
+                const directCallees = this.findAllChildren(funcName);
+
+                // TWO TYPES OF SOURCE INFO:
+                // 1. chainFiles: Full source for root cause + direct callers (key decision points)
+                // 2. chainDefs: Just function defs for entire chain (to trace the call path)
+
+                // 1. Full source files for root cause and direct callers
+                const chainFiles = [];
+                const addedFunctions = new Set();
+
+                // Add root cause caller (where the branch decision happens) - MOST IMPORTANT
+                if (rootCauseDetail.caller) {
+                    const callerNode = this.nodes.get(rootCauseDetail.caller);
+                    if (callerNode?.userData?.info?.file) {
+                        chainFiles.push({
+                            function: rootCauseDetail.caller,
+                            file: callerNode.userData.info.file,
+                            line: callerNode.userData.info.line || 0,
+                            isRootCause: true
+                        });
+                        addedFunctions.add(rootCauseDetail.caller);
+                    }
+                }
+
+                // Add direct callers (immediate parents of target)
+                directCallers.forEach(callerName => {
+                    if (addedFunctions.has(callerName)) return;
+                    const callerNode = this.nodes.get(callerName);
+                    if (callerNode?.userData?.info?.file) {
+                        chainFiles.push({
+                            function: callerName,
+                            file: callerNode.userData.info.file,
+                            line: callerNode.userData.info.line || 0,
+                            isRootCause: false
+                        });
+                        addedFunctions.add(callerName);
+                    }
+                });
+
+                // 2. Function definitions for ENTIRE call chain (just defs to trace path)
+                const chainDefs = [];
+                chain.forEach((chainFunc, index) => {
+                    const chainNode = this.nodes.get(chainFunc);
+                    if (chainNode?.userData?.info?.file) {
+                        chainDefs.push({
+                            function: chainFunc,
+                            file: chainNode.userData.info.file,
+                            line: chainNode.userData.info.line || 0,
+                            chainIndex: index
+                        });
+                    }
+                });
 
                 console.log('[Explorer] Requesting AI explanation for:', funcName);
+                console.log('[Explorer] Root cause:', rootCause, 'Detail:', rootCauseDetail);
+                console.log('[Explorer] Chain files collected:', chainFiles.length, chainFiles);
+                console.log('[Explorer] Upstream:', upstreamPath.length, 'Downstream:', downstreamPath.length);
 
                 // Build context for the AI
                 const context = `Status: ${isAlive ? 'Executed' : 'Not executed'}
 Call count: ${callCount}
-${isDead && whyNotCovered ? 'Why not covered: ' + whyNotCovered : ''}`;
+${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
 
                 // Call back to Kotlin via cefQuery (injected by JCEF) if in IDE mode
                 if (typeof window.cefQuery === 'function') {
@@ -4628,7 +4851,21 @@ ${isDead && whyNotCovered ? 'Why not covered: ' + whyNotCovered : ''}`;
                             isAlive: isAlive,
                             isDead: isDead,
                             callCount: callCount,
-                            whyNotCovered: whyNotCovered
+                            whyNotCovered: rootCause,
+                            // Enhanced context for better AI analysis
+                            rootCauseDetail: rootCauseDetail,
+                            callChain: chain,
+                            upstreamPath: upstreamPath,
+                            downstreamPath: downstreamPath,
+                            directCallers: directCallers,
+                            directCallees: directCallees,
+                            chainFiles: chainFiles,
+                            // Function defs for entire chain (to trace call path)
+                            chainDefs: chainDefs,
+                            // Partial incoming coverage info
+                            hasDeadIncomingPaths: hasDeadIncomingPaths,
+                            deadCallers: deadCallers,
+                            aliveCallers: aliveCallers
                         }),
                         onSuccess: function(response) {
                             console.log('[Explorer] AI explanation request sent');

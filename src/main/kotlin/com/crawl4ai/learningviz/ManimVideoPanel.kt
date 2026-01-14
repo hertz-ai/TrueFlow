@@ -843,8 +843,28 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     val callCount = json.get("callCount")?.asInt ?: 0
                     val whyNotCovered = json.get("whyNotCovered")?.asString
 
+                    // Enhanced context from call graph analysis
+                    val rootCauseDetail = json.getAsJsonObject("rootCauseDetail")
+                    val callChain = json.getAsJsonArray("callChain")?.map { it.asString } ?: emptyList()
+                    val upstreamPath = json.getAsJsonArray("upstreamPath")?.map { it.asString } ?: emptyList()
+                    val downstreamPath = json.getAsJsonArray("downstreamPath")?.map { it.asString } ?: emptyList()
+                    val directCallers = json.getAsJsonArray("directCallers")?.map { it.asString } ?: emptyList()
+                    val directCallees = json.getAsJsonArray("directCallees")?.map { it.asString } ?: emptyList()
+                    val chainFiles = json.getAsJsonArray("chainFiles")
+                    val chainDefs = json.getAsJsonArray("chainDefs")
+
+                    // Partial incoming coverage info
+                    val hasDeadIncomingPaths = json.get("hasDeadIncomingPaths")?.asBoolean ?: false
+                    val deadCallers = json.getAsJsonArray("deadCallers")?.map { it.asString } ?: emptyList()
+                    val aliveCallers = json.getAsJsonArray("aliveCallers")?.map { it.asString } ?: emptyList()
+
                     if (funcName != null) {
-                        handleExplainRequest(funcName, funcFile, funcLine, isAlive, isDead, callCount, whyNotCovered)
+                        handleExplainRequest(
+                            funcName, funcFile, funcLine, isAlive, isDead, callCount, whyNotCovered,
+                            rootCauseDetail, callChain, upstreamPath, downstreamPath,
+                            directCallers, directCallees, chainFiles, chainDefs,
+                            hasDeadIncomingPaths, deadCallers, aliveCallers
+                        )
                     }
                 }
             }
@@ -864,7 +884,18 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         isAlive: Boolean,
         isDead: Boolean,
         callCount: Int,
-        whyNotCovered: String?
+        whyNotCovered: String?,
+        rootCauseDetail: com.google.gson.JsonObject?,
+        callChain: List<String>,
+        upstreamPath: List<String>,
+        downstreamPath: List<String>,
+        directCallers: List<String>,
+        directCallees: List<String>,
+        chainFiles: com.google.gson.JsonArray?,
+        chainDefs: com.google.gson.JsonArray?,
+        hasDeadIncomingPaths: Boolean,
+        deadCallers: List<String>,
+        aliveCallers: List<String>
     ) {
         ApplicationManager.getApplication().invokeLater {
             // Check if LLM server is running by looking for AIExplanationPanel
@@ -879,8 +910,13 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                 // Show prompt in Interactive Explorer to start server
                 showLLMNotRunningMessage()
             } else {
-                // Server is running, request explanation
-                requestAIExplanation(funcName, funcFile, funcLine, isAlive, isDead, callCount, whyNotCovered, aiPanel!!)
+                // Server is running, request explanation with enhanced context
+                requestAIExplanation(
+                    funcName, funcFile, funcLine, isAlive, isDead, callCount, whyNotCovered,
+                    rootCauseDetail, callChain, upstreamPath, downstreamPath,
+                    directCallers, directCallees, chainFiles, chainDefs,
+                    hasDeadIncomingPaths, deadCallers, aliveCallers, aiPanel!!
+                )
             }
         }
     }
@@ -927,7 +963,7 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     }
 
     /**
-     * Request AI explanation for a function.
+     * Request AI explanation for a function with full call graph context.
      */
     private fun requestAIExplanation(
         funcName: String,
@@ -937,6 +973,17 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         isDead: Boolean,
         callCount: Int,
         whyNotCovered: String?,
+        rootCauseDetail: com.google.gson.JsonObject?,
+        callChain: List<String>,
+        upstreamPath: List<String>,
+        downstreamPath: List<String>,
+        directCallers: List<String>,
+        directCallees: List<String>,
+        chainFiles: com.google.gson.JsonArray?,
+        chainDefs: com.google.gson.JsonArray?,
+        hasDeadIncomingPaths: Boolean,
+        deadCallers: List<String>,
+        aliveCallers: List<String>,
         aiPanel: AIExplanationPanel
     ) {
         // Show loading state
@@ -953,7 +1000,12 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             "", 0
         )
 
-        // Build context for the explanation
+        // Extract root cause details
+        val branchCaller = rootCauseDetail?.get("caller")?.asString
+        val branchCondition = rootCauseDetail?.get("branch_condition")?.asString
+        val branchLine = rootCauseDetail?.get("branch_line")?.asString
+
+        // Build enhanced context for the explanation
         val context = buildString {
             append("Function: $funcName\n")
             if (funcFile != null) append("File: $funcFile\n")
@@ -961,7 +1013,35 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             append("Status: ${if (isAlive) "Executed" else "Not Executed"}\n")
             if (callCount > 0) append("Call count: $callCount\n")
             if (isDead && whyNotCovered != null) {
-                append("Why not covered: $whyNotCovered\n")
+                append("\n=== WHY NOT COVERED ===\n")
+                append("Root cause: $whyNotCovered\n")
+                if (branchCaller != null) {
+                    append("Branch decision in: $branchCaller\n")
+                    if (branchCondition != null) append("Condition: $branchCondition\n")
+                    if (branchLine != null) append("At line: $branchLine\n")
+                }
+                if (callChain.isNotEmpty()) {
+                    append("Call chain: ${callChain.joinToString(" → ")}\n")
+                }
+            }
+            append("\n=== CALL GRAPH CONTEXT ===\n")
+            if (directCallers.isNotEmpty()) {
+                append("Direct callers (${directCallers.size}): ${directCallers.take(5).joinToString(", ")}${if (directCallers.size > 5) "..." else ""}\n")
+            } else {
+                append("Direct callers: NONE (orphaned)\n")
+            }
+            if (directCallees.isNotEmpty()) {
+                append("Direct callees (${directCallees.size}): ${directCallees.take(5).joinToString(", ")}${if (directCallees.size > 5) "..." else ""}\n")
+            }
+            append("Total upstream (transitive callers): ${upstreamPath.size}\n")
+            append("Total downstream (transitive callees): ${downstreamPath.size}\n")
+
+            // Partial incoming coverage info
+            if (hasDeadIncomingPaths && isAlive) {
+                append("\n=== PARTIAL INCOMING COVERAGE ===\n")
+                append("This function is ALIVE but has DEAD CALLERS (paths not exercised).\n")
+                append("Alive callers (${aliveCallers.size}): ${aliveCallers.take(3).joinToString(", ")}${if (aliveCallers.size > 3) "..." else ""}\n")
+                append("Dead callers (${deadCallers.size}): ${deadCallers.take(3).joinToString(", ")}${if (deadCallers.size > 3) "..." else ""}\n")
             }
         }
 
@@ -975,21 +1055,166 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                         if (file.exists()) {
                             val lines = file.readLines()
                             val startLine = maxOf(0, funcLine - 1)
-                            val endLine = minOf(lines.size, funcLine + 20)
+                            val endLine = minOf(lines.size, funcLine + 30)  // Read more lines
                             lines.subList(startLine, endLine).joinToString("\n")
                         } else ""
                     } catch (e: Exception) { "" }
                 } else ""
 
-                val prompt = buildString {
-                    append("Explain this function's purpose and behavior:\n\n")
-                    append("Context:\n$context\n")
-                    if (sourceCode.isNotEmpty()) {
-                        append("\nSource code:\n```\n$sourceCode\n```\n")
+                // Read source code for ALL callers in the chain (especially the root cause)
+                val callersSourceCode = buildString {
+                    if (chainFiles != null && chainFiles.size() > 0) {
+                        // Read source code for each caller in the chain
+                        for (i in 0 until minOf(chainFiles.size(), 3)) {  // Limit to 3 callers to avoid too much context
+                            try {
+                                val callerObj = chainFiles[i].asJsonObject
+                                val callerFunc = callerObj.get("function")?.asString ?: "Unknown"
+                                val callerFile = callerObj.get("file")?.asString
+                                val callerLine = callerObj.get("line")?.asInt ?: 0
+                                val isRootCause = callerObj.get("isRootCause")?.asBoolean ?: false
+
+                                if (callerFile != null) {
+                                    val file = java.io.File(callerFile)
+                                    if (file.exists()) {
+                                        val lines = file.readLines()
+                                        val startLine = maxOf(0, callerLine - 5)
+                                        val endLine = minOf(lines.size, callerLine + 40)  // Read more lines for context
+
+                                        val marker = if (isRootCause) "ROOT CAUSE CALLER" else "CALLER"
+                                        append("\n// === $marker: $callerFunc ===\n")
+                                        append("// File: $callerFile (line $callerLine)\n")
+                                        append(lines.subList(startLine, endLine).mapIndexed { idx, line ->
+                                            val lineNum = startLine + idx + 1
+                                            val marker = if (lineNum == callerLine) ">>>" else "   "
+                                            "$marker $lineNum: $line"
+                                        }.joinToString("\n"))
+                                        append("\n")
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                PluginLogger.warn("Failed to read caller source: ${e.message}")
+                            }
+                        }
                     }
-                    append("\nProvide a concise explanation of what this function does.")
+                }
+
+                // Keep backwards compatibility - extract just the root cause caller source for simple cases
+                val callerSourceCode = callersSourceCode
+
+                // Read function DEFINITIONS only for entire call chain (to trace the path)
+                val chainDefsCode = buildString {
+                    if (chainDefs != null && chainDefs.size() > 0) {
+                        append("\n// === CALL CHAIN (function definitions to trace the path) ===\n")
+                        for (i in 0 until chainDefs.size()) {
+                            try {
+                                val defObj = chainDefs[i].asJsonObject
+                                val defFunc = defObj.get("function")?.asString ?: "Unknown"
+                                val defFile = defObj.get("file")?.asString
+                                val defLine = defObj.get("line")?.asInt ?: 0
+                                val chainIndex = defObj.get("chainIndex")?.asInt ?: i
+
+                                if (defFile != null) {
+                                    val file = java.io.File(defFile)
+                                    if (file.exists()) {
+                                        val lines = file.readLines()
+                                        val startLine = maxOf(0, defLine - 1)
+                                        val endLine = minOf(lines.size, defLine + 12)  // Just ~12 lines for def
+
+                                        append("\n// [$chainIndex] $defFunc\n")
+                                        append("// File: $defFile:$defLine\n")
+                                        append(lines.subList(startLine, endLine).mapIndexed { idx, line ->
+                                            val lineNum = startLine + idx + 1
+                                            "$lineNum: $line"
+                                        }.joinToString("\n"))
+                                        append("\n")
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                PluginLogger.warn("Failed to read chain def: ${e.message}")
+                            }
+                        }
+                    }
+                }
+
+                val prompt = buildString {
                     if (isDead) {
-                        append(" Also explain why it might not be executed and suggest how to test it.")
+                        // For dead/uncovered code, focus on WHY it's not covered with full context
+                        append("Analyze why this function is NOT being executed. You have full call graph context.\n\n")
+                        append("=== ANALYSIS CONTEXT ===\n$context\n")
+
+                        if (sourceCode.isNotEmpty()) {
+                            append("\n=== TARGET FUNCTION SOURCE ===\n```python\n$sourceCode\n```\n")
+                        }
+
+                        if (callerSourceCode.isNotEmpty()) {
+                            append("\n=== CALLER SOURCE (where branch decision happens) ===\n```python\n$callerSourceCode\n```\n")
+                        }
+
+                        if (chainDefsCode.isNotEmpty()) {
+                            append("\n=== CALL CHAIN TRACE ===\n```python\n$chainDefsCode\n```\n")
+                        }
+
+                        append("\n=== YOUR ANALYSIS TASK ===\n")
+                        when (whyNotCovered) {
+                            "NO_CALL_SITES" -> {
+                                append("This function has NO CALL SITES - nothing in the codebase calls it.\n\n")
+                                append("Analyze:\n")
+                                append("1. Based on the function name and code, what is its intended purpose?\n")
+                                append("2. Is this likely:\n")
+                                append("   - Dead code that should be deleted?\n")
+                                append("   - A planned feature not yet integrated?\n")
+                                append("   - A utility awaiting usage?\n")
+                                append("   - An entry point for external triggers (API, CLI, tests)?\n")
+                                append("3. If it should be called, where in the codebase would be appropriate?\n")
+                            }
+                            "UNREACHABLE_FROM_ENTRY" -> {
+                                append("This function exists in an ORPHANED CALL CHAIN - the entire chain has no entry point.\n\n")
+                                append("Call chain: ${callChain.joinToString(" → ")}\n\n")
+                                append("Analyze:\n")
+                                append("1. What entry point (main, API route, CLI command) is missing?\n")
+                                append("2. Is this an abandoned feature or incomplete integration?\n")
+                                append("3. How could this chain be connected to the application's execution flow?\n")
+                            }
+                            "BRANCH_NOT_TAKEN" -> {
+                                append("This function is DEAD due to a BRANCH NOT TAKEN.\n\n")
+                                append("The caller '$branchCaller' was executed but did NOT call this function.\n")
+                                if (branchCondition != null) {
+                                    append("Branch condition: $branchCondition\n")
+                                }
+                                append("\nAnalyze the CALLER source code above and explain:\n")
+                                append("1. What specific condition prevented this function from being called?\n")
+                                append("2. What input/state would make the condition evaluate to call this function?\n")
+                                append("3. Suggest a specific test case or scenario that would execute this path.\n")
+                            }
+                            else -> {
+                                append("Analyze why this function is not being executed and what would trigger it.\n")
+                            }
+                        }
+                        append("\nBe SPECIFIC and ACTIONABLE. Reference actual code from the context provided.")
+                    } else if (hasDeadIncomingPaths) {
+                        // For alive code with dead incoming paths - partial coverage
+                        append("Analyze this function's PARTIAL INCOMING COVERAGE.\n\n")
+                        append("This function IS executed, but some callers in the code are NOT being executed.\n\n")
+                        append("=== ANALYSIS CONTEXT ===\n$context\n")
+                        if (sourceCode.isNotEmpty()) {
+                            append("\n=== TARGET FUNCTION SOURCE ===\n```python\n$sourceCode\n```\n")
+                        }
+                        append("\n=== YOUR ANALYSIS TASK ===\n")
+                        append("Dead callers: ${deadCallers.joinToString(", ")}\n")
+                        append("Alive callers: ${aliveCallers.joinToString(", ")}\n\n")
+                        append("Analyze:\n")
+                        append("1. Why are the dead callers not being executed?\n")
+                        append("2. What test scenarios would exercise the paths through the dead callers?\n")
+                        append("3. Is the dead caller path important for coverage, or is it redundant?\n")
+                        append("\nBe SPECIFIC about what conditions would trigger the untested paths.")
+                    } else {
+                        // For alive/covered code, explain what it does
+                        append("Explain this function's purpose and behavior:\n\n")
+                        append("Context:\n$context\n")
+                        if (sourceCode.isNotEmpty()) {
+                            append("\nSource code:\n```python\n$sourceCode\n```\n")
+                        }
+                        append("\nProvide a concise explanation of what this function does and its role in the call graph.")
                     }
                 }
 

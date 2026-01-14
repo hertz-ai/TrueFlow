@@ -520,7 +520,7 @@ Keep the explanation focused and under 200 words."""
         if (!statusEl) {
             statusEl = document.createElement('div');
             statusEl.id = 'trueflow-connection-status';
-            statusEl.style.cssText = 'position:fixed;bottom:10px;right:10px;padding:8px 16px;border-radius:4px;font-size:12px;z-index:10000;transition:opacity 0.3s;';
+            statusEl.style.cssText = 'position:fixed;bottom:80px;right:10px;padding:8px 16px;border-radius:4px;font-size:12px;z-index:10000;transition:opacity 0.3s;';
             document.body.appendChild(statusEl);
         }
 
