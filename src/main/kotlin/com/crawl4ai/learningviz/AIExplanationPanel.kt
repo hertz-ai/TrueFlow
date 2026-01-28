@@ -203,6 +203,9 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private var callTraceData: JsonObject? = null
     private var currentDiagramData: String? = null
 
+    // Reference to parent tool window for RPC data access
+    private var toolWindow: EnhancedLearningFlowToolWindow? = null
+
     // Hub client for real-time cross-IDE coordination
     private val hubClient = HubClient.getInstance()
 
@@ -898,6 +901,136 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                     }
                     responseData.addProperty("status", "stopped")
                     hubClient.sendRpcResponse(requestId, responseData)
+                }
+
+                // === New RPC handlers delegating to tool window ===
+
+                "get_call_tree" -> {
+                    val rootFunction = args.get("root_function")?.asString
+                    val maxDepth = args.get("max_depth")?.asInt ?: 5
+                    val data = toolWindow?.getRpcCallTree(rootFunction, maxDepth)
+                    if (data != null) {
+                        hubClient.sendRpcResponse(requestId, data)
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
+                }
+
+                "get_callers" -> {
+                    val functionName = args.get("function_name")?.asString ?: ""
+                    val maxDepth = args.get("max_depth")?.asInt ?: 3
+                    val data = toolWindow?.getRpcCallers(functionName, maxDepth)
+                    if (data != null) {
+                        hubClient.sendRpcResponse(requestId, data)
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
+                }
+
+                "get_callees" -> {
+                    val functionName = args.get("function_name")?.asString ?: ""
+                    val maxDepth = args.get("max_depth")?.asInt ?: 3
+                    val data = toolWindow?.getRpcCallees(functionName, maxDepth)
+                    if (data != null) {
+                        hubClient.sendRpcResponse(requestId, data)
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
+                }
+
+                "search_functions" -> {
+                    val query = args.get("query")?.asString ?: ""
+                    val data = toolWindow?.getRpcSearchFunctions(query)
+                    if (data != null) {
+                        hubClient.sendRpcResponse(requestId, data)
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
+                }
+
+                "get_call_chain" -> {
+                    val functionName = args.get("function_name")?.asString ?: ""
+                    val data = toolWindow?.getRpcCallChain(functionName)
+                    if (data != null) {
+                        hubClient.sendRpcResponse(requestId, data)
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
+                }
+
+                "get_coverage_summary" -> {
+                    val data = toolWindow?.getRpcCoverageSummary()
+                    if (data != null) {
+                        hubClient.sendRpcResponse(requestId, data)
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
+                }
+
+                "find_path" -> {
+                    val source = args.get("source")?.asString ?: ""
+                    val target = args.get("target")?.asString ?: ""
+                    val data = toolWindow?.getRpcFindPath(source, target)
+                    if (data != null) {
+                        hubClient.sendRpcResponse(requestId, data)
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
+                }
+
+                "explain_function" -> {
+                    val functionName = args.get("function_name")?.asString ?: ""
+                    // Get call chain data first
+                    val chainData = toolWindow?.getRpcCallChain(functionName)
+                    if (chainData != null) {
+                        // Use AI to explain
+                        val context = buildString {
+                            appendLine("Function: ${chainData.get("function")?.asString}")
+                            appendLine("Upstream callers: ${chainData.getAsJsonArray("upstream")?.size() ?: 0}")
+                            appendLine("Downstream callees: ${chainData.getAsJsonArray("downstream")?.size() ?: 0}")
+                        }
+                        responseData.addProperty("function", functionName)
+                        responseData.add("call_chain", chainData)
+                        responseData.addProperty("context", context)
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    } else {
+                        responseData.addProperty("error", "Function not found or tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
+                }
+
+                "export_flamegraph" -> {
+                    val data = toolWindow?.getRpcFlamegraphData()
+                    if (data != null) {
+                        hubClient.sendRpcResponse(requestId, data)
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
+                }
+
+                "generate_manim" -> {
+                    // Trigger manim generation asynchronously
+                    responseData.addProperty("status", "triggered")
+                    responseData.addProperty("note", "Manim generation is async, check list_videos for results")
+                    hubClient.sendRpcResponse(requestId, responseData)
+                }
+
+                "list_videos" -> {
+                    val data = toolWindow?.getRpcManimVideos()
+                    if (data != null) {
+                        hubClient.sendRpcResponse(requestId, data)
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                        hubClient.sendRpcResponse(requestId, responseData)
+                    }
                 }
 
                 else -> {
@@ -2343,6 +2476,13 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
      */
     fun setDiagramData(diagram: String) {
         currentDiagramData = diagram
+    }
+
+    /**
+     * Set reference to parent tool window for RPC data access.
+     */
+    fun setToolWindow(window: EnhancedLearningFlowToolWindow) {
+        toolWindow = window
     }
 
     /**

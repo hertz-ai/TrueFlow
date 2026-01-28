@@ -18,8 +18,11 @@ Configuration (environment variables):
     TRUEFLOW_PROJECT_DIR - Project directory to trace (default: current dir)
     TRUEFLOW_TRACE_PORT - Socket port for trace server (default: 5678)
     TRUEFLOW_API_PORT - Port for AI server (default: 8080)
+
+Compatible with MCP SDK 1.x (list_tools/call_tool API)
 """
 
+import ast
 import asyncio
 import json
 import logging
@@ -31,13 +34,13 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 # MCP SDK imports
 try:
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-    from mcp.types import Tool, TextContent, Resource, ResourceTemplate
+    from mcp.types import Tool, TextContent
 except ImportError:
     print("MCP SDK not installed. Install with: pip install mcp", file=sys.stderr)
     sys.exit(1)
@@ -53,7 +56,7 @@ server = Server("trueflow")
 @dataclass
 class TrueFlowState:
     """Global state for TrueFlow MCP server."""
-    project_dir: Path = field(default_factory=lambda: Path.cwd())
+    project_dir: Path = field(default_factory=lambda: Path(os.environ.get("TRUEFLOW_PROJECT_DIR", str(Path.cwd()))))
     trace_socket: Optional[socket.socket] = None
     trace_connected: bool = False
     trace_events: list = field(default_factory=list)
@@ -62,13 +65,11 @@ class TrueFlowState:
     performance_data: dict = field(default_factory=dict)
     dead_code_data: dict = field(default_factory=dict)
     call_trace_data: list = field(default_factory=list)
-    # Call graph structures (matching Interactive Explorer)
-    call_graph: dict = field(default_factory=dict)  # caller -> [callees]
-    reverse_call_graph: dict = field(default_factory=dict)  # callee -> [callers]
-    covered_functions: set = field(default_factory=set)  # Functions that have been executed
-    function_info: dict = field(default_factory=dict)  # func_name -> {file, line, module}
-    # Stack tracking for building call graph
-    _call_stack: list = field(default_factory=list)  # Stack of (call_id, func_name)
+    call_graph: dict = field(default_factory=dict)
+    reverse_call_graph: dict = field(default_factory=dict)
+    covered_functions: set = field(default_factory=set)
+    function_info: dict = field(default_factory=dict)
+    _call_stack: list = field(default_factory=list)
 
 
 # Global state
@@ -76,58 +77,399 @@ state = TrueFlowState()
 
 
 # ============================================================================
-# TRACE COLLECTION TOOLS
+# TOOL DEFINITIONS (MCP SDK 1.x compatible)
 # ============================================================================
 
-@server.tool()
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    """List all available tools."""
+    return [
+        # Trace Collection Tools
+        Tool(
+            name="trace_connect",
+            description="Connect to a running TrueFlow trace server on port 5678. Returns connection status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Trace server host", "default": "127.0.0.1"},
+                    "port": {"type": "integer", "description": "Trace server port", "default": 5678}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="trace_disconnect",
+            description="Disconnect from the trace server.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        Tool(
+            name="trace_status",
+            description="Get current trace collection status including event count and connection state.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        Tool(
+            name="trace_get_events",
+            description="Get collected trace events with optional filtering.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max events to return", "default": 100},
+                    "filter_module": {"type": "string", "description": "Filter by module name"},
+                    "filter_function": {"type": "string", "description": "Filter by function name"}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="trace_clear",
+            description="Clear all collected trace events.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        # Analysis Tools
+        Tool(
+            name="analyze_dead_code",
+            description="Analyze dead/unreachable code by comparing static AST with runtime traces. Shows functions defined but never executed.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source_dir": {"type": "string", "description": "Source directory to analyze", "default": "src/crawl4ai/embodied_ai"}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="analyze_performance",
+            description="Analyze performance metrics from traces - call counts, execution times, bottlenecks.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sort_by": {"type": "string", "description": "Sort by: total_ms, calls, avg_ms, max_ms", "default": "total_ms"},
+                    "limit": {"type": "integer", "description": "Number of top functions", "default": 20}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="analyze_call_tree",
+            description="Generate a call tree showing function call hierarchy.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "root_function": {"type": "string", "description": "Starting function (empty for all entry points)"},
+                    "max_depth": {"type": "integer", "description": "Maximum tree depth", "default": 5}
+                },
+                "required": []
+            }
+        ),
+        # Explorer Tools
+        Tool(
+            name="explorer_get_callers",
+            description="Get all functions that call a specific function (upstream call chain).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "function_name": {"type": "string", "description": "Function to find callers for"},
+                    "max_depth": {"type": "integer", "description": "How deep to trace", "default": 3}
+                },
+                "required": ["function_name"]
+            }
+        ),
+        Tool(
+            name="explorer_get_callees",
+            description="Get all functions called by a specific function (downstream call chain).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "function_name": {"type": "string", "description": "Function to find callees for"},
+                    "max_depth": {"type": "integer", "description": "How deep to trace", "default": 3}
+                },
+                "required": ["function_name"]
+            }
+        ),
+        Tool(
+            name="explorer_search",
+            description="Search for functions by name pattern in trace data.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query (partial match)"},
+                    "search_type": {"type": "string", "description": "What to search: function, module, file, all", "default": "function"}
+                },
+                "required": ["query"]
+            }
+        ),
+        Tool(
+            name="explorer_get_call_chain",
+            description="Get complete call chain for a function - both upstream and downstream.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "function_name": {"type": "string", "description": "Function to analyze"},
+                    "source_dir": {"type": "string", "description": "Source directory", "default": "src/crawl4ai/embodied_ai"}
+                },
+                "required": ["function_name"]
+            }
+        ),
+        Tool(
+            name="explorer_get_coverage_summary",
+            description="Get code coverage summary from trace data.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        Tool(
+            name="explorer_find_path",
+            description="Find the call path between two functions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Starting function"},
+                    "target": {"type": "string", "description": "Target function"}
+                },
+                "required": ["source", "target"]
+            }
+        ),
+        Tool(
+            name="explorer_get_function_details",
+            description="Get detailed information about a specific function including file, line, calls, performance metrics, callers and callees.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "function_name": {"type": "string", "description": "Full or partial function name to look up"}
+                },
+                "required": ["function_name"]
+            }
+        ),
+        Tool(
+            name="explorer_get_hot_paths",
+            description="Get the most frequently executed code paths (hot paths) for performance analysis.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Number of hot paths to return", "default": 10}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="explorer_get_call_graph",
+            description="Get the full call graph structure showing caller->callees relationships.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "module_filter": {"type": "string", "description": "Optional filter to only include functions from specific module"}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="analyze_sql_queries",
+            description="Analyze SQL queries from traces to detect N+1 problems and slow queries.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        # Manim Tools
+        Tool(
+            name="manim_generate_video",
+            description="Generate a Manim 3D animation video from trace data.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "trace_file": {"type": "string", "description": "Path to trace JSON file (uses current trace if empty)"},
+                    "quality": {"type": "string", "description": "Video quality - low_quality, medium_quality, high_quality", "default": "low_quality"},
+                    "scene_type": {"type": "string", "description": "Type of visualization - execution_flow, architecture, error_propagation", "default": "execution_flow"}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="manim_list_videos",
+            description="List all generated Manim videos.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        # Diagram Export Tools
+        Tool(
+            name="export_diagram",
+            description="Export execution flow as a diagram (plantuml, mermaid, json).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "format": {"type": "string", "description": "Output format - plantuml, mermaid, json", "default": "plantuml"},
+                    "output_file": {"type": "string", "description": "Output file path (auto-generated if empty)"}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="export_flamegraph",
+            description="Export performance data as a flamegraph-compatible JSON for speedscope.app.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "output_file": {"type": "string", "description": "Output file path (auto-generated if empty)"}
+                },
+                "required": []
+            }
+        ),
+        # AI Server Tools
+        Tool(
+            name="ai_server_start",
+            description="Start the local AI server (llama.cpp) for code explanations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "model_path": {"type": "string", "description": "Path to GGUF model file (uses default if empty)"},
+                    "port": {"type": "integer", "description": "Server port", "default": 8080}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="ai_server_stop",
+            description="Stop the local AI server.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        Tool(
+            name="ai_server_status",
+            description="Check AI server status.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        Tool(
+            name="ai_download_model",
+            description="Download an AI model from HuggingFace. Presets: Qwen3-VL-2B-Instruct-Q4_K_XL (1.5GB), Qwen3-2B-Instruct-Q4_K_M (1.1GB)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "model_name": {"type": "string", "description": "Model preset name", "default": "Qwen3-VL-2B-Instruct-Q4_K_XL"}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="ai_explain_code",
+            description="Ask the AI to explain code behavior using collected trace context.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Your question about the code"},
+                    "context_type": {"type": "string", "description": "Context to include: all, performance, dead_code, call_trace, none", "default": "all"}
+                },
+                "required": ["question"]
+            }
+        ),
+        # Project Management Tools
+        Tool(
+            name="set_project_dir",
+            description="Set the project directory for TrueFlow operations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "directory": {"type": "string", "description": "Path to project directory"}
+                },
+                "required": ["directory"]
+            }
+        ),
+        Tool(
+            name="get_project_info",
+            description="Get information about the current project.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        )
+    ]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> Sequence[TextContent]:
+    """Handle tool calls."""
+    try:
+        if name == "trace_connect":
+            result = await trace_connect(arguments.get("host", "127.0.0.1"), arguments.get("port", 5678))
+        elif name == "trace_disconnect":
+            result = await trace_disconnect()
+        elif name == "trace_status":
+            result = await trace_status()
+        elif name == "trace_get_events":
+            result = await trace_get_events(arguments.get("limit", 100), arguments.get("filter_module", ""), arguments.get("filter_function", ""))
+        elif name == "trace_clear":
+            result = await trace_clear()
+        elif name == "analyze_dead_code":
+            result = await analyze_dead_code(arguments.get("source_dir", "src/crawl4ai/embodied_ai"))
+        elif name == "analyze_performance":
+            result = await analyze_performance(arguments.get("sort_by", "total_ms"), arguments.get("limit", 20))
+        elif name == "analyze_call_tree":
+            result = await analyze_call_tree(arguments.get("root_function", ""), arguments.get("max_depth", 5))
+        elif name == "explorer_get_callers":
+            result = await explorer_get_callers(arguments.get("function_name", ""), arguments.get("max_depth", 3))
+        elif name == "explorer_get_callees":
+            result = await explorer_get_callees(arguments.get("function_name", ""), arguments.get("max_depth", 3))
+        elif name == "explorer_search":
+            result = await explorer_search(arguments.get("query", ""), arguments.get("search_type", "function"))
+        elif name == "explorer_get_call_chain":
+            result = await explorer_get_call_chain(arguments.get("function_name", ""), arguments.get("source_dir", "src/crawl4ai/embodied_ai"))
+        elif name == "explorer_get_coverage_summary":
+            result = await explorer_get_coverage_summary()
+        elif name == "explorer_find_path":
+            result = await explorer_find_path(arguments.get("source", ""), arguments.get("target", ""))
+        elif name == "explorer_get_function_details":
+            result = await explorer_get_function_details(arguments.get("function_name", ""))
+        elif name == "explorer_get_hot_paths":
+            result = await explorer_get_hot_paths(arguments.get("limit", 10))
+        elif name == "explorer_get_call_graph":
+            result = await explorer_get_call_graph(arguments.get("module_filter", ""))
+        elif name == "analyze_sql_queries":
+            result = await analyze_sql_queries()
+        elif name == "manim_generate_video":
+            result = await manim_generate_video(arguments.get("trace_file", ""), arguments.get("quality", "low_quality"), arguments.get("scene_type", "execution_flow"))
+        elif name == "manim_list_videos":
+            result = await manim_list_videos()
+        elif name == "export_diagram":
+            result = await export_diagram(arguments.get("format", "plantuml"), arguments.get("output_file", ""))
+        elif name == "export_flamegraph":
+            result = await export_flamegraph(arguments.get("output_file", ""))
+        elif name == "ai_server_start":
+            result = await ai_server_start(arguments.get("model_path", ""), arguments.get("port", 8080))
+        elif name == "ai_server_stop":
+            result = await ai_server_stop()
+        elif name == "ai_server_status":
+            result = await ai_server_status()
+        elif name == "ai_download_model":
+            result = await ai_download_model(arguments.get("model_name", "Qwen3-VL-2B-Instruct-Q4_K_XL"))
+        elif name == "ai_explain_code":
+            result = await ai_explain_code(arguments.get("question", ""), arguments.get("context_type", "all"))
+        elif name == "set_project_dir":
+            result = await set_project_dir(arguments.get("directory", ""))
+        elif name == "get_project_info":
+            result = await get_project_info()
+        else:
+            result = f"Unknown tool: {name}"
+        return [TextContent(type="text", text=result)]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error in {name}: {str(e)}")]
+
+
+# ============================================================================
+# TRACE COLLECTION IMPLEMENTATIONS
+# ============================================================================
+
 async def trace_connect(host: str = "127.0.0.1", port: int = 5678) -> str:
-    """
-    Connect to a running TrueFlow trace server.
-
-    The trace server streams real-time execution events from Python code.
-    Start your Python app with TrueFlow instrumentation first.
-
-    Args:
-        host: Trace server host (default: 127.0.0.1)
-        port: Trace server port (default: 5678)
-
-    Returns:
-        Connection status message
-    """
+    """Connect to trace server."""
     global state
-
     if state.trace_connected:
         return "Already connected to trace server"
-
     try:
         state.trace_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         state.trace_socket.settimeout(5.0)
         state.trace_socket.connect((host, port))
         state.trace_connected = True
         state.trace_events = []
-
-        # Start background reader
         asyncio.create_task(_read_trace_events())
-
         return f"Connected to trace server at {host}:{port}"
     except Exception as e:
         state.trace_connected = False
         return f"Failed to connect: {str(e)}. Make sure the trace server is running."
 
 
-@server.tool()
 async def trace_disconnect() -> str:
-    """
-    Disconnect from the trace server.
-
-    Returns:
-        Disconnection status message
-    """
+    """Disconnect from trace server."""
     global state
-
     if not state.trace_connected:
         return "Not connected to trace server"
-
     try:
         if state.trace_socket:
             state.trace_socket.close()
@@ -138,80 +480,54 @@ async def trace_disconnect() -> str:
         return f"Error disconnecting: {str(e)}"
 
 
-@server.tool()
 async def trace_status() -> str:
-    """
-    Get current trace collection status.
-
-    Returns:
-        JSON with connection status, event count, and recent events
-    """
+    """Get trace collection status."""
     global state
-
     status = {
         "connected": state.trace_connected,
         "event_count": len(state.trace_events),
-        "recent_events": state.trace_events[-10:] if state.trace_events else [],
-        "unique_functions": len(set(e.get("function", "") for e in state.trace_events)),
-        "unique_modules": len(set(e.get("module", "") for e in state.trace_events))
+        "covered_functions": len(state.covered_functions),
+        "call_graph_edges": sum(len(v) for v in state.call_graph.values()),
+        "recent_events": state.trace_events[-5:] if state.trace_events else []
     }
     return json.dumps(status, indent=2)
 
 
-@server.tool()
 async def trace_get_events(limit: int = 100, filter_module: str = "", filter_function: str = "") -> str:
-    """
-    Get collected trace events with optional filtering.
-
-    Args:
-        limit: Maximum number of events to return (default: 100)
-        filter_module: Filter by module name (partial match)
-        filter_function: Filter by function name (partial match)
-
-    Returns:
-        JSON array of trace events
-    """
+    """Get collected trace events."""
     global state
-
     events = state.trace_events
-
     if filter_module:
         events = [e for e in events if filter_module.lower() in e.get("module", "").lower()]
-
     if filter_function:
         events = [e for e in events if filter_function.lower() in e.get("function", "").lower()]
-
     return json.dumps(events[-limit:], indent=2)
 
 
-@server.tool()
 async def trace_clear() -> str:
-    """
-    Clear all collected trace events.
-
-    Returns:
-        Confirmation message
-    """
+    """Clear all trace data."""
     global state
     count = len(state.trace_events)
     state.trace_events = []
     state.performance_data = {}
     state.dead_code_data = {}
     state.call_trace_data = []
-    return f"Cleared {count} trace events"
+    state.call_graph = {}
+    state.reverse_call_graph = {}
+    state.covered_functions = set()
+    state._call_stack = []
+    return f"Cleared {count} trace events and all analytics"
 
 
 async def _read_trace_events():
     """Background task to read trace events from socket."""
     global state
     buffer = ""
-
     while state.trace_connected and state.trace_socket:
         try:
             data = state.trace_socket.recv(4096).decode('utf-8')
             if not data:
                 break
-
             buffer += data
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
@@ -227,117 +543,599 @@ async def _read_trace_events():
         except Exception as e:
             logger.error(f"Error reading trace events: {e}")
             break
-
     state.trace_connected = False
 
 
 def _update_analytics(event: dict):
-    """Update performance, call graph, and dead code analytics from event."""
+    """Update performance and call graph from event."""
     global state
-
     func_key = f"{event.get('module', 'unknown')}.{event.get('function', 'unknown')}"
     event_type = event.get("type", "")
     call_id = event.get("call_id")
 
-    # Initialize performance data for new functions
     if func_key not in state.performance_data:
         state.performance_data[func_key] = {
-            "calls": 0,
-            "total_ms": 0,
-            "min_ms": float('inf'),
-            "max_ms": 0,
-            "file": event.get("file", ""),
-            "line": event.get("line", 0)
+            "calls": 0, "total_ms": 0, "min_ms": float('inf'), "max_ms": 0,
+            "file": event.get("file", ""), "line": event.get("line", 0)
         }
 
-    # Store function info (file, line, module)
     if func_key not in state.function_info:
         state.function_info[func_key] = {
-            "file": event.get("file", ""),
-            "line": event.get("line", 0),
-            "module": event.get("module", "unknown")
+            "file": event.get("file", ""), "line": event.get("line", 0), "module": event.get("module", "unknown")
         }
 
     perf = state.performance_data[func_key]
 
-    # Handle call events - build call graph
     if event_type == "call":
         perf["calls"] += 1
         state.covered_functions.add(func_key)
-
-        # Build call graph from stack
         if state._call_stack:
-            caller = state._call_stack[-1][1]  # Get caller function name
-            # Add to call_graph (caller -> callees)
+            caller = state._call_stack[-1][1]
             if caller not in state.call_graph:
                 state.call_graph[caller] = []
             if func_key not in state.call_graph[caller]:
                 state.call_graph[caller].append(func_key)
-
-            # Add to reverse_call_graph (callee -> callers)
             if func_key not in state.reverse_call_graph:
                 state.reverse_call_graph[func_key] = []
             if caller not in state.reverse_call_graph[func_key]:
                 state.reverse_call_graph[func_key].append(caller)
-
-        # Push to stack
         state._call_stack.append((call_id, func_key))
 
-    # Handle return events
     elif event_type == "return":
         if "duration_ms" in event:
             duration = event["duration_ms"]
             perf["total_ms"] += duration
             perf["min_ms"] = min(perf["min_ms"], duration)
             perf["max_ms"] = max(perf["max_ms"], duration)
-
-        # Pop from stack
         if state._call_stack and state._call_stack[-1][0] == call_id:
             state._call_stack.pop()
 
-    # Track call hierarchy for detailed analysis
-    state.call_trace_data.append({
-        "function": func_key,
-        "depth": event.get("depth", 0),
-        "parent_id": event.get("parent_id"),
-        "call_id": call_id,
-        "timestamp": event.get("timestamp"),
-        "type": event_type
-    })
+
+# ============================================================================
+# ANALYSIS IMPLEMENTATIONS
+# ============================================================================
+
+async def analyze_dead_code(source_dir: str = "src/crawl4ai/embodied_ai") -> str:
+    """Analyze dead code comparing static AST with runtime coverage."""
+    global state
+    source_path = state.project_dir / source_dir
+
+    if not source_path.exists():
+        return f"Source directory not found: {source_path}"
+
+    # Static analysis - get all defined functions
+    defined_functions = set()
+    defined_classes = set()
+    file_definitions = {}
+
+    for py_file in source_path.rglob("*.py"):
+        if "__pycache__" in str(py_file):
+            continue
+        try:
+            content = py_file.read_text(encoding='utf-8')
+            tree = ast.parse(content)
+            rel_path = py_file.relative_to(source_path.parent)
+            module_name = str(rel_path).replace(os.sep, '.').replace('/', '.').replace('.py', '')
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    full_name = f"{module_name}.{node.name}"
+                    defined_classes.add(full_name)
+                    file_definitions[full_name] = {"file": str(py_file), "line": node.lineno}
+
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    full_name = f"{module_name}.{node.name}"
+                    defined_functions.add(full_name)
+                    file_definitions[full_name] = {"file": str(py_file), "line": node.lineno}
+        except Exception as e:
+            logger.warning(f"Error parsing {py_file}: {e}")
+
+    # Compare with runtime coverage
+    runtime_covered = state.covered_functions if state.covered_functions else set()
+
+    # Find dead code
+    dead_functions = []
+    for func in defined_functions:
+        func_name = func.split('.')[-1]
+        if func_name.startswith('_'):
+            continue  # Skip private
+        # Check if covered in runtime
+        is_covered = any(func_name in covered for covered in runtime_covered)
+        if not is_covered:
+            info = file_definitions.get(func, {})
+            dead_functions.append({
+                "function": func,
+                "file": info.get("file", "unknown"),
+                "line": info.get("line", 0)
+            })
+
+    # Build result
+    result = {
+        "source_dir": str(source_path),
+        "static_analysis": {
+            "total_functions": len(defined_functions),
+            "total_classes": len(defined_classes)
+        },
+        "runtime_coverage": {
+            "connected": state.trace_connected,
+            "covered_functions": len(runtime_covered),
+            "coverage_percent": round(len(runtime_covered) / len(defined_functions) * 100, 1) if defined_functions else 0
+        },
+        "dead_functions_count": len(dead_functions),
+        "dead_functions": dead_functions[:50],
+        "note": "Connect to trace server and run code to improve accuracy" if not state.trace_connected else "Based on runtime execution data"
+    }
+
+    return json.dumps(result, indent=2)
+
+
+async def analyze_performance(sort_by: str = "total_ms", limit: int = 20) -> str:
+    """Analyze performance from trace data."""
+    global state
+    if not state.performance_data:
+        return json.dumps({"error": "No performance data. Connect to trace server first."})
+
+    results = []
+    for func, data in state.performance_data.items():
+        avg_ms = data["total_ms"] / data["calls"] if data["calls"] > 0 else 0
+        results.append({
+            "function": func,
+            "calls": data["calls"],
+            "total_ms": round(data["total_ms"], 2),
+            "avg_ms": round(avg_ms, 2),
+            "min_ms": round(data["min_ms"], 2) if data["min_ms"] != float('inf') else 0,
+            "max_ms": round(data["max_ms"], 2),
+            "file": data["file"],
+            "line": data["line"]
+        })
+
+    results.sort(key=lambda x: x.get(sort_by, 0), reverse=True)
+    return json.dumps({"total_functions": len(results), "sort_by": sort_by, "hotspots": results[:limit]}, indent=2)
+
+
+async def analyze_call_tree(root_function: str = "", max_depth: int = 5) -> str:
+    """Generate call tree from trace data."""
+    global state
+    if not state.call_trace_data and not state.call_graph:
+        return json.dumps({"error": "No call trace data. Connect and collect traces first."})
+
+    # Find entry points
+    entry_points = [f for f in state.covered_functions if f not in state.reverse_call_graph or not state.reverse_call_graph[f]]
+
+    def build_tree(func: str, depth: int, visited: set) -> dict:
+        if depth > max_depth or func in visited:
+            return {"function": func, "truncated": True}
+        visited.add(func)
+        children = state.call_graph.get(func, [])
+        return {
+            "function": func,
+            "calls": state.performance_data.get(func, {}).get("calls", 0),
+            "children": [build_tree(c, depth + 1, visited.copy()) for c in children[:10]]
+        }
+
+    if root_function:
+        matching = [f for f in state.covered_functions if root_function.lower() in f.lower()]
+        if matching:
+            tree = [build_tree(matching[0], 0, set())]
+        else:
+            tree = []
+    else:
+        tree = [build_tree(ep, 0, set()) for ep in entry_points[:5]]
+
+    return json.dumps({"entry_points": entry_points[:20], "tree": tree}, indent=2)
 
 
 # ============================================================================
-# MANIM VIDEO GENERATION TOOLS
+# EXPLORER IMPLEMENTATIONS
 # ============================================================================
 
-@server.tool()
-async def manim_generate_video(
-    trace_file: str = "",
-    quality: str = "low_quality",
-    scene_type: str = "execution_flow"
-) -> str:
-    """
-    Generate a Manim 3D animation video from trace data.
+def _find_matching_function(name: str) -> str:
+    """Find matching function in covered functions."""
+    if name in state.covered_functions:
+        return name
+    for func in state.covered_functions:
+        if name.lower() in func.lower():
+            return func
+    return ""
 
-    Creates beautiful 3D visualizations of code execution flow,
-    similar to 3Blue1Brown style animations.
 
-    Args:
-        trace_file: Path to trace JSON file (uses current trace if empty)
-        quality: Video quality - low_quality, medium_quality, high_quality
-        scene_type: Type of visualization - execution_flow, architecture, error_propagation
-
-    Returns:
-        Path to generated video file or error message
-    """
+async def explorer_get_callers(function_name: str, max_depth: int = 3) -> str:
+    """Get all callers of a function."""
     global state
 
-    # Find the visualizer script
+    # Also build from static analysis if no runtime data
+    if not state.reverse_call_graph:
+        call_graph, reverse_graph, func_info = build_call_graph_static("src/crawl4ai/embodied_ai")
+    else:
+        reverse_graph = state.reverse_call_graph
+        func_info = state.function_info
+
+    # Find matching functions
+    matches = [f for f in func_info.keys() if function_name.lower() in f.lower()]
+    if not matches:
+        return json.dumps({"error": f"Function '{function_name}' not found"})
+
+    results = []
+    for func in matches[:5]:
+        def trace_up(target: str, depth: int, visited: set) -> list:
+            if depth > max_depth or target in visited:
+                return []
+            visited.add(target)
+            callers = reverse_graph.get(target, []) or reverse_graph.get(target.split('.')[-1], [])
+            result = []
+            for caller in callers[:10]:
+                result.append({"caller": caller, "depth": depth, "callers": trace_up(caller, depth + 1, visited.copy())})
+            return result
+
+        callers = reverse_graph.get(func, []) or reverse_graph.get(func.split('.')[-1], [])
+        results.append({
+            "function": func,
+            "file": func_info.get(func, {}).get("file", "unknown"),
+            "direct_callers": callers[:20],
+            "caller_tree": trace_up(func, 1, set())
+        })
+
+    return json.dumps({"matches": results, "total": len(matches)}, indent=2)
+
+
+async def explorer_get_callees(function_name: str, max_depth: int = 3) -> str:
+    """Get all callees of a function."""
+    global state
+
+    if not state.call_graph:
+        call_graph, reverse_graph, func_info = build_call_graph_static("src/crawl4ai/embodied_ai")
+    else:
+        call_graph = state.call_graph
+        func_info = state.function_info
+
+    matches = [f for f in func_info.keys() if function_name.lower() in f.lower()]
+    if not matches:
+        return json.dumps({"error": f"Function '{function_name}' not found"})
+
+    results = []
+    for func in matches[:5]:
+        def trace_down(source: str, depth: int, visited: set) -> list:
+            if depth > max_depth or source in visited:
+                return []
+            visited.add(source)
+            callees = call_graph.get(source, [])
+            result = []
+            for callee in callees[:10]:
+                result.append({"callee": callee, "depth": depth, "callees": trace_down(callee, depth + 1, visited.copy())})
+            return result
+
+        callees = call_graph.get(func, [])
+        results.append({
+            "function": func,
+            "file": func_info.get(func, {}).get("file", "unknown"),
+            "direct_callees": callees[:30],
+            "callee_tree": trace_down(func, 1, set())
+        })
+
+    return json.dumps({"matches": results, "total": len(matches)}, indent=2)
+
+
+async def explorer_search(query: str, search_type: str = "function") -> str:
+    """Search for functions by pattern."""
+    global state
+
+    if not state.function_info:
+        _, _, func_info = build_call_graph_static("src/crawl4ai/embodied_ai")
+    else:
+        func_info = state.function_info
+
+    results = []
+    query_lower = query.lower()
+
+    for func_key, info in func_info.items():
+        match = False
+        if search_type in ["function", "all"] and query_lower in func_key.split('.')[-1].lower():
+            match = True
+        if search_type in ["module", "all"] and query_lower in func_key.rsplit('.', 1)[0].lower():
+            match = True
+        if search_type in ["file", "all"] and query_lower in info.get("file", "").lower():
+            match = True
+
+        if match:
+            callers = state.reverse_call_graph.get(func_key, [])
+            callees = state.call_graph.get(func_key, [])
+            results.append({
+                "function": func_key,
+                "file": info.get("file", "unknown"),
+                "line": info.get("line", 0),
+                "callers_count": len(callers),
+                "callees_count": len(callees),
+                "is_dead": len(callers) == 0 and not func_key.split('.')[-1].startswith('_'),
+                "is_covered": func_key in state.covered_functions
+            })
+
+    results.sort(key=lambda x: (-x.get("callers_count", 0), x["function"]))
+    return json.dumps({"query": query, "results": results[:50], "total": len(results)}, indent=2)
+
+
+async def explorer_get_call_chain(function_name: str, source_dir: str = "src/crawl4ai/embodied_ai") -> str:
+    """Get complete call chain for a function."""
+    global state
+
+    if not state.call_graph:
+        call_graph, reverse_graph, func_info = build_call_graph_static(source_dir)
+    else:
+        call_graph = state.call_graph
+        reverse_graph = state.reverse_call_graph
+        func_info = state.function_info
+
+    matches = [f for f in func_info.keys() if function_name.lower() in f.lower()]
+    if not matches:
+        return json.dumps({"error": f"Function '{function_name}' not found"})
+
+    func = matches[0]
+
+    def trace_up(target: str, visited: set) -> list:
+        if target in visited:
+            return []
+        visited.add(target)
+        callers = reverse_graph.get(target, []) or reverse_graph.get(target.split('.')[-1], [])
+        result = list(callers)
+        for caller in callers:
+            result.extend(trace_up(caller, visited.copy()))
+        return list(set(result))
+
+    def trace_down(source: str, visited: set) -> list:
+        if source in visited:
+            return []
+        visited.add(source)
+        callees = call_graph.get(source, [])
+        result = list(callees)
+        for callee in callees:
+            result.extend(trace_down(callee, visited.copy()))
+        return list(set(result))
+
+    upstream = trace_up(func, set())
+    downstream = trace_down(func, set())
+    root_callers = [f for f in upstream if not reverse_graph.get(f, [])]
+
+    return json.dumps({
+        "function": func,
+        "file": func_info.get(func, {}).get("file", "unknown"),
+        "upstream": {"all_callers": upstream[:50], "root_callers": root_callers[:10], "total": len(upstream)},
+        "downstream": {"all_callees": downstream[:50], "total": len(downstream)},
+        "is_dead": len(upstream) == 0 and not func.split('.')[-1].startswith('_')
+    }, indent=2)
+
+
+async def explorer_get_coverage_summary() -> str:
+    """Get coverage summary from trace data."""
+    global state
+
+    if not state.covered_functions:
+        return json.dumps({"error": "No coverage data. Connect to trace server and run code first."})
+
+    modules = {}
+    for func in state.covered_functions:
+        module = func.rsplit('.', 1)[0] if '.' in func else "unknown"
+        if module not in modules:
+            modules[module] = {"count": 0, "total_ms": 0}
+        modules[module]["count"] += 1
+        modules[module]["total_ms"] += state.performance_data.get(func, {}).get("total_ms", 0)
+
+    entry_points = [f for f in state.covered_functions if f not in state.reverse_call_graph]
+
+    return json.dumps({
+        "summary": {
+            "total_covered": len(state.covered_functions),
+            "total_calls": sum(d.get("calls", 0) for d in state.performance_data.values()),
+            "total_ms": round(sum(d.get("total_ms", 0) for d in state.performance_data.values()), 2),
+            "modules_count": len(modules),
+            "entry_points_count": len(entry_points)
+        },
+        "entry_points": entry_points[:20],
+        "modules": [{"module": m, **d} for m, d in sorted(modules.items(), key=lambda x: -x[1]["count"])][:20]
+    }, indent=2)
+
+
+async def explorer_find_path(source: str, target: str) -> str:
+    """Find call path between two functions."""
+    global state
+
+    if not state.call_graph:
+        call_graph, reverse_graph, func_info = build_call_graph_static("src/crawl4ai/embodied_ai")
+    else:
+        call_graph = state.call_graph
+        func_info = state.function_info
+
+    source_func = next((f for f in func_info if source.lower() in f.lower()), None)
+    target_func = next((f for f in func_info if target.lower() in f.lower()), None)
+
+    if not source_func:
+        return json.dumps({"error": f"Source '{source}' not found"})
+    if not target_func:
+        return json.dumps({"error": f"Target '{target}' not found"})
+
+    # BFS for path
+    queue = [(source_func, [source_func])]
+    visited = {source_func}
+
+    while queue:
+        current, path = queue.pop(0)
+        if current == target_func:
+            return json.dumps({
+                "source": source_func, "target": target_func,
+                "path": path, "length": len(path) - 1,
+                "path_string": " -> ".join(path)
+            }, indent=2)
+        for callee in call_graph.get(current, []):
+            if callee not in visited:
+                visited.add(callee)
+                queue.append((callee, path + [callee]))
+
+    return json.dumps({"source": source_func, "target": target_func, "reachable": False, "message": "No path found"}, indent=2)
+
+
+async def explorer_get_function_details(function_name: str) -> str:
+    """Get detailed information about a specific function."""
+    global state
+
+    if not state.call_graph and not state.performance_data:
+        build_call_graph_static("src/crawl4ai/embodied_ai")
+
+    matches = []
+    for func_key in state.function_info.keys():
+        if function_name.lower() in func_key.lower():
+            perf_data = state.performance_data.get(func_key, {})
+            func_info = state.function_info.get(func_key, {})
+            callees = state.call_graph.get(func_key, [])
+            callers = state.reverse_call_graph.get(func_key, [])
+            avg_ms = perf_data.get("total_ms", 0) / perf_data.get("calls", 1) if perf_data.get("calls", 0) > 0 else 0
+
+            matches.append({
+                "function": func_key,
+                "file": func_info.get("file", perf_data.get("file", "unknown")),
+                "line": func_info.get("line", perf_data.get("line", 0)),
+                "module": func_info.get("module", ""),
+                "calls": perf_data.get("calls", 0),
+                "total_ms": round(perf_data.get("total_ms", 0), 2),
+                "avg_ms": round(avg_ms, 2),
+                "max_ms": round(perf_data.get("max_ms", 0), 2),
+                "callees": callees[:20],
+                "callers": callers[:20],
+                "callees_count": len(callees),
+                "callers_count": len(callers),
+                "is_entry_point": len(callers) == 0,
+                "is_covered": func_key in state.covered_functions
+            })
+
+    if not matches:
+        return json.dumps({"error": f"No function matching '{function_name}' found"})
+
+    matches.sort(key=lambda x: x["calls"], reverse=True)
+    return json.dumps({"query": function_name, "matches": matches[:10], "total_matches": len(matches)}, indent=2)
+
+
+async def explorer_get_hot_paths(limit: int = 10) -> str:
+    """Get the most frequently executed code paths."""
+    global state
+
+    if not state.call_graph:
+        build_call_graph_static("src/crawl4ai/embodied_ai")
+
+    entry_points = [f for f in state.covered_functions if not state.reverse_call_graph.get(f, [])]
+    paths = []
+
+    for entry in entry_points[:20]:
+        def collect_paths(func: str, current_path: list, visited: set):
+            if func in visited or len(current_path) > 10:
+                return
+            visited.add(func)
+            current_path.append(func)
+
+            callees = state.call_graph.get(func, [])
+            if not callees:
+                path_total_ms = sum(state.performance_data.get(f, {}).get("total_ms", 0) for f in current_path)
+                path_min_calls = min((state.performance_data.get(f, {}).get("calls", 0) for f in current_path), default=0)
+                paths.append({
+                    "entry_point": entry,
+                    "path": " -> ".join(current_path[:5]) + ("..." if len(current_path) > 5 else ""),
+                    "functions": current_path.copy(),
+                    "depth": len(current_path),
+                    "path_total_ms": round(path_total_ms, 2),
+                    "min_calls_in_path": path_min_calls
+                })
+            else:
+                for callee in callees[:5]:
+                    collect_paths(callee, current_path.copy(), visited.copy())
+
+        collect_paths(entry, [], set())
+
+    paths.sort(key=lambda x: x["min_calls_in_path"], reverse=True)
+    return json.dumps({"hot_paths": paths[:limit], "total_paths": len(paths), "entry_points": entry_points[:20]}, indent=2)
+
+
+async def explorer_get_call_graph(module_filter: str = "") -> str:
+    """Get the full call graph structure."""
+    global state
+
+    if not state.call_graph:
+        build_call_graph_static("src/crawl4ai/embodied_ai")
+
+    if module_filter:
+        filter_lower = module_filter.lower()
+        filtered_call_graph = {
+            caller: [c for c in callees if filter_lower in c.lower()]
+            for caller, callees in state.call_graph.items()
+            if filter_lower in caller.lower()
+        }
+        filtered_reverse = {
+            callee: [c for c in callers if filter_lower in c.lower()]
+            for callee, callers in state.reverse_call_graph.items()
+            if filter_lower in callee.lower()
+        }
+        filtered_functions = [f for f in state.function_info.keys() if filter_lower in f.lower()]
+    else:
+        filtered_call_graph = dict(state.call_graph)
+        filtered_reverse = dict(state.reverse_call_graph)
+        filtered_functions = list(state.function_info.keys())
+
+    entry_points = [f for f in filtered_functions if f not in filtered_reverse or not filtered_reverse[f]]
+    leaf_nodes = [f for f in filtered_functions if f not in filtered_call_graph or not filtered_call_graph[f]]
+
+    return json.dumps({
+        "call_graph": {k: v for k, v in list(filtered_call_graph.items())[:100]},
+        "reverse_call_graph": {k: v for k, v in list(filtered_reverse.items())[:100]},
+        "functions": filtered_functions[:100],
+        "total_functions": len(filtered_functions),
+        "total_edges": sum(len(v) for v in filtered_call_graph.values()),
+        "entry_points": entry_points[:20],
+        "leaf_nodes": leaf_nodes[:20],
+        "module_filter": module_filter or "none"
+    }, indent=2)
+
+
+async def analyze_sql_queries() -> str:
+    """Analyze SQL queries from traces to detect N+1 problems."""
+    global state
+
+    sql_events = [e for e in state.trace_events if
+                  'sql' in e.get('function', '').lower() or
+                  'query' in e.get('function', '').lower() or
+                  'execute' in e.get('function', '').lower() or
+                  e.get('trace_data', {}).get('type') == 'sql']
+
+    if not sql_events:
+        return json.dumps({
+            "status": "No SQL queries detected in traces",
+            "hint": "Ensure database operations are being traced"
+        })
+
+    query_patterns = {}
+    for event in sql_events:
+        pattern = event.get('function', 'unknown')
+        if pattern not in query_patterns:
+            query_patterns[pattern] = {"count": 0, "total_ms": 0}
+        query_patterns[pattern]["count"] += 1
+        query_patterns[pattern]["total_ms"] += event.get("duration_ms", 0)
+
+    n_plus_1 = [{"pattern": p, **data} for p, data in query_patterns.items() if data["count"] > 10]
+
+    return json.dumps({
+        "total_queries": len(sql_events),
+        "unique_patterns": len(query_patterns),
+        "potential_n_plus_1": n_plus_1,
+        "all_patterns": query_patterns
+    }, indent=2)
+
+
+# ============================================================================
+# MANIM VIDEO IMPLEMENTATIONS
+# ============================================================================
+
+async def manim_generate_video(trace_file: str = "", quality: str = "low_quality", scene_type: str = "execution_flow") -> str:
+    """Generate a Manim 3D animation video from trace data."""
+    global state
+
     plugin_dir = state.project_dir / ".pycharm_plugin" / "runtime_injector"
     visualizer_script = plugin_dir / "ultimate_architecture_viz.py"
 
     if not visualizer_script.exists():
-        # Try alternate locations
         alt_paths = [
             state.project_dir / "pycharm-plugin" / "runtime_injector" / "ultimate_architecture_viz.py",
             Path(__file__).parent / "ultimate_architecture_viz.py"
@@ -349,22 +1147,18 @@ async def manim_generate_video(
         else:
             return "Manim visualizer not found. Ensure TrueFlow is properly installed."
 
-    # Create trace file from current events if not provided
     if not trace_file:
         traces_dir = state.project_dir / ".pycharm_plugin" / "manim" / "traces"
         traces_dir.mkdir(parents=True, exist_ok=True)
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         trace_file = str(traces_dir / f"trace_{timestamp}.json")
-
         with open(trace_file, 'w') as f:
             json.dump({
-                "events": state.trace_events[-500:],  # Last 500 events
+                "events": state.trace_events[-500:],
                 "performance": state.performance_data,
                 "timestamp": timestamp
             }, f, indent=2)
 
-    # Run Manim
     try:
         cmd = [
             sys.executable, "-c",
@@ -387,7 +1181,6 @@ print('VIDEO_PATH:', config.get_output_dir())
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
         if result.returncode == 0:
-            # Find the video path from output
             for line in result.stdout.split('\n'):
                 if 'VIDEO_PATH:' in line:
                     video_dir = line.split('VIDEO_PATH:')[1].strip()
@@ -403,14 +1196,8 @@ print('VIDEO_PATH:', config.get_output_dir())
         return f"Error generating video: {str(e)}"
 
 
-@server.tool()
 async def manim_list_videos() -> str:
-    """
-    List all generated Manim videos.
-
-    Returns:
-        JSON array of video file paths with metadata
-    """
+    """List all generated Manim videos."""
     global state
 
     media_dir = state.project_dir / ".pycharm_plugin" / "manim" / "media" / "videos"
@@ -430,230 +1217,18 @@ async def manim_list_videos() -> str:
 
 
 # ============================================================================
-# ANALYSIS TOOLS
+# DIAGRAM EXPORT IMPLEMENTATIONS
 # ============================================================================
 
-@server.tool()
-async def analyze_performance(sort_by: str = "total_ms", limit: int = 20) -> str:
-    """
-    Analyze performance metrics from collected traces.
-
-    Shows which functions take the most time, have the most calls, etc.
-
-    Args:
-        sort_by: Sort metric - total_ms, calls, avg_ms, max_ms
-        limit: Number of top functions to return
-
-    Returns:
-        JSON with performance analysis
-    """
-    global state
-
-    if not state.performance_data:
-        return "No performance data. Connect to trace server and collect events first."
-
-    # Calculate averages
-    results = []
-    for func, data in state.performance_data.items():
-        avg_ms = data["total_ms"] / data["calls"] if data["calls"] > 0 else 0
-        results.append({
-            "function": func,
-            "calls": data["calls"],
-            "total_ms": round(data["total_ms"], 2),
-            "avg_ms": round(avg_ms, 2),
-            "min_ms": round(data["min_ms"], 2) if data["min_ms"] != float('inf') else 0,
-            "max_ms": round(data["max_ms"], 2),
-            "file": data["file"],
-            "line": data["line"]
-        })
-
-    # Sort
-    results.sort(key=lambda x: x.get(sort_by, 0), reverse=True)
-
-    return json.dumps({
-        "total_functions": len(results),
-        "sort_by": sort_by,
-        "hotspots": results[:limit]
-    }, indent=2)
-
-
-@server.tool()
-async def analyze_dead_code(source_dir: str = "") -> str:
-    """
-    Analyze dead/unreachable code by comparing static analysis with runtime traces.
-
-    Identifies functions that exist in source but were never called during execution.
-
-    Args:
-        source_dir: Directory to scan for Python files (default: project dir)
-
-    Returns:
-        JSON with dead code analysis
-    """
-    global state
-
-    source_path = Path(source_dir) if source_dir else state.project_dir
-
-    # Get all defined functions from source files
-    defined_functions = set()
-    for py_file in source_path.rglob("*.py"):
-        if ".venv" in str(py_file) or "node_modules" in str(py_file):
-            continue
-        try:
-            with open(py_file, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-                import ast
-                tree = ast.parse(content)
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        module = str(py_file.relative_to(source_path)).replace('/', '.').replace('\\', '.').replace('.py', '')
-                        defined_functions.add(f"{module}.{node.name}")
-        except:
-            continue
-
-    # Get called functions from traces
-    called_functions = set(state.performance_data.keys())
-
-    # Find dead code
-    dead_functions = defined_functions - called_functions
-
-    # Categorize
-    result = {
-        "total_defined": len(defined_functions),
-        "total_called": len(called_functions),
-        "dead_count": len(dead_functions),
-        "coverage_percent": round(len(called_functions) / len(defined_functions) * 100, 1) if defined_functions else 0,
-        "dead_functions": sorted(list(dead_functions))[:50],
-        "note": "Run more code paths to improve coverage accuracy"
-    }
-
-    state.dead_code_data = result
-    return json.dumps(result, indent=2)
-
-
-@server.tool()
-async def analyze_call_tree(root_function: str = "", max_depth: int = 5) -> str:
-    """
-    Generate a call tree showing function call hierarchy.
-
-    Args:
-        root_function: Starting function (empty for all entry points)
-        max_depth: Maximum tree depth to show
-
-    Returns:
-        JSON call tree structure
-    """
-    global state
-
-    if not state.call_trace_data:
-        return "No call trace data. Connect and collect traces first."
-
-    # Build call graph
-    calls_by_parent = {}
-    for call in state.call_trace_data:
-        parent = call.get("parent_id", "root")
-        if parent not in calls_by_parent:
-            calls_by_parent[parent] = []
-        calls_by_parent[parent].append(call)
-
-    def build_tree(parent_id: str, depth: int) -> list:
-        if depth > max_depth:
-            return []
-        children = calls_by_parent.get(parent_id, [])
-        return [{
-            "function": c["function"],
-            "depth": c["depth"],
-            "children": build_tree(c["call_id"], depth + 1) if c["call_id"] else []
-        } for c in children]
-
-    tree = build_tree("root", 0)
-
-    if root_function:
-        # Filter to specific function
-        def find_function(nodes, target):
-            for n in nodes:
-                if target in n["function"]:
-                    return n
-                found = find_function(n.get("children", []), target)
-                if found:
-                    return found
-            return None
-        tree = [find_function(tree, root_function)] if find_function(tree, root_function) else []
-
-    return json.dumps(tree, indent=2)
-
-
-@server.tool()
-async def analyze_sql_queries() -> str:
-    """
-    Analyze SQL queries from traces to detect N+1 problems and slow queries.
-
-    Returns:
-        JSON with SQL analysis including N+1 detection
-    """
-    global state
-
-    # Filter SQL-related events
-    sql_events = [e for e in state.trace_events if
-                  'sql' in e.get('function', '').lower() or
-                  'query' in e.get('function', '').lower() or
-                  'execute' in e.get('function', '').lower() or
-                  e.get('trace_data', {}).get('type') == 'sql']
-
-    if not sql_events:
-        return json.dumps({
-            "status": "No SQL queries detected in traces",
-            "hint": "Ensure database operations are being traced"
-        })
-
-    # Group by query pattern
-    query_patterns = {}
-    for event in sql_events:
-        pattern = event.get('function', 'unknown')
-        if pattern not in query_patterns:
-            query_patterns[pattern] = {"count": 0, "total_ms": 0}
-        query_patterns[pattern]["count"] += 1
-        query_patterns[pattern]["total_ms"] += event.get("duration_ms", 0)
-
-    # Detect N+1 (same query called many times in short period)
-    n_plus_1 = [
-        {"pattern": p, **data}
-        for p, data in query_patterns.items()
-        if data["count"] > 10
-    ]
-
-    return json.dumps({
-        "total_queries": len(sql_events),
-        "unique_patterns": len(query_patterns),
-        "potential_n_plus_1": n_plus_1,
-        "all_patterns": query_patterns
-    }, indent=2)
-
-
-# ============================================================================
-# DIAGRAM EXPORT TOOLS
-# ============================================================================
-
-@server.tool()
 async def export_diagram(format: str = "plantuml", output_file: str = "") -> str:
-    """
-    Export execution flow as a diagram.
-
-    Args:
-        format: Output format - plantuml, mermaid, json
-        output_file: Output file path (auto-generated if empty)
-
-    Returns:
-        Path to exported file or diagram content
-    """
+    """Export execution flow as a diagram."""
     global state
 
     if not state.trace_events:
         return "No trace events to export. Collect traces first."
 
-    # Generate unique participants
     modules = set()
-    for event in state.trace_events[:200]:  # Limit for readability
+    for event in state.trace_events[:200]:
         modules.add(event.get("module", "unknown"))
 
     if format == "plantuml":
@@ -702,29 +1277,15 @@ async def export_diagram(format: str = "plantuml", output_file: str = "") -> str
     return f"Diagram exported to: {output_path}"
 
 
-@server.tool()
 async def export_flamegraph(output_file: str = "") -> str:
-    """
-    Export performance data as a flamegraph-compatible JSON.
-
-    Can be visualized with speedscope.app or similar tools.
-
-    Args:
-        output_file: Output file path (auto-generated if empty)
-
-    Returns:
-        Path to exported file
-    """
+    """Export performance data as a flamegraph-compatible JSON."""
     global state
 
     if not state.performance_data:
         return "No performance data. Collect traces first."
 
-    # Build flamegraph format
     flamegraph_data = {
-        "shared": {
-            "frames": []
-        },
+        "shared": {"frames": []},
         "profiles": [{
             "type": "sampled",
             "name": "TrueFlow Trace",
@@ -736,9 +1297,7 @@ async def export_flamegraph(output_file: str = "") -> str:
         }]
     }
 
-    frame_index = {}
     for i, (func, data) in enumerate(state.performance_data.items()):
-        frame_index[func] = i
         flamegraph_data["shared"]["frames"].append({
             "name": func,
             "file": data.get("file", ""),
@@ -761,32 +1320,20 @@ async def export_flamegraph(output_file: str = "") -> str:
 
 
 # ============================================================================
-# AI SERVER MANAGEMENT TOOLS
+# AI SERVER IMPLEMENTATIONS
 # ============================================================================
 
-@server.tool()
 async def ai_server_start(model_path: str = "", port: int = 8080) -> str:
-    """
-    Start the local AI server (llama.cpp) for code explanations.
-
-    Args:
-        model_path: Path to GGUF model file (uses default if empty)
-        port: Server port (default: 8080)
-
-    Returns:
-        Server status message
-    """
+    """Start the local AI server."""
     global state
 
     if state.ai_server_process and state.ai_server_process.poll() is None:
         return "AI server is already running"
 
-    # Find llama-server
     home = Path.home()
     possible_paths = [
         home / ".trueflow" / "llama.cpp" / "build" / "bin" / "Release" / "llama-server.exe",
         home / ".trueflow" / "llama.cpp" / "build" / "bin" / "llama-server",
-        home / ".trueflow" / "llama.cpp" / "build" / "bin" / "llama-server.exe",
     ]
 
     llama_server = None
@@ -798,7 +1345,6 @@ async def ai_server_start(model_path: str = "", port: int = 8080) -> str:
     if not llama_server:
         return "llama-server not found. Install llama.cpp first."
 
-    # Find model
     if not model_path:
         models_dir = home / ".trueflow" / "models"
         if models_dir.exists():
@@ -807,9 +1353,8 @@ async def ai_server_start(model_path: str = "", port: int = 8080) -> str:
                 break
 
     if not model_path:
-        return "No model found. Download a model first using ai_download_model."
+        return "No model found. Download a model first."
 
-    # Start server
     try:
         cmd = [
             str(llama_server),
@@ -819,13 +1364,8 @@ async def ai_server_start(model_path: str = "", port: int = 8080) -> str:
             "--host", "127.0.0.1"
         ]
 
-        state.ai_server_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        state.ai_server_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # Wait for startup
         for _ in range(30):
             time.sleep(1)
             try:
@@ -841,14 +1381,8 @@ async def ai_server_start(model_path: str = "", port: int = 8080) -> str:
         return f"Failed to start AI server: {str(e)}"
 
 
-@server.tool()
 async def ai_server_stop() -> str:
-    """
-    Stop the local AI server.
-
-    Returns:
-        Status message
-    """
+    """Stop the local AI server."""
     global state
 
     if not state.ai_server_process:
@@ -863,14 +1397,8 @@ async def ai_server_stop() -> str:
         return f"Error stopping server: {str(e)}"
 
 
-@server.tool()
 async def ai_server_status() -> str:
-    """
-    Check AI server status.
-
-    Returns:
-        JSON with server status
-    """
+    """Check AI server status."""
     global state
 
     running = state.ai_server_process and state.ai_server_process.poll() is None
@@ -891,21 +1419,8 @@ async def ai_server_status() -> str:
     }, indent=2)
 
 
-@server.tool()
 async def ai_download_model(model_name: str = "Qwen3-VL-2B-Instruct-Q4_K_XL") -> str:
-    """
-    Download an AI model from HuggingFace.
-
-    Args:
-        model_name: Model preset name. Options:
-            - Qwen3-VL-2B-Instruct-Q4_K_XL (recommended, 1.5GB)
-            - Qwen3-VL-2B-Thinking-Q4_K_XL (reasoning, 1.5GB)
-            - Qwen3-VL-4B-Instruct-Q4_K_XL (larger, 2.8GB)
-            - Qwen3-2B-Instruct-Q4_K_M (text-only, 1.1GB)
-
-    Returns:
-        Download status message
-    """
+    """Download an AI model from HuggingFace."""
     MODEL_PRESETS = {
         "Qwen3-VL-2B-Instruct-Q4_K_XL": {
             "repo": "unsloth/Qwen3-VL-2B-Instruct-GGUF",
@@ -940,35 +1455,17 @@ async def ai_download_model(model_name: str = "Qwen3-VL-2B-Instruct-Q4_K_XL") ->
 
     try:
         import urllib.request
-
-        def report_progress(count, block_size, total_size):
-            percent = int(count * block_size * 100 / total_size)
-            if count % 100 == 0:
-                logger.info(f"Download progress: {percent}%")
-
         logger.info(f"Downloading {model_name}...")
-        urllib.request.urlretrieve(url, dest_path, reporthook=report_progress)
+        urllib.request.urlretrieve(url, dest_path)
         return f"Model downloaded to: {dest_path}"
-
     except Exception as e:
         return f"Download failed: {str(e)}"
 
 
-@server.tool()
 async def ai_explain_code(question: str, context_type: str = "all") -> str:
-    """
-    Ask the AI to explain code behavior using collected trace context.
-
-    Args:
-        question: Your question about the code
-        context_type: Context to include - all, performance, dead_code, call_trace, none
-
-    Returns:
-        AI explanation
-    """
+    """Ask the AI to explain code behavior using trace context."""
     global state
 
-    # Build context
     context = ""
     if context_type in ["all", "performance"]:
         if state.performance_data:
@@ -984,13 +1481,12 @@ async def ai_explain_code(question: str, context_type: str = "all") -> str:
                 context += f"  - {func}\n"
 
     if context_type in ["all", "call_trace"]:
-        if state.call_trace_data:
-            context += "\n--- Recent Call Trace ---\n"
-            for call in state.call_trace_data[-20:]:
-                indent = "  " * call.get("depth", 0)
-                context += f"{indent}-> {call['function']}\n"
+        if state.call_graph:
+            context += "\n--- Active Call Graph ---\n"
+            context += f"  Functions: {len(state.function_info)}, Edges: {sum(len(v) for v in state.call_graph.values())}\n"
+            entry_points = [f for f in state.covered_functions if not state.reverse_call_graph.get(f, [])]
+            context += f"  Entry points: {', '.join(entry_points[:5])}\n"
 
-    # Call AI server
     try:
         import urllib.request
 
@@ -1015,24 +1511,15 @@ async def ai_explain_code(question: str, context_type: str = "all") -> str:
         return result["choices"][0]["message"]["content"]
 
     except Exception as e:
-        return f"AI server error: {str(e)}. Make sure the server is running with ai_server_start."
+        return f"AI server error: {str(e)}. Start server with ai_server_start first.\n\nContext that would be sent:\n{context}"
 
 
 # ============================================================================
-# PROJECT MANAGEMENT TOOLS
+# PROJECT MANAGEMENT IMPLEMENTATIONS
 # ============================================================================
 
-@server.tool()
 async def set_project_dir(directory: str) -> str:
-    """
-    Set the project directory for TrueFlow operations.
-
-    Args:
-        directory: Path to project directory
-
-    Returns:
-        Confirmation message
-    """
+    """Set the project directory for TrueFlow operations."""
     global state
 
     path = Path(directory).resolve()
@@ -1043,14 +1530,8 @@ async def set_project_dir(directory: str) -> str:
     return f"Project directory set to: {state.project_dir}"
 
 
-@server.tool()
 async def get_project_info() -> str:
-    """
-    Get information about the current project.
-
-    Returns:
-        JSON with project info
-    """
+    """Get information about the current project."""
     global state
 
     info = {
@@ -1069,836 +1550,85 @@ async def get_project_info() -> str:
     return json.dumps(info, indent=2)
 
 
-@server.tool()
-async def auto_integrate(entry_point: str = "") -> str:
-    """
-    Auto-integrate TrueFlow tracing into a Python project.
+# ============================================================================
+# STATIC ANALYSIS HELPER
+# ============================================================================
 
-    Sets up the runtime injector so that running Python code
-    automatically streams trace events.
+def build_call_graph_static(source_dir: str) -> tuple:
+    """Build call graph from static AST analysis."""
+    source_path = state.project_dir / source_dir
+    call_graph = {}
+    reverse_graph = {}
+    function_info = {}
 
-    Args:
-        entry_point: Main Python file (e.g., main.py, app.py)
+    for py_file in source_path.rglob("*.py"):
+        if "__pycache__" in str(py_file):
+            continue
+        try:
+            content = py_file.read_text(encoding='utf-8')
+            tree = ast.parse(content)
+            rel_path = py_file.relative_to(source_path.parent)
+            module_name = str(rel_path).replace(os.sep, '.').replace('/', '.').replace('.py', '')
 
-    Returns:
-        Integration status and instructions
-    """
-    global state
+            class CallVisitor(ast.NodeVisitor):
+                def __init__(self):
+                    self.current_func = None
+                    self.current_class = None
 
-    plugin_dir = state.project_dir / ".pycharm_plugin"
-    injector_dir = plugin_dir / "runtime_injector"
+                def visit_ClassDef(self, node):
+                    old = self.current_class
+                    self.current_class = node.name
+                    self.generic_visit(node)
+                    self.current_class = old
 
-    # Create directories
-    plugin_dir.mkdir(parents=True, exist_ok=True)
-    injector_dir.mkdir(parents=True, exist_ok=True)
+                def visit_FunctionDef(self, node):
+                    old = self.current_func
+                    if self.current_class:
+                        self.current_func = f"{module_name}.{self.current_class}.{node.name}"
+                    else:
+                        self.current_func = f"{module_name}.{node.name}"
+                    function_info[self.current_func] = {"file": str(py_file), "line": node.lineno, "module": module_name}
+                    if self.current_func not in call_graph:
+                        call_graph[self.current_func] = []
+                    self.generic_visit(node)
+                    self.current_func = old
 
-    # Copy injector files from our location
-    source_dir = Path(__file__).parent
-    files_to_copy = [
-        "python_runtime_instrumentor.py",
-        "sitecustomize.py"
-    ]
+                visit_AsyncFunctionDef = visit_FunctionDef
 
-    copied = []
-    for filename in files_to_copy:
-        source = source_dir / filename
-        dest = injector_dir / filename
-        if source.exists():
-            import shutil
-            shutil.copy2(source, dest)
-            copied.append(filename)
+                def visit_Call(self, node):
+                    if self.current_func:
+                        callee = None
+                        if isinstance(node.func, ast.Name):
+                            callee = node.func.id
+                        elif isinstance(node.func, ast.Attribute):
+                            callee = node.func.attr
+                        if callee:
+                            call_graph[self.current_func].append(callee)
+                            if callee not in reverse_graph:
+                                reverse_graph[callee] = []
+                            reverse_graph[callee].append(self.current_func)
+                    self.generic_visit(node)
 
-    instructions = f"""
-TrueFlow integration complete!
+            CallVisitor().visit(tree)
+        except Exception as e:
+            logger.debug(f"Error parsing {py_file}: {e}")
 
-Files deployed to: {injector_dir}
-Copied: {', '.join(copied)}
+    # Update global state
+    state.call_graph = call_graph
+    state.reverse_call_graph = reverse_graph
+    state.function_info = function_info
 
-To run with tracing enabled:
-
-Option 1 - Environment variable:
-    set PYTHONPATH={injector_dir};%PYTHONPATH%
-    python {entry_point or 'your_script.py'}
-
-Option 2 - Direct import:
-    Add to your script:
-    import sys
-    sys.path.insert(0, r'{injector_dir}')
-    import sitecustomize
-
-Then connect with: trace_connect()
-"""
-
-    return instructions
+    return call_graph, reverse_graph, function_info
 
 
 # ============================================================================
-# INTERACTIVE EXPLORER TOOLS (for LLM-driven code exploration)
-# Uses exact same call_graph logic as Interactive Explorer HTML
-# ============================================================================
-
-def _find_matching_function(function_name: str) -> str:
-    """Find exact or partial match in covered functions."""
-    # Try exact match first
-    if function_name in state.covered_functions:
-        return function_name
-    # Try partial match
-    for func in state.covered_functions:
-        if function_name.lower() in func.lower():
-            return func
-    return ""
-
-
-def _find_all_children(func_name: str) -> list:
-    """Find ALL children (callees) of a function - matches Interactive Explorer findAllChildren()."""
-    return state.call_graph.get(func_name, [])
-
-
-def _find_all_parents(func_name: str) -> list:
-    """Find ALL parents (callers) of a function - matches Interactive Explorer findAllParents()."""
-    return state.reverse_call_graph.get(func_name, [])
-
-
-def _find_downstream_path(func_name: str, visited: set = None) -> list:
-    """
-    Find all downstream nodes (callees) recursively.
-    Matches Interactive Explorer findDownstreamPath().
-    """
-    if visited is None:
-        visited = set()
-    if func_name in visited:
-        return []
-    visited.add(func_name)
-
-    callees = state.call_graph.get(func_name, [])
-    downstream = []
-
-    for callee in callees:
-        downstream.append(callee)
-        downstream.extend(_find_downstream_path(callee, visited))
-
-    return list(set(downstream))
-
-
-def _find_upstream_path(func_name: str, visited: set = None) -> list:
-    """
-    Find all upstream nodes (callers) recursively.
-    Matches Interactive Explorer findUpstreamPath().
-    """
-    if visited is None:
-        visited = set()
-    if func_name in visited:
-        return []
-    visited.add(func_name)
-
-    callers = state.reverse_call_graph.get(func_name, [])
-    upstream = []
-
-    for caller in callers:
-        upstream.append(caller)
-        upstream.extend(_find_upstream_path(caller, visited))
-
-    return list(set(upstream))
-
-
-def _find_root_caller(func_name: str) -> str:
-    """
-    Find the root caller (entry point) for a function.
-    Matches Interactive Explorer findRootCaller().
-    """
-    current = func_name
-    visited = set()
-
-    while True:
-        if current in visited:
-            break
-        visited.add(current)
-
-        callers = state.reverse_call_graph.get(current, [])
-        if not callers:
-            return current  # No callers - this is the root
-
-        # Follow the first caller (primary path)
-        current = callers[0]
-
-    return current
-
-
-@server.tool()
-async def explorer_get_function_details(function_name: str) -> str:
-    """
-    Get detailed information about a specific function from trace data.
-
-    Use this when an LLM needs to understand what a function does, its performance,
-    who calls it, and what it calls. Uses exact same call_graph logic as Interactive Explorer.
-
-    Args:
-        function_name: Full or partial function name (e.g., "MyClass.method" or just "method")
-
-    Returns:
-        JSON with function details: file, line, calls, performance, callees, callers
-    """
-    global state
-
-    if not state.call_graph and not state.performance_data:
-        return "No trace data available. Connect to trace server and collect events first."
-
-    # Find matching functions
-    matches = []
-    for func_key in state.covered_functions:
-        if function_name.lower() in func_key.lower():
-            perf_data = state.performance_data.get(func_key, {})
-            func_info = state.function_info.get(func_key, {})
-
-            # Get callees and callers using call_graph (same as Interactive Explorer)
-            callees = _find_all_children(func_key)
-            callers = _find_all_parents(func_key)
-
-            avg_ms = perf_data.get("total_ms", 0) / perf_data.get("calls", 1) if perf_data.get("calls", 0) > 0 else 0
-
-            matches.append({
-                "function": func_key,
-                "file": func_info.get("file", perf_data.get("file", "unknown")),
-                "line": func_info.get("line", perf_data.get("line", 0)),
-                "module": func_info.get("module", ""),
-                "calls": perf_data.get("calls", 0),
-                "total_ms": round(perf_data.get("total_ms", 0), 2),
-                "avg_ms": round(avg_ms, 2),
-                "max_ms": round(perf_data.get("max_ms", 0), 2),
-                "callees": callees[:20],
-                "callers": callers[:20],
-                "callees_count": len(callees),
-                "callers_count": len(callers),
-                "is_entry_point": len(callers) == 0
-            })
-
-    if not matches:
-        return f"No function matching '{function_name}' found in traces."
-
-    # Sort by calls (most called first)
-    matches.sort(key=lambda x: x["calls"], reverse=True)
-
-    return json.dumps({
-        "query": function_name,
-        "matches": matches[:10],
-        "total_matches": len(matches)
-    }, indent=2)
-
-
-@server.tool()
-async def explorer_get_callees(function_name: str, max_depth: int = 2) -> str:
-    """
-    Get all functions called by a specific function (outgoing call edges).
-
-    Use this to understand what other code a function depends on.
-    Uses exact same call_graph logic as Interactive Explorer findDownstreamPath().
-
-    Args:
-        function_name: Function to analyze
-        max_depth: How deep to follow the call chain (default: 2)
-
-    Returns:
-        JSON tree of called functions with their metrics
-    """
-    global state
-
-    if not state.call_graph:
-        return "No call graph data available. Connect to trace server and collect events first."
-
-    # Find exact function
-    func = _find_matching_function(function_name)
-    if not func:
-        return f"Function '{function_name}' not found in traces."
-
-    def build_callee_tree(func_name: str, depth: int, visited: set) -> list:
-        if depth > max_depth or func_name in visited:
-            return []
-        visited.add(func_name)
-
-        result = []
-        callees = _find_all_children(func_name)
-
-        for callee in callees:
-            perf = state.performance_data.get(callee, {})
-            result.append({
-                "function": callee,
-                "calls": perf.get("calls", 0),
-                "total_ms": round(perf.get("total_ms", 0), 2),
-                "is_covered": callee in state.covered_functions,
-                "children": build_callee_tree(callee, depth + 1, visited.copy()) if depth + 1 <= max_depth else []
-            })
-
-        return result
-
-    tree = build_callee_tree(func, 0, set())
-
-    # Also get flat list of all downstream functions
-    all_downstream = _find_downstream_path(func)
-
-    return json.dumps({
-        "function": func,
-        "max_depth": max_depth,
-        "callees_tree": tree,
-        "all_downstream": all_downstream[:50],
-        "total_downstream": len(all_downstream)
-    }, indent=2)
-
-
-@server.tool()
-async def explorer_get_callers(function_name: str, max_depth: int = 2) -> str:
-    """
-    Get all functions that call a specific function (incoming call edges).
-
-    Use this to understand what code depends on a function.
-    Uses exact same call_graph logic as Interactive Explorer findUpstreamPath().
-
-    Args:
-        function_name: Function to analyze
-        max_depth: How deep to follow the caller chain (default: 2)
-
-    Returns:
-        JSON tree of calling functions
-    """
-    global state
-
-    if not state.reverse_call_graph:
-        return "No call graph data available. Connect to trace server and collect events first."
-
-    # Find exact function
-    func = _find_matching_function(function_name)
-    if not func:
-        return f"Function '{function_name}' not found in traces."
-
-    def build_caller_tree(func_name: str, depth: int, visited: set) -> list:
-        if depth > max_depth or func_name in visited:
-            return []
-        visited.add(func_name)
-
-        result = []
-        callers = _find_all_parents(func_name)
-
-        for caller in callers:
-            perf = state.performance_data.get(caller, {})
-            result.append({
-                "function": caller,
-                "calls": perf.get("calls", 0),
-                "total_ms": round(perf.get("total_ms", 0), 2),
-                "is_covered": caller in state.covered_functions,
-                "callers": build_caller_tree(caller, depth + 1, visited.copy()) if depth + 1 <= max_depth else []
-            })
-
-        return result
-
-    tree = build_caller_tree(func, 0, set())
-
-    # Also get flat list of all upstream functions and root caller
-    all_upstream = _find_upstream_path(func)
-    root = _find_root_caller(func)
-
-    return json.dumps({
-        "function": func,
-        "max_depth": max_depth,
-        "callers_tree": tree,
-        "all_upstream": all_upstream[:50],
-        "total_upstream": len(all_upstream),
-        "root_caller": root if root != func else None
-    }, indent=2)
-
-
-@server.tool()
-async def explorer_search(query: str, search_type: str = "function") -> str:
-    """
-    Search for functions, modules, or files in the trace data.
-
-    Use this to find code elements by name or pattern.
-    Uses same data structures as Interactive Explorer.
-
-    Args:
-        query: Search query (partial match supported)
-        search_type: What to search - function, module, file, all
-
-    Returns:
-        JSON array of matching items with metadata
-    """
-    global state
-
-    results = []
-    query_lower = query.lower()
-
-    for func_key in state.covered_functions:
-        perf_data = state.performance_data.get(func_key, {})
-        func_info = state.function_info.get(func_key, {})
-
-        match = False
-        module_name = func_key.rsplit(".", 1)[0] if "." in func_key else ""
-        func_name = func_key.rsplit(".", 1)[-1] if "." in func_key else func_key
-        file_path = func_info.get("file", perf_data.get("file", ""))
-
-        if search_type in ["function", "all"] and query_lower in func_name.lower():
-            match = True
-        if search_type in ["module", "all"] and query_lower in module_name.lower():
-            match = True
-        if search_type in ["file", "all"] and query_lower in file_path.lower():
-            match = True
-
-        if match:
-            callees = _find_all_children(func_key)
-            callers = _find_all_parents(func_key)
-            results.append({
-                "function": func_key,
-                "module": module_name,
-                "name": func_name,
-                "file": file_path,
-                "line": func_info.get("line", perf_data.get("line", 0)),
-                "calls": perf_data.get("calls", 0),
-                "total_ms": round(perf_data.get("total_ms", 0), 2),
-                "callees_count": len(callees),
-                "callers_count": len(callers),
-                "is_entry_point": len(callers) == 0
-            })
-
-    # Sort by calls (most called first)
-    results.sort(key=lambda x: x["calls"], reverse=True)
-
-    return json.dumps({
-        "query": query,
-        "search_type": search_type,
-        "results": results[:50],
-        "total_matches": len(results)
-    }, indent=2)
-
-
-@server.tool()
-async def explorer_get_hot_paths(limit: int = 10) -> str:
-    """
-    Get the most frequently executed code paths (hot paths).
-
-    Use this to identify performance-critical execution flows.
-    Analyzes call_graph to find heavily traversed paths.
-
-    Args:
-        limit: Number of hot paths to return
-
-    Returns:
-        JSON array of hot paths with call sequences and metrics
-    """
-    global state
-
-    if not state.call_graph:
-        return "No call graph data available."
-
-    # Find entry points (functions with no callers)
-    entry_points = [f for f in state.covered_functions if not _find_all_parents(f)]
-
-    # Build paths from each entry point
-    paths = []
-
-    for entry in entry_points:
-        # DFS to collect all paths from this entry
-        def collect_paths(func: str, current_path: list, visited: set):
-            if func in visited or len(current_path) > 10:
-                return
-            visited.add(func)
-            current_path.append(func)
-
-            callees = _find_all_children(func)
-            if not callees:
-                # Leaf node - record path
-                perf = state.performance_data.get(func, {})
-                path_total_ms = sum(state.performance_data.get(f, {}).get("total_ms", 0) for f in current_path)
-                path_total_calls = min(state.performance_data.get(f, {}).get("calls", 0) for f in current_path) if current_path else 0
-                paths.append({
-                    "entry_point": entry,
-                    "path": " -> ".join(current_path[:5]) + ("..." if len(current_path) > 5 else ""),
-                    "functions": current_path.copy(),
-                    "depth": len(current_path),
-                    "path_total_ms": round(path_total_ms, 2),
-                    "min_calls_in_path": path_total_calls
-                })
-            else:
-                for callee in callees[:5]:  # Limit branching
-                    collect_paths(callee, current_path.copy(), visited.copy())
-
-        collect_paths(entry, [], set())
-
-    # Sort by execution frequency (min_calls_in_path as proxy)
-    paths.sort(key=lambda x: x["min_calls_in_path"], reverse=True)
-
-    return json.dumps({
-        "hot_paths": paths[:limit],
-        "total_paths_analyzed": len(paths),
-        "entry_points": entry_points[:20]
-    }, indent=2)
-
-
-@server.tool()
-async def explorer_get_coverage_summary() -> str:
-    """
-    Get code coverage summary from trace data.
-
-    Use this to understand what percentage of code has been executed.
-    Uses same call_graph analysis as Interactive Explorer.
-
-    Returns:
-        JSON with coverage statistics by module and overall
-    """
-    global state
-
-    if not state.covered_functions:
-        return "No trace data available."
-
-    # Find entry points (no callers) and leaf nodes (no callees)
-    entry_points = []
-    leaf_nodes = []
-    for func in state.covered_functions:
-        callers = _find_all_parents(func)
-        callees = _find_all_children(func)
-        if not callers:
-            entry_points.append(func)
-        if not callees:
-            leaf_nodes.append(func)
-
-    # Group by module
-    modules = {}
-    for func_key in state.covered_functions:
-        perf_data = state.performance_data.get(func_key, {})
-        module = func_key.rsplit(".", 1)[0] if "." in func_key else "unknown"
-        if module not in modules:
-            modules[module] = {
-                "functions_covered": 0,
-                "total_calls": 0,
-                "total_ms": 0,
-                "entry_points": 0,
-                "functions": []
-            }
-        modules[module]["functions_covered"] += 1
-        modules[module]["total_calls"] += perf_data.get("calls", 0)
-        modules[module]["total_ms"] += perf_data.get("total_ms", 0)
-        modules[module]["functions"].append(func_key.rsplit(".", 1)[-1])
-        if func_key in entry_points:
-            modules[module]["entry_points"] += 1
-
-    # Calculate totals
-    total_functions = len(state.covered_functions)
-    total_calls = sum(state.performance_data.get(f, {}).get("calls", 0) for f in state.covered_functions)
-    total_ms = sum(state.performance_data.get(f, {}).get("total_ms", 0) for f in state.covered_functions)
-
-    # Call graph stats
-    total_edges = sum(len(callees) for callees in state.call_graph.values())
-
-    # Add dead code info if available
-    dead_code_info = {}
-    if state.dead_code_data:
-        dead_code_info = {
-            "total_defined": state.dead_code_data.get("total_defined", 0),
-            "dead_count": state.dead_code_data.get("dead_count", 0),
-            "coverage_percent": state.dead_code_data.get("coverage_percent", 0)
-        }
-
-    # Sort modules by activity
-    module_summary = [
-        {
-            "module": m,
-            "functions_covered": d["functions_covered"],
-            "total_calls": d["total_calls"],
-            "total_ms": round(d["total_ms"], 2),
-            "entry_points": d["entry_points"]
-        }
-        for m, d in sorted(modules.items(), key=lambda x: x[1]["total_calls"], reverse=True)
-    ][:20]
-
-    return json.dumps({
-        "summary": {
-            "total_functions_executed": total_functions,
-            "total_function_calls": total_calls,
-            "total_execution_time_ms": round(total_ms, 2),
-            "unique_modules": len(modules),
-            "call_graph_edges": total_edges,
-            "entry_points_count": len(entry_points),
-            "leaf_nodes_count": len(leaf_nodes)
-        },
-        "entry_points": entry_points[:10],
-        "dead_code": dead_code_info,
-        "modules": module_summary
-    }, indent=2)
-
-
-@server.tool()
-async def explorer_explain_function(function_name: str) -> str:
-    """
-    Get an AI-powered explanation of a function's behavior based on trace data.
-
-    Combines trace context with AI to explain what a function does,
-    its performance characteristics, and its role in the codebase.
-
-    Args:
-        function_name: Function to explain
-
-    Returns:
-        AI-generated explanation with trace context
-    """
-    global state
-
-    # Get function details first
-    details_json = await explorer_get_function_details(function_name)
-    details = json.loads(details_json)
-
-    if "matches" not in details or not details["matches"]:
-        return f"Function '{function_name}' not found in traces."
-
-    func_info = details["matches"][0]
-
-    # Build context for AI
-    context = f"""
-Function: {func_info['function']}
-File: {func_info['file']}:{func_info['line']}
-
-Performance Metrics:
-- Called {func_info['calls']} times
-- Total time: {func_info['total_ms']}ms
-- Average time: {func_info['avg_ms']}ms per call
-- Max time: {func_info['max_ms']}ms
-
-Calls these functions ({func_info['callees_count']} callees):
-{', '.join(func_info['callees'][:10]) if func_info['callees'] else 'None recorded'}
-
-Called by ({func_info['callers_count']} callers):
-{', '.join(func_info['callers'][:10]) if func_info['callers'] else 'Entry point or not recorded'}
-"""
-
-    # Try to get AI explanation
-    try:
-        import urllib.request
-
-        prompt = f"""Based on the runtime trace data below, explain what this function does and its role in the codebase.
-Focus on:
-1. What the function's purpose appears to be
-2. Its performance characteristics (is it called often? is it slow?)
-3. Its dependencies (what it calls) and dependents (what calls it)
-4. Any potential concerns (e.g., called too often, takes too long)
-
-{context}
-
-Provide a concise technical explanation."""
-
-        payload = json.dumps({
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 512,
-            "temperature": 0.7
-        }).encode('utf-8')
-
-        req = urllib.request.Request(
-            "http://127.0.0.1:8080/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"}
-        )
-
-        response = urllib.request.urlopen(req, timeout=60)
-        result = json.loads(response.read().decode('utf-8'))
-        ai_explanation = result["choices"][0]["message"]["content"]
-
-        return json.dumps({
-            "function": func_info['function'],
-            "metrics": {
-                "calls": func_info['calls'],
-                "total_ms": func_info['total_ms'],
-                "avg_ms": func_info['avg_ms']
-            },
-            "ai_explanation": ai_explanation
-        }, indent=2)
-
-    except Exception as e:
-        # Return just the metrics if AI is not available
-        return json.dumps({
-            "function": func_info['function'],
-            "metrics": func_info,
-            "ai_explanation": f"AI server not available: {str(e)}. Start with ai_server_start().",
-            "context": context
-        }, indent=2)
-
-
-@server.tool()
-async def explorer_get_call_graph(module_filter: str = "") -> str:
-    """
-    Get the full call graph structure as used by Interactive Explorer.
-
-    Use this to understand the overall code structure and relationships.
-    This is the same data structure that Interactive Explorer visualizes as 3D nodes.
-
-    Args:
-        module_filter: Optional filter to only include functions from specific module
-
-    Returns:
-        JSON with call_graph (caller->callees) and reverse_call_graph (callee->callers)
-    """
-    global state
-
-    if not state.call_graph:
-        return "No call graph data available. Connect to trace server and collect events first."
-
-    # Apply module filter if provided
-    if module_filter:
-        filter_lower = module_filter.lower()
-        filtered_call_graph = {
-            caller: [c for c in callees if filter_lower in c.lower()]
-            for caller, callees in state.call_graph.items()
-            if filter_lower in caller.lower()
-        }
-        filtered_reverse = {
-            callee: [c for c in callers if filter_lower in c.lower()]
-            for callee, callers in state.reverse_call_graph.items()
-            if filter_lower in callee.lower()
-        }
-        filtered_functions = [f for f in state.covered_functions if filter_lower in f.lower()]
-    else:
-        filtered_call_graph = dict(state.call_graph)
-        filtered_reverse = dict(state.reverse_call_graph)
-        filtered_functions = list(state.covered_functions)
-
-    # Find entry points and leaf nodes
-    entry_points = [f for f in filtered_functions if f not in filtered_reverse or not filtered_reverse[f]]
-    leaf_nodes = [f for f in filtered_functions if f not in filtered_call_graph or not filtered_call_graph[f]]
-
-    return json.dumps({
-        "call_graph": filtered_call_graph,
-        "reverse_call_graph": filtered_reverse,
-        "functions": filtered_functions[:100],
-        "total_functions": len(filtered_functions),
-        "total_edges": sum(len(v) for v in filtered_call_graph.values()),
-        "entry_points": entry_points[:20],
-        "leaf_nodes": leaf_nodes[:20],
-        "module_filter": module_filter or "none"
-    }, indent=2)
-
-
-@server.tool()
-async def explorer_find_path(source: str, target: str) -> str:
-    """
-    Find the call path between two functions.
-
-    Use this to understand how one function reaches another through the call chain.
-    Similar to navigating between nodes in Interactive Explorer.
-
-    Args:
-        source: Starting function name
-        target: Target function name to reach
-
-    Returns:
-        JSON with the path from source to target (if reachable)
-    """
-    global state
-
-    if not state.call_graph:
-        return "No call graph data available."
-
-    # Find exact matches
-    source_func = _find_matching_function(source)
-    target_func = _find_matching_function(target)
-
-    if not source_func:
-        return f"Source function '{source}' not found in traces."
-    if not target_func:
-        return f"Target function '{target}' not found in traces."
-
-    # BFS to find shortest path from source to target (downstream)
-    def find_downstream_path():
-        queue = [(source_func, [source_func])]
-        visited = {source_func}
-
-        while queue:
-            current, path = queue.pop(0)
-            if current == target_func:
-                return path
-
-            for callee in state.call_graph.get(current, []):
-                if callee not in visited:
-                    visited.add(callee)
-                    queue.append((callee, path + [callee]))
-
-        return None
-
-    # BFS to find path from source to target (upstream - target calls source)
-    def find_upstream_path():
-        queue = [(source_func, [source_func])]
-        visited = {source_func}
-
-        while queue:
-            current, path = queue.pop(0)
-            if current == target_func:
-                return list(reversed(path))
-
-            for caller in state.reverse_call_graph.get(current, []):
-                if caller not in visited:
-                    visited.add(caller)
-                    queue.append((caller, path + [caller]))
-
-        return None
-
-    downstream_path = find_downstream_path()
-    upstream_path = find_upstream_path()
-
-    result = {
-        "source": source_func,
-        "target": target_func
-    }
-
-    if downstream_path:
-        result["downstream_path"] = {
-            "direction": f"{source_func} calls ... calls {target_func}",
-            "path": downstream_path,
-            "length": len(downstream_path) - 1,
-            "path_string": " -> ".join(downstream_path)
-        }
-
-    if upstream_path:
-        result["upstream_path"] = {
-            "direction": f"{target_func} calls ... calls {source_func}",
-            "path": upstream_path,
-            "length": len(upstream_path) - 1,
-            "path_string": " -> ".join(upstream_path)
-        }
-
-    if not downstream_path and not upstream_path:
-        result["reachable"] = False
-        result["message"] = f"No call path exists between {source_func} and {target_func}"
-    else:
-        result["reachable"] = True
-
-    return json.dumps(result, indent=2)
-
-
-# ============================================================================
-# RESOURCES (for MCP resource protocol)
-# ============================================================================
-
-@server.resource("trueflow://traces/latest")
-async def get_latest_traces() -> str:
-    """Get the latest trace events as a resource."""
-    return json.dumps(state.trace_events[-100:], indent=2)
-
-
-@server.resource("trueflow://performance/summary")
-async def get_performance_summary() -> str:
-    """Get performance analysis summary as a resource."""
-    return json.dumps(state.performance_data, indent=2)
-
-
-@server.resource("trueflow://deadcode/report")
-async def get_deadcode_report() -> str:
-    """Get dead code analysis report as a resource."""
-    return json.dumps(state.dead_code_data, indent=2)
-
-
-# ============================================================================
-# MAIN ENTRY POINT
+# MAIN
 # ============================================================================
 
 async def main():
     """Run the MCP server."""
-    logger.info("Starting TrueFlow MCP Server...")
+    logger.info("Starting TrueFlow MCP Server (Claude-compatible)...")
     logger.info(f"Project directory: {state.project_dir}")
-
-    # Run with stdio transport (standard MCP protocol)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 

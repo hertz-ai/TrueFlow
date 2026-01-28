@@ -142,11 +142,415 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         val explanation: String? = null
     )
 
+    // ==================== AUTO-EXPLAIN CACHE SYSTEM ====================
+
+    /**
+     * Cached AI explanation for a dead function.
+     * Keyed by function signature + content hash for invalidation.
+     */
+    data class CachedExplanation(
+        val functionName: String,
+        val filePath: String,
+        val line: Int,
+        val contentHash: String,  // Hash of function source for cache invalidation
+        val whyNotCovered: String,  // Root cause type
+        val explanation: String,  // AI-generated explanation
+        val timestamp: Long,  // When this was generated
+        val modelUsed: String = "unknown"  // Which model generated this
+    )
+
+    /**
+     * Cache manager for auto-explain functionality.
+     * Stores explanations persistently and manages background processing.
+     */
+    private inner class ExplanationCacheManager {
+        private val cache = mutableMapOf<String, CachedExplanation>()
+        private val cacheFile = File(PluginPaths.getPluginRoot(project), "explanation_cache.json")
+        private val pendingQueue = java.util.concurrent.ConcurrentLinkedQueue<String>()  // Function names to explain
+        private val priorityFunctions = java.util.concurrent.ConcurrentHashMap<String, Long>()  // funcName -> priority timestamp
+        private var isProcessing = false
+        private var lastUserRequestTime = System.currentTimeMillis()
+        private val idleThresholdMs = 5000L  // 5 seconds of idle before auto-processing
+        private var backgroundWorker: java.util.concurrent.ScheduledExecutorService? = null
+        private var isShutdown = false
+
+        init {
+            loadCache()
+            startBackgroundWorker()
+        }
+
+        fun getCacheKey(funcName: String, filePath: String): String {
+            return "$funcName@$filePath"
+        }
+
+        fun getExplanation(funcName: String, filePath: String): CachedExplanation? {
+            val key = getCacheKey(funcName, filePath)
+            return cache[key]
+        }
+
+        fun hasValidExplanation(funcName: String, filePath: String, contentHash: String): Boolean {
+            val cached = getExplanation(funcName, filePath)
+            return cached != null && cached.contentHash == contentHash
+        }
+
+        fun storeExplanation(explanation: CachedExplanation) {
+            val key = getCacheKey(explanation.functionName, explanation.filePath)
+            cache[key] = explanation
+            saveCache()
+
+            // Notify Interactive Explorer of the cached explanation
+            notifyExplorerOfCachedExplanation(explanation)
+        }
+
+        fun markUserActivity() {
+            lastUserRequestTime = System.currentTimeMillis()
+        }
+
+        fun isIdle(): Boolean {
+            return System.currentTimeMillis() - lastUserRequestTime > idleThresholdMs
+        }
+
+        /**
+         * Prioritize a function for explanation (user searched or focused on it).
+         * These get processed before regular queue items.
+         */
+        fun prioritizeFunction(funcName: String, reason: String = "user_interaction") {
+            // Add to priority map with current timestamp (higher = more recent = higher priority)
+            priorityFunctions[funcName] = System.currentTimeMillis()
+
+            // Also ensure it's in the pending queue
+            if (!pendingQueue.contains(funcName)) {
+                pendingQueue.add(funcName)
+            }
+            PluginLogger.info("[AutoExplain] Prioritized: $funcName ($reason)")
+        }
+
+        /**
+         * Prioritize multiple functions (e.g., search results).
+         */
+        fun prioritizeFunctions(funcNames: List<String>, reason: String = "search") {
+            val timestamp = System.currentTimeMillis()
+            funcNames.forEach { funcName ->
+                priorityFunctions[funcName] = timestamp
+                if (!pendingQueue.contains(funcName)) {
+                    pendingQueue.add(funcName)
+                }
+            }
+            if (funcNames.isNotEmpty()) {
+                PluginLogger.info("[AutoExplain] Prioritized ${funcNames.size} functions ($reason)")
+            }
+        }
+
+        fun queueForExplanation(funcName: String) {
+            if (!pendingQueue.contains(funcName)) {
+                pendingQueue.add(funcName)
+                PluginLogger.info("[AutoExplain] Queued: $funcName (queue size: ${pendingQueue.size})")
+            }
+        }
+
+        fun queueDeadFunctions(deadFunctions: List<String>) {
+            deadFunctions.forEach { funcName ->
+                val funcInfo = visualizationData?.functions?.get(funcName)
+                val filePath = funcInfo?.file ?: ""
+                val contentHash = computeContentHash(funcName, filePath, funcInfo?.line ?: 0)
+
+                // Only queue if not already cached with valid hash
+                if (!hasValidExplanation(funcName, filePath, contentHash)) {
+                    queueForExplanation(funcName)
+                }
+            }
+            PluginLogger.info("[AutoExplain] Queued ${pendingQueue.size} functions for auto-explanation")
+        }
+
+        /**
+         * Compute a content hash that captures everything affecting the explanation:
+         * 1. Source code of the function
+         * 2. Coverage status (dead/alive)
+         * 3. Callers (who calls this function)
+         * 4. Callees (what this function calls)
+         * 5. whyNotCovered reason
+         *
+         * Cache is invalidated when any of these change.
+         */
+        private fun computeContentHash(funcName: String, filePath: String, line: Int): String {
+            val data = visualizationData ?: return "no_data"
+            if (filePath.isEmpty() || line <= 0) return "unknown"
+
+            try {
+                val sb = StringBuilder()
+
+                // 1. Source code hash
+                val file = File(filePath)
+                if (file.exists()) {
+                    val lines = file.readLines()
+                    val startIdx = maxOf(0, line - 1)
+                    val endIdx = minOf(lines.size, line + 50)
+                    val sourceCode = lines.subList(startIdx, endIdx).joinToString("\n")
+                    sb.append("src:${sourceCode.hashCode()};")
+                }
+
+                // 2. Coverage status (dead/alive)
+                val isAlive = data.coveredFunctions?.contains(funcName) == true
+                sb.append("alive:$isAlive;")
+
+                // 3. Callers (sorted for consistent hash)
+                val callers = data.callGraph?.filterValues { it.contains(funcName) }?.keys?.sorted() ?: emptyList()
+                val aliveCallers = callers.filter { data.coveredFunctions?.contains(it) == true }
+                val deadCallers = callers.filter { data.coveredFunctions?.contains(it) != true }
+                sb.append("callers:${callers.hashCode()};")
+                sb.append("aliveCallers:${aliveCallers.size};deadCallers:${deadCallers.size};")
+
+                // 4. Callees (what this function calls)
+                val callees = data.callGraph?.get(funcName)?.sorted() ?: emptyList()
+                sb.append("callees:${callees.hashCode()};")
+
+                // 5. whyNotCovered reason
+                val whyInfo = data.whyNotCovered?.get(funcName)
+                val whyReason = whyInfo?.rootCause ?: ""
+                sb.append("why:$whyReason;")
+
+                return sb.toString().hashCode().toString(16)
+            } catch (e: Exception) {
+                return "error"
+            }
+        }
+
+        private fun startBackgroundWorker() {
+            backgroundWorker = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+                Thread(r, "TrueFlow-AutoExplain").apply { isDaemon = true }
+            }
+
+            backgroundWorker?.scheduleWithFixedDelay({
+                if (!isShutdown) {
+                    processQueueIfIdle()
+                }
+            }, 10, 3, java.util.concurrent.TimeUnit.SECONDS)  // Check every 3 seconds
+        }
+
+        /**
+         * Select the next function to process, prioritizing user-interacted items.
+         * Returns null if queue is empty.
+         */
+        private fun selectNextFunction(): String? {
+            if (pendingQueue.isEmpty()) return null
+
+            // Find highest priority item (most recently user-interacted)
+            val prioritized = pendingQueue.filter { priorityFunctions.containsKey(it) }
+            if (prioritized.isNotEmpty()) {
+                // Sort by timestamp descending (most recent first)
+                val best = prioritized.maxByOrNull { priorityFunctions[it] ?: 0L }
+                if (best != null) {
+                    pendingQueue.remove(best)
+                    return best
+                }
+            }
+
+            // No priority items, just poll normally
+            return pendingQueue.poll()
+        }
+
+        private fun processQueueIfIdle() {
+            if (isProcessing || pendingQueue.isEmpty()) return
+
+            // Check if AI is idle (no user requests recently)
+            if (!isIdle()) {
+                return
+            }
+
+            // Check if AI server is running and not busy
+            val aiPanel = findAIExplanationPanel()
+            if (aiPanel == null || !aiPanel.isServerRunning()) {
+                return
+            }
+
+            // Process priority items first (user searches/focused nodes)
+            val funcName = selectNextFunction() ?: return
+            isProcessing = true
+
+            val isPriority = priorityFunctions.containsKey(funcName)
+            priorityFunctions.remove(funcName)  // Clear priority after selection
+            PluginLogger.info("[AutoExplain] Processing${if (isPriority) " (PRIORITY)" else ""}: $funcName (remaining: ${pendingQueue.size})")
+
+            try {
+                processAutoExplain(funcName, aiPanel)
+            } catch (e: Exception) {
+                PluginLogger.error("[AutoExplain] Error processing $funcName", e)
+                isProcessing = false
+            }
+        }
+
+        private fun processAutoExplain(funcName: String, aiPanel: AIExplanationPanel) {
+            val data = visualizationData ?: run {
+                isProcessing = false
+                return
+            }
+
+            val funcInfo = data.functions[funcName]
+            val whyInfo = data.whyNotCovered[funcName]
+
+            if (funcInfo == null || whyInfo == null) {
+                isProcessing = false
+                return
+            }
+
+            val filePath = funcInfo.file ?: ""
+            val line = funcInfo.line
+            val contentHash = computeContentHash(funcName, filePath, line)
+
+            // Check cache again (might have been filled by user request)
+            if (hasValidExplanation(funcName, filePath, contentHash)) {
+                PluginLogger.info("[AutoExplain] Already cached: $funcName")
+                isProcessing = false
+                return
+            }
+
+            // Build minimal context for auto-explain (less verbose than user-triggered)
+            val sourceCode = readFunctionSource(filePath, line)
+            val rootCause = whyInfo.rootCause
+            val callerInfo = whyInfo.rootCauseDetail
+
+            val prompt = buildAutoExplainPrompt(funcName, rootCause, sourceCode, callerInfo)
+
+            // Call AI asynchronously
+            java.util.concurrent.CompletableFuture.runAsync {
+                try {
+                    aiPanel.askQuestion(prompt, sourceCode, null) { response ->
+                        // Store in cache
+                        val explanation = CachedExplanation(
+                            functionName = funcName,
+                            filePath = filePath,
+                            line = line,
+                            contentHash = contentHash,
+                            whyNotCovered = rootCause,
+                            explanation = response,
+                            timestamp = System.currentTimeMillis(),
+                            modelUsed = "auto"
+                        )
+                        storeExplanation(explanation)
+                        PluginLogger.info("[AutoExplain] Cached explanation for: $funcName")
+                        isProcessing = false
+                    }
+                } catch (e: Exception) {
+                    PluginLogger.error("[AutoExplain] Failed to get explanation for $funcName", e)
+                    isProcessing = false
+                }
+            }
+        }
+
+        private fun readFunctionSource(filePath: String, line: Int): String {
+            if (filePath.isEmpty() || line <= 0) return ""
+            try {
+                val file = File(filePath)
+                if (!file.exists()) return ""
+                val lines = file.readLines()
+                val startIdx = maxOf(0, line - 1)
+                val endIdx = minOf(lines.size, line + 30)
+                return lines.subList(startIdx, endIdx).joinToString("\n")
+            } catch (e: Exception) {
+                return ""
+            }
+        }
+
+        private fun buildAutoExplainPrompt(
+            funcName: String,
+            rootCause: String,
+            sourceCode: String,
+            callerInfo: WhyNotCoveredDetail?
+        ): String {
+            return buildString {
+                append("Briefly explain why this function is not executed (1-2 sentences):\n\n")
+                append("Function: $funcName\n")
+                append("Reason: $rootCause\n")
+                if (callerInfo?.caller != null) {
+                    append("Caller: ${callerInfo.caller}\n")
+                }
+                if (sourceCode.isNotEmpty()) {
+                    append("\nCode:\n```python\n$sourceCode\n```\n")
+                }
+                append("\nProvide a concise explanation suitable for display as a tooltip.")
+            }
+        }
+
+        private fun loadCache() {
+            try {
+                if (cacheFile.exists()) {
+                    val json = cacheFile.readText()
+                    val type = object : com.google.gson.reflect.TypeToken<Map<String, CachedExplanation>>() {}.type
+                    val loaded: Map<String, CachedExplanation>? = gson.fromJson<Map<String, CachedExplanation>>(json, type)
+                    if (loaded != null) {
+                        cache.clear()
+                        cache.putAll(loaded)
+                    }
+                    PluginLogger.info("[AutoExplain] Loaded ${cache.size} cached explanations")
+                }
+            } catch (e: Exception) {
+                PluginLogger.warn("[AutoExplain] Failed to load cache: ${e.message}")
+            }
+        }
+
+        private fun saveCache() {
+            try {
+                cacheFile.parentFile?.mkdirs()
+                val json = gson.toJson(cache)
+                cacheFile.writeText(json)
+            } catch (e: Exception) {
+                PluginLogger.warn("[AutoExplain] Failed to save cache: ${e.message}")
+            }
+        }
+
+        fun shutdown() {
+            isShutdown = true
+            backgroundWorker?.shutdown()
+            saveCache()
+        }
+
+        fun getCacheStats(): Map<String, Any> {
+            return mapOf(
+                "totalCached" to cache.size,
+                "pendingQueue" to pendingQueue.size,
+                "isProcessing" to isProcessing,
+                "isIdle" to isIdle()
+            )
+        }
+    }
+
+    // Explanation cache instance
+    private var explanationCache: ExplanationCacheManager? = null
+
+    private fun notifyExplorerOfCachedExplanation(explanation: CachedExplanation) {
+        ApplicationManager.getApplication().invokeLater {
+            val escapedExplanation = explanation.explanation
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "")
+
+            val message = """
+                {
+                    "type": "cached_explanation",
+                    "function": "${explanation.functionName}",
+                    "explanation": "$escapedExplanation",
+                    "whyNotCovered": "${explanation.whyNotCovered}",
+                    "cached": true
+                }
+            """.trimIndent()
+
+            interactiveBrowser?.cefBrowser?.executeJavaScript(
+                "if (typeof handleCachedExplanation === 'function') { handleCachedExplanation($message); }",
+                "", 0
+            )
+        }
+    }
+
+    // ==================== END AUTO-EXPLAIN CACHE SYSTEM ====================
+
     init {
         border = JBUI.Borders.empty(10)
         createUI()
         scanForVideos()
         setupFileWatcher()
+        // Initialize auto-explain cache
+        explanationCache = ExplanationCacheManager()
     }
 
     private fun setupFileWatcher() {
@@ -201,6 +605,9 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         // Stop live server if running
         explorerServer?.stop()
         explorerServer = null
+        // Shutdown auto-explain cache
+        explanationCache?.shutdown()
+        explanationCache = null
     }
 
     private fun createUI() {
@@ -662,6 +1069,16 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                             JOptionPane.ERROR_MESSAGE
                         )
                     }
+                },
+                // Unified explain handler - routes through same logic as IDE mode
+                onExplainRequest = { funcName, filePath, isDead, whyNotCovered, onResult ->
+                    handleHttpExplainRequest(funcName, filePath, isDead, whyNotCovered, onResult)
+                },
+                // Prioritize handler - for preemptive caching based on user searches/focus
+                onPrioritizeRequest = { funcNames, reason ->
+                    funcNames.forEach { funcName ->
+                        explanationCache?.prioritizeFunction(funcName, reason)
+                    }
                 }
             )
 
@@ -673,6 +1090,122 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         } catch (e: Exception) {
             PluginLogger.error("Failed to start live server", e)
             updateLiveServerButton(false, null)
+        }
+    }
+
+    /**
+     * Handle explain request from HTTP server (browser mode).
+     * Uses same caching and prompt logic as IDE mode.
+     */
+    private fun handleHttpExplainRequest(
+        funcName: String,
+        filePath: String,
+        isDead: Boolean,
+        whyNotCovered: String?,
+        onResult: (String?, Boolean) -> Unit
+    ) {
+        // Mark user activity (pauses auto-explain)
+        explanationCache?.markUserActivity()
+
+        // Check cache first
+        if (isDead && filePath.isNotEmpty()) {
+            val cached = explanationCache?.getExplanation(funcName, filePath)
+            if (cached != null) {
+                PluginLogger.info("[HttpExplain] Using cached explanation for: $funcName")
+                onResult(cached.explanation, true)
+                return
+            }
+        }
+
+        // Check if AI server is running
+        val aiPanel = findAIExplanationPanel()
+        if (aiPanel == null || !aiPanel.isServerRunning()) {
+            PluginLogger.warn("[HttpExplain] AI server not running")
+            onResult(null, false)
+            return
+        }
+
+        // Get function info from visualization data
+        val funcInfo = visualizationData?.functions?.get(funcName)
+        val funcLine = funcInfo?.line ?: 0
+        val whyInfo = visualizationData?.whyNotCovered?.get(funcName)
+
+        // Build context and prompt (same as IDE mode)
+        java.util.concurrent.CompletableFuture.runAsync {
+            try {
+                // Read function source
+                val sourceCode = if (filePath.isNotEmpty() && funcLine > 0) {
+                    try {
+                        val file = File(filePath)
+                        if (file.exists()) {
+                            val lines = file.readLines()
+                            val startLine = maxOf(0, funcLine - 1)
+                            val endLine = minOf(lines.size, funcLine + 30)
+                            lines.subList(startLine, endLine).joinToString("\n")
+                        } else ""
+                    } catch (e: Exception) { "" }
+                } else ""
+
+                // Build prompt based on status
+                val prompt = buildString {
+                    if (isDead) {
+                        append("Analyze why this function is NOT being executed:\n\n")
+                        append("Function: $funcName\n")
+                        append("File: $filePath\n")
+                        if (whyNotCovered != null) {
+                            append("Root cause: $whyNotCovered\n")
+                        }
+                        if (sourceCode.isNotEmpty()) {
+                            append("\nSource code:\n```python\n$sourceCode\n```\n")
+                        }
+                        append("\nExplain why this code is not being executed and what would trigger it.")
+                    } else {
+                        append("Explain this function's purpose and behavior:\n\n")
+                        append("Function: $funcName\n")
+                        append("File: $filePath\n")
+                        if (sourceCode.isNotEmpty()) {
+                            append("\nSource code:\n```python\n$sourceCode\n```\n")
+                        }
+                        append("\nProvide a concise explanation.")
+                    }
+                }
+
+                // Call AI
+                aiPanel.askQuestion(prompt, sourceCode, null) { response ->
+                    // Cache the result for dead functions
+                    if (isDead && filePath.isNotEmpty() && whyNotCovered != null) {
+                        try {
+                            val file = File(filePath)
+                            val contentHash = if (file.exists() && funcLine > 0) {
+                                val lines = file.readLines()
+                                val startIdx = maxOf(0, funcLine - 1)
+                                val endIdx = minOf(lines.size, funcLine + 50)
+                                lines.subList(startIdx, endIdx).joinToString("\n").hashCode().toString(16)
+                            } else "unknown"
+
+                            val cached = CachedExplanation(
+                                functionName = funcName,
+                                filePath = filePath,
+                                line = funcLine,
+                                contentHash = contentHash,
+                                whyNotCovered = whyNotCovered,
+                                explanation = response,
+                                timestamp = System.currentTimeMillis(),
+                                modelUsed = "http-request"
+                            )
+                            explanationCache?.storeExplanation(cached)
+                            PluginLogger.info("[HttpExplain] Cached explanation for: $funcName")
+                        } catch (e: Exception) {
+                            PluginLogger.warn("[HttpExplain] Failed to cache: ${e.message}")
+                        }
+                    }
+
+                    onResult(response, false)
+                }
+            } catch (e: Exception) {
+                PluginLogger.error("[HttpExplain] Error: ${e.message}", e)
+                onResult(null, false)
+            }
         }
     }
 
@@ -857,14 +1390,27 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     val hasDeadIncomingPaths = json.get("hasDeadIncomingPaths")?.asBoolean ?: false
                     val deadCallers = json.getAsJsonArray("deadCallers")?.map { it.asString } ?: emptyList()
                     val aliveCallers = json.getAsJsonArray("aliveCallers")?.map { it.asString } ?: emptyList()
+                    val deadCallerFiles = json.getAsJsonArray("deadCallerFiles")  // File info to read dead caller source
 
                     if (funcName != null) {
                         handleExplainRequest(
                             funcName, funcFile, funcLine, isAlive, isDead, callCount, whyNotCovered,
                             rootCauseDetail, callChain, upstreamPath, downstreamPath,
                             directCallers, directCallees, chainFiles, chainDefs,
-                            hasDeadIncomingPaths, deadCallers, aliveCallers
+                            hasDeadIncomingPaths, deadCallers, aliveCallers, deadCallerFiles
                         )
+                    }
+                }
+                "prioritize" -> {
+                    // Prioritize functions for auto-explain (user search/focus)
+                    val reason = json.get("reason")?.asString ?: "user_interaction"
+                    val funcName = json.get("function")?.asString
+                    val funcNames = json.getAsJsonArray("functions")?.mapNotNull { it.asString }
+
+                    if (funcName != null) {
+                        explanationCache?.prioritizeFunction(funcName, reason)
+                    } else if (funcNames != null && funcNames.isNotEmpty()) {
+                        explanationCache?.prioritizeFunctions(funcNames, reason)
                     }
                 }
             }
@@ -875,7 +1421,7 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
 
     /**
      * Handles AI explanation request from Interactive Explorer.
-     * Checks if LLM server is running and sends appropriate response.
+     * Checks cache first, then LLM server if no cached explanation.
      */
     private fun handleExplainRequest(
         funcName: String,
@@ -895,9 +1441,24 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         chainDefs: com.google.gson.JsonArray?,
         hasDeadIncomingPaths: Boolean,
         deadCallers: List<String>,
-        aliveCallers: List<String>
+        aliveCallers: List<String>,
+        deadCallerFiles: com.google.gson.JsonArray?
     ) {
+        // Mark user activity (pauses auto-explain background processing)
+        explanationCache?.markUserActivity()
+
         ApplicationManager.getApplication().invokeLater {
+            // Check cache first for dead functions
+            if (isDead && funcFile != null) {
+                val cached = explanationCache?.getExplanation(funcName, funcFile)
+                if (cached != null) {
+                    PluginLogger.info("[Explain] Using cached explanation for: $funcName")
+                    // Send cached response immediately
+                    sendCachedExplanationToExplorer(funcName, cached.explanation, cached.whyNotCovered)
+                    return@invokeLater
+                }
+            }
+
             // Check if LLM server is running by looking for AIExplanationPanel
             val toolWindowManager = com.intellij.openapi.wm.ToolWindowManager.getInstance(project)
             val toolWindow = toolWindowManager.getToolWindow("TrueFlow")
@@ -915,10 +1476,35 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     funcName, funcFile, funcLine, isAlive, isDead, callCount, whyNotCovered,
                     rootCauseDetail, callChain, upstreamPath, downstreamPath,
                     directCallers, directCallees, chainFiles, chainDefs,
-                    hasDeadIncomingPaths, deadCallers, aliveCallers, aiPanel!!
+                    hasDeadIncomingPaths, deadCallers, aliveCallers, deadCallerFiles, aiPanel!!
                 )
             }
         }
+    }
+
+    /**
+     * Send a cached explanation to the Interactive Explorer.
+     */
+    private fun sendCachedExplanationToExplorer(funcName: String, explanation: String, whyNotCovered: String) {
+        val escapedResponse = explanation.replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "")
+
+        val responseMessage = """
+            {
+                "type": "llm_response",
+                "function": "$funcName",
+                "explanation": "$escapedResponse",
+                "cached": true,
+                "whyNotCovered": "$whyNotCovered"
+            }
+        """.trimIndent()
+
+        interactiveBrowser?.cefBrowser?.executeJavaScript(
+            "if (typeof handleLLMResponse === 'function') { handleLLMResponse($responseMessage); }",
+            "", 0
+        )
     }
 
     /**
@@ -984,6 +1570,7 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         hasDeadIncomingPaths: Boolean,
         deadCallers: List<String>,
         aliveCallers: List<String>,
+        deadCallerFiles: com.google.gson.JsonArray?,
         aiPanel: AIExplanationPanel
     ) {
         // Show loading state
@@ -1061,6 +1648,48 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     } catch (e: Exception) { "" }
                 } else ""
 
+                // Helper function to read entire Python function from file
+                fun readEntireFunction(lines: List<String>, funcDefLine: Int, maxLines: Int = 200): Pair<Int, Int> {
+                    if (funcDefLine < 1 || funcDefLine > lines.size) return Pair(0, minOf(50, lines.size))
+
+                    val startIdx = funcDefLine - 1  // Convert to 0-indexed
+                    val defLine = lines.getOrNull(startIdx) ?: return Pair(startIdx, minOf(startIdx + 50, lines.size))
+
+                    // Get the indentation of the function definition
+                    val defIndent = defLine.takeWhile { it == ' ' || it == '\t' }.length
+
+                    // Find the end of the function by looking for:
+                    // 1. Another def/class at same or lesser indentation
+                    // 2. A non-empty line with lesser indentation (dedent)
+                    var endIdx = startIdx + 1
+                    while (endIdx < lines.size && endIdx < startIdx + maxLines) {
+                        val line = lines[endIdx]
+                        val trimmed = line.trim()
+
+                        // Skip empty lines and comments
+                        if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                            endIdx++
+                            continue
+                        }
+
+                        val lineIndent = line.takeWhile { it == ' ' || it == '\t' }.length
+
+                        // Check for new function/class definition at same or lesser indentation
+                        if (lineIndent <= defIndent && (trimmed.startsWith("def ") || trimmed.startsWith("async def ") || trimmed.startsWith("class "))) {
+                            break
+                        }
+
+                        // Check for dedent to module/class level (non-empty line with less indent)
+                        if (lineIndent < defIndent && trimmed.isNotEmpty() && !trimmed.startsWith("@")) {
+                            break
+                        }
+
+                        endIdx++
+                    }
+
+                    return Pair(maxOf(0, startIdx - 2), endIdx)  // Include 2 lines before for decorators
+                }
+
                 // Read source code for ALL callers in the chain (especially the root cause)
                 val callersSourceCode = buildString {
                     if (chainFiles != null && chainFiles.size() > 0) {
@@ -1077,16 +1706,15 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                                     val file = java.io.File(callerFile)
                                     if (file.exists()) {
                                         val lines = file.readLines()
-                                        val startLine = maxOf(0, callerLine - 5)
-                                        val endLine = minOf(lines.size, callerLine + 40)  // Read more lines for context
+                                        val (startLine, endLine) = readEntireFunction(lines, callerLine)
 
                                         val marker = if (isRootCause) "ROOT CAUSE CALLER" else "CALLER"
                                         append("\n// === $marker: $callerFunc ===\n")
                                         append("// File: $callerFile (line $callerLine)\n")
                                         append(lines.subList(startLine, endLine).mapIndexed { idx, line ->
                                             val lineNum = startLine + idx + 1
-                                            val marker = if (lineNum == callerLine) ">>>" else "   "
-                                            "$marker $lineNum: $line"
+                                            val lineMarker = if (lineNum == callerLine) ">>>" else "   "
+                                            "$lineMarker $lineNum: $line"
                                         }.joinToString("\n"))
                                         append("\n")
                                     }
@@ -1136,6 +1764,40 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     }
                 }
 
+                // Read source code for DEAD CALLERS (for partial coverage analysis)
+                val deadCallersSourceCode = buildString {
+                    if (deadCallerFiles != null && deadCallerFiles.size() > 0) {
+                        append("\n// === DEAD CALLERS SOURCE (paths not exercised) ===\n")
+                        for (i in 0 until minOf(deadCallerFiles.size(), 5)) {  // Limit to 5 dead callers
+                            try {
+                                val callerObj = deadCallerFiles[i].asJsonObject
+                                val callerFunc = callerObj.get("function")?.asString ?: "Unknown"
+                                val callerFile = callerObj.get("file")?.asString
+                                val callerLine = callerObj.get("line")?.asInt ?: 0
+
+                                if (callerFile != null) {
+                                    val file = java.io.File(callerFile)
+                                    if (file.exists()) {
+                                        val lines = file.readLines()
+                                        val (startLine, endLine) = readEntireFunction(lines, callerLine)
+
+                                        append("\n// ❌ DEAD CALLER: $callerFunc\n")
+                                        append("// File: $callerFile (line $callerLine)\n")
+                                        append(lines.subList(startLine, endLine).mapIndexed { idx, line ->
+                                            val lineNum = startLine + idx + 1
+                                            val lineMarker = if (lineNum == callerLine) ">>>" else "   "
+                                            "$lineMarker $lineNum: $line"
+                                        }.joinToString("\n"))
+                                        append("\n")
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                PluginLogger.warn("Failed to read dead caller source: ${e.message}")
+                            }
+                        }
+                    }
+                }
+
                 val prompt = buildString {
                     if (isDead) {
                         // For dead/uncovered code, focus on WHY it's not covered with full context
@@ -1177,14 +1839,21 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                             }
                             "BRANCH_NOT_TAKEN" -> {
                                 append("This function is DEAD due to a BRANCH NOT TAKEN.\n\n")
-                                append("The caller '$branchCaller' was executed but did NOT call this function.\n")
-                                if (branchCondition != null) {
-                                    append("Branch condition: $branchCondition\n")
+                                append("The caller '$branchCaller' was executed but did NOT call this function '$funcName'.\n")
+                                if (branchLine != null) {
+                                    append("Caller defined at line: $branchLine\n")
                                 }
-                                append("\nAnalyze the CALLER source code above and explain:\n")
-                                append("1. What specific condition prevented this function from being called?\n")
-                                append("2. What input/state would make the condition evaluate to call this function?\n")
-                                append("3. Suggest a specific test case or scenario that would execute this path.\n")
+                                append("\n=== CRITICAL: FIND THE EXACT BRANCH ===\n")
+                                append("Look in the CALLER SOURCE CODE above and find:\n")
+                                append("1. The EXACT LINE with 'if', 'elif', 'else', 'match', 'case', 'for', 'while', or 'try/except' that controls whether '$funcName' gets called\n")
+                                append("2. Quote the EXACT condition code (e.g., 'if some_flag:', 'elif x > 10:', 'except ValueError:')\n")
+                                append("3. The line number where this branch condition appears\n\n")
+                                append("=== YOUR ANALYSIS ===\n")
+                                append("Format your response as:\n")
+                                append("**Branch Location:** Line X: `<exact condition code>`\n")
+                                append("**Why Not Taken:** <explain what value/state caused this branch to be skipped>\n")
+                                append("**To Execute This Path:** <specific input/state needed to take this branch>\n")
+                                append("**Test Scenario:** <concrete test case that would call $funcName>\n")
                             }
                             else -> {
                                 append("Analyze why this function is not being executed and what would trigger it.\n")
@@ -1194,19 +1863,27 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     } else if (hasDeadIncomingPaths) {
                         // For alive code with dead incoming paths - partial coverage
                         append("Analyze this function's PARTIAL INCOMING COVERAGE.\n\n")
-                        append("This function IS executed, but some callers in the code are NOT being executed.\n\n")
+                        append("This function '$funcName' IS executed via some paths, but other code paths to it are NOT being exercised.\n\n")
                         append("=== ANALYSIS CONTEXT ===\n$context\n")
                         if (sourceCode.isNotEmpty()) {
                             append("\n=== TARGET FUNCTION SOURCE ===\n```python\n$sourceCode\n```\n")
                         }
-                        append("\n=== YOUR ANALYSIS TASK ===\n")
-                        append("Dead callers: ${deadCallers.joinToString(", ")}\n")
-                        append("Alive callers: ${aliveCallers.joinToString(", ")}\n\n")
-                        append("Analyze:\n")
-                        append("1. Why are the dead callers not being executed?\n")
-                        append("2. What test scenarios would exercise the paths through the dead callers?\n")
-                        append("3. Is the dead caller path important for coverage, or is it redundant?\n")
-                        append("\nBe SPECIFIC about what conditions would trigger the untested paths.")
+                        if (deadCallersSourceCode.isNotEmpty()) {
+                            append("\n=== DEAD CALLERS SOURCE CODE ===\n```python\n$deadCallersSourceCode\n```\n")
+                        }
+                        append("\n=== COVERAGE STATUS ===\n")
+                        append("✅ ALIVE callers (paths exercised): ${aliveCallers.joinToString(", ")}\n")
+                        append("❌ DEAD callers (paths NOT exercised): ${deadCallers.joinToString(", ")}\n\n")
+                        append("=== YOUR ANALYSIS TASK ===\n")
+                        append("For EACH dead caller in the source code above, find:\n")
+                        append("1. **The exact line** where the dead caller is defined\n")
+                        append("2. **The branch condition** (if/elif/else/match/try-except) that prevented this caller from being executed\n")
+                        append("3. **What would trigger it** - specific test input or state to exercise this path\n\n")
+                        append("Format your response with a section for each dead caller:\n")
+                        append("### Dead Caller: `<caller_name>`\n")
+                        append("**Branch Location:** Line X: `<exact condition from source>`\n")
+                        append("**Why Not Executed:** <explain what state caused this branch to not be taken>\n")
+                        append("**Test Scenario:** <specific test case to exercise this path>\n")
                     } else {
                         // For alive/covered code, explain what it does
                         append("Explain this function's purpose and behavior:\n\n")
@@ -1220,6 +1897,34 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
 
                 // Call the LLM via AIExplanationPanel's askQuestion method
                 aiPanel.askQuestion(prompt, sourceCode, null) { response ->
+                    // Cache the explanation for dead functions
+                    if (isDead && funcFile != null && whyNotCovered != null) {
+                        try {
+                            val file = java.io.File(funcFile)
+                            val contentHash = if (file.exists() && funcLine > 0) {
+                                val lines = file.readLines()
+                                val startIdx = maxOf(0, funcLine - 1)
+                                val endIdx = minOf(lines.size, funcLine + 50)
+                                lines.subList(startIdx, endIdx).joinToString("\n").hashCode().toString(16)
+                            } else "unknown"
+
+                            val cached = CachedExplanation(
+                                functionName = funcName,
+                                filePath = funcFile,
+                                line = funcLine,
+                                contentHash = contentHash,
+                                whyNotCovered = whyNotCovered,
+                                explanation = response,
+                                timestamp = System.currentTimeMillis(),
+                                modelUsed = "user-request"
+                            )
+                            explanationCache?.storeExplanation(cached)
+                            PluginLogger.info("[Explain] Cached user-requested explanation for: $funcName")
+                        } catch (e: Exception) {
+                            PluginLogger.warn("[Explain] Failed to cache explanation: ${e.message}")
+                        }
+                    }
+
                     // Send response back to Interactive Explorer
                     val escapedResponse = response.replace("\\", "\\\\")
                         .replace("\"", "\\\"")
@@ -1439,6 +2144,9 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             deadFunctions = deadFunctions,
             whyNotCovered = whyNotCovered
         )
+
+        // Queue dead functions for auto-explain (background processing when AI is idle)
+        explanationCache?.queueDeadFunctions(deadFunctions)
 
         // Push to live server if running
         pushCurrentDataToServer()

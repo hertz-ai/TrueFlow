@@ -26,6 +26,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.swing.*
 import javax.swing.table.DefaultTableModel
+import com.google.gson.JsonObject
+import com.google.gson.JsonArray
 
 /**
  * WrapLayout - A FlowLayout subclass that supports wrapping components to the next line.
@@ -310,6 +312,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         PluginPaths.initializeAll(project)
         ResourceDeployer.deployAll(project)
 
+        // Set tool window reference for RPC data access
+        aiExplanationPanel.setToolWindow(this)
+
         // Initialize performance table
         performanceTableModel = DefaultTableModel(
             arrayOf("Module", "Function", "Calls", "Total (ms)", "Avg (ms)", "Min (ms)", "Max (ms)", "Mem (MB)", "CPU (%)", "File", "Line"),
@@ -393,7 +398,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             openAutoIntegrateDialog()
         }
         autoIntegrateButton.isOpaque = true
-        autoIntegrateButton.isContentAreaFilled = true
+        autoIntegrateButton.isContentAreaFilled = false  // Disable LAF background to allow custom colors
         // Green if not integrated (call to action), gray if already done
         // Pulse only starts when a compatible app is detected (in checkForTraceServer)
         if (isIntegrated) {
@@ -434,6 +439,8 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
                 }
             }
         }
+        attachButton.isOpaque = true
+        attachButton.isContentAreaFilled = false  // Disable LAF background to allow custom colors
         attachButton.background = java.awt.Color(33, 150, 243) // Blue highlight
         attachButton.foreground = java.awt.Color.WHITE
         toolbar.add(attachButton)
@@ -4326,6 +4333,411 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     }
 
     fun getContent(): JComponent = mainPanel
+
+    // ==================== RPC Data Accessors for MCP Hub ====================
+    // These methods return JsonObject data for RPC responses
+
+    /**
+     * Get call graph data for RPC.
+     */
+    fun getRpcCallGraph(moduleFilter: String?): JsonObject {
+        val result = JsonObject()
+        val graphArray = JsonArray()
+
+        val filteredGraph = if (moduleFilter.isNullOrEmpty()) {
+            socketResolvedCallGraph
+        } else {
+            socketResolvedCallGraph.filterKeys { it.lowercase().contains(moduleFilter.lowercase()) }
+        }
+
+        for ((caller, callees) in filteredGraph.entries.take(100)) {
+            val entry = JsonObject()
+            entry.addProperty("caller", caller)
+            val calleesArray = JsonArray()
+            callees.forEach { calleesArray.add(it) }
+            entry.add("callees", calleesArray)
+            graphArray.add(entry)
+        }
+
+        result.add("call_graph", graphArray)
+        result.addProperty("total_functions", socketAllDefinedFunctions.size)
+        result.addProperty("total_edges", socketResolvedCallGraph.values.sumOf { it.size })
+        return result
+    }
+
+    /**
+     * Get callers of a function for RPC.
+     */
+    fun getRpcCallers(functionName: String, maxDepth: Int = 3): JsonObject {
+        val result = JsonObject()
+
+        // Find matching function
+        val matches = socketAllDefinedFunctions.filter { it.lowercase().contains(functionName.lowercase()) }
+        if (matches.isEmpty()) {
+            result.addProperty("error", "Function '$functionName' not found")
+            return result
+        }
+
+        val funcKey = matches.first()
+        result.addProperty("function", funcKey)
+
+        // Build reverse call graph
+        val reverseGraph = mutableMapOf<String, MutableList<String>>()
+        for ((caller, callees) in socketResolvedCallGraph) {
+            for (callee in callees) {
+                reverseGraph.getOrPut(callee) { mutableListOf() }.add(caller)
+            }
+        }
+
+        // Get callers recursively
+        fun getCallers(f: String, depth: Int, visited: MutableSet<String>): List<String> {
+            if (depth > maxDepth || f in visited) return emptyList()
+            visited.add(f)
+            val direct = reverseGraph[f] ?: emptyList()
+            return direct + direct.flatMap { getCallers(it, depth + 1, visited) }
+        }
+
+        val callers = getCallers(funcKey, 0, mutableSetOf()).distinct()
+        val callersArray = JsonArray()
+        callers.take(50).forEach { callersArray.add(it) }
+        result.add("callers", callersArray)
+        result.addProperty("count", callers.size)
+
+        return result
+    }
+
+    /**
+     * Get callees of a function for RPC.
+     */
+    fun getRpcCallees(functionName: String, maxDepth: Int = 3): JsonObject {
+        val result = JsonObject()
+
+        val matches = socketAllDefinedFunctions.filter { it.lowercase().contains(functionName.lowercase()) }
+        if (matches.isEmpty()) {
+            result.addProperty("error", "Function '$functionName' not found")
+            return result
+        }
+
+        val funcKey = matches.first()
+        result.addProperty("function", funcKey)
+
+        // Get callees recursively
+        fun getCallees(f: String, depth: Int, visited: MutableSet<String>): List<String> {
+            if (depth > maxDepth || f in visited) return emptyList()
+            visited.add(f)
+            val direct = socketResolvedCallGraph[f] ?: emptyList()
+            return direct + direct.flatMap { getCallees(it, depth + 1, visited) }
+        }
+
+        val callees = getCallees(funcKey, 0, mutableSetOf()).distinct()
+        val calleesArray = JsonArray()
+        callees.take(50).forEach { calleesArray.add(it) }
+        result.add("callees", calleesArray)
+        result.addProperty("count", callees.size)
+
+        return result
+    }
+
+    /**
+     * Search functions by name for RPC.
+     */
+    fun getRpcSearchFunctions(query: String): JsonObject {
+        val result = JsonObject()
+        result.addProperty("query", query)
+
+        val matches = socketAllDefinedFunctions.filter { it.lowercase().contains(query.lowercase()) }
+        val resultsArray = JsonArray()
+
+        for (funcKey in matches.take(50)) {
+            val funcObj = JsonObject()
+            funcObj.addProperty("function", funcKey)
+            val (file, line) = socketFunctionDefinitions[funcKey] ?: Pair("-", 0)
+            funcObj.addProperty("file", file)
+            funcObj.addProperty("line", line)
+            funcObj.addProperty("covered", funcKey in socketTraceCalls)
+            funcObj.addProperty("call_count", socketTraceCalls[funcKey] ?: 0)
+            resultsArray.add(funcObj)
+        }
+
+        result.add("results", resultsArray)
+        result.addProperty("total", matches.size)
+        return result
+    }
+
+    /**
+     * Get full call chain (upstream + downstream) for RPC.
+     */
+    fun getRpcCallChain(functionName: String): JsonObject {
+        val result = JsonObject()
+
+        val matches = socketAllDefinedFunctions.filter { it.lowercase().contains(functionName.lowercase()) }
+        if (matches.isEmpty()) {
+            result.addProperty("error", "Function '$functionName' not found")
+            return result
+        }
+
+        val funcKey = matches.first()
+        result.addProperty("function", funcKey)
+
+        // Build reverse call graph
+        val reverseGraph = mutableMapOf<String, MutableList<String>>()
+        for ((caller, callees) in socketResolvedCallGraph) {
+            for (callee in callees) {
+                reverseGraph.getOrPut(callee) { mutableListOf() }.add(caller)
+            }
+        }
+
+        // Upstream (callers)
+        fun getUpstream(f: String, visited: MutableSet<String>): List<String> {
+            if (f in visited) return emptyList()
+            visited.add(f)
+            val callers = reverseGraph[f] ?: emptyList()
+            return callers + callers.flatMap { getUpstream(it, visited) }
+        }
+
+        // Downstream (callees)
+        fun getDownstream(f: String, visited: MutableSet<String>): List<String> {
+            if (f in visited) return emptyList()
+            visited.add(f)
+            val callees = socketResolvedCallGraph[f] ?: emptyList()
+            return callees + callees.flatMap { getDownstream(it, visited) }
+        }
+
+        val upstream = getUpstream(funcKey, mutableSetOf()).distinct()
+        val downstream = getDownstream(funcKey, mutableSetOf()).distinct()
+
+        val upstreamArray = JsonArray()
+        upstream.take(50).forEach { upstreamArray.add(it) }
+        val downstreamArray = JsonArray()
+        downstream.take(50).forEach { downstreamArray.add(it) }
+
+        result.add("upstream", upstreamArray)
+        result.add("downstream", downstreamArray)
+        result.addProperty("upstream_count", upstream.size)
+        result.addProperty("downstream_count", downstream.size)
+
+        return result
+    }
+
+    /**
+     * Get coverage summary for RPC.
+     */
+    fun getRpcCoverageSummary(): JsonObject {
+        val result = JsonObject()
+
+        val totalDefined = socketAllDefinedFunctions.size
+        val totalCovered = socketTraceCalls.size
+        val deadCount = totalDefined - socketTraceCalls.keys.count { it in socketAllDefinedFunctions }
+
+        result.addProperty("total_defined", totalDefined)
+        result.addProperty("total_covered", totalCovered)
+        result.addProperty("dead_count", deadCount)
+        result.addProperty("coverage_percent", if (totalDefined > 0) (totalCovered.toDouble() / totalDefined * 100) else 0.0)
+
+        // Module breakdown
+        val moduleStats = mutableMapOf<String, Pair<Int, Int>>() // module -> (defined, covered)
+        for (func in socketAllDefinedFunctions) {
+            val module = func.substringBeforeLast(".", "unknown")
+            val (d, c) = moduleStats.getOrPut(module) { Pair(0, 0) }
+            moduleStats[module] = Pair(d + 1, c + (if (func in socketTraceCalls) 1 else 0))
+        }
+
+        val modulesArray = JsonArray()
+        for ((module, stats) in moduleStats.entries.sortedByDescending { it.value.first }.take(20)) {
+            val obj = JsonObject()
+            obj.addProperty("module", module)
+            obj.addProperty("defined", stats.first)
+            obj.addProperty("covered", stats.second)
+            modulesArray.add(obj)
+        }
+        result.add("modules", modulesArray)
+
+        return result
+    }
+
+    /**
+     * Find path between two functions for RPC.
+     */
+    fun getRpcFindPath(source: String, target: String): JsonObject {
+        val result = JsonObject()
+
+        val srcMatches = socketAllDefinedFunctions.filter { it.lowercase().contains(source.lowercase()) }
+        val tgtMatches = socketAllDefinedFunctions.filter { it.lowercase().contains(target.lowercase()) }
+
+        if (srcMatches.isEmpty()) {
+            result.addProperty("error", "Source '$source' not found")
+            return result
+        }
+        if (tgtMatches.isEmpty()) {
+            result.addProperty("error", "Target '$target' not found")
+            return result
+        }
+
+        val srcKey = srcMatches.first()
+        val tgtKey = tgtMatches.first()
+
+        result.addProperty("source", srcKey)
+        result.addProperty("target", tgtKey)
+
+        // BFS to find path
+        val queue = ArrayDeque<Pair<String, List<String>>>()
+        queue.add(Pair(srcKey, listOf(srcKey)))
+        val visited = mutableSetOf(srcKey)
+
+        while (queue.isNotEmpty()) {
+            val (curr, path) = queue.removeFirst()
+            if (curr == tgtKey) {
+                val pathArray = JsonArray()
+                path.forEach { pathArray.add(it) }
+                result.add("path", pathArray)
+                result.addProperty("length", path.size - 1)
+                result.addProperty("reachable", true)
+                return result
+            }
+            for (callee in socketResolvedCallGraph[curr] ?: emptyList()) {
+                if (callee !in visited) {
+                    visited.add(callee)
+                    queue.add(Pair(callee, path + callee))
+                }
+            }
+        }
+
+        result.addProperty("reachable", false)
+        return result
+    }
+
+    /**
+     * Get flamegraph data for RPC.
+     */
+    fun getRpcFlamegraphData(): JsonObject {
+        val result = JsonObject()
+
+        // Build speedscope format
+        val frames = JsonArray()
+        val samples = JsonArray()
+        val weights = JsonArray()
+
+        val funcList = socketFunctionDurations.keys.toList()
+        for ((index, func) in funcList.withIndex()) {
+            val frameObj = JsonObject()
+            frameObj.addProperty("name", func)
+            val (file, _) = socketFunctionDefinitions[func] ?: Pair("", 0)
+            frameObj.addProperty("file", file)
+            frames.add(frameObj)
+
+            val sampleArray = JsonArray()
+            sampleArray.add(index)
+            samples.add(sampleArray)
+
+            weights.add(socketFunctionDurations[func]?.sum() ?: 0.0)
+        }
+
+        val shared = JsonObject()
+        shared.add("frames", frames)
+        result.add("shared", shared)
+
+        val profile = JsonObject()
+        profile.addProperty("type", "sampled")
+        profile.addProperty("name", "TrueFlow")
+        profile.addProperty("unit", "milliseconds")
+        profile.addProperty("startValue", 0)
+        profile.addProperty("endValue", socketFunctionDurations.values.sumOf { it.sum() })
+        profile.add("samples", samples)
+        profile.add("weights", weights)
+
+        val profiles = JsonArray()
+        profiles.add(profile)
+        result.add("profiles", profiles)
+
+        return result
+    }
+
+    /**
+     * Get call tree for RPC.
+     */
+    fun getRpcCallTree(rootFunction: String?, maxDepth: Int = 5): JsonObject {
+        val result = JsonObject()
+
+        // Find entry points
+        val reverseGraph = mutableMapOf<String, MutableList<String>>()
+        for ((caller, callees) in socketResolvedCallGraph) {
+            for (callee in callees) {
+                reverseGraph.getOrPut(callee) { mutableListOf() }.add(caller)
+            }
+        }
+
+        val entryPoints = socketAllDefinedFunctions.filter { reverseGraph[it].isNullOrEmpty() }
+
+        fun buildTree(func: String, depth: Int, visited: MutableSet<String>): JsonObject {
+            val node = JsonObject()
+            node.addProperty("function", func)
+            node.addProperty("depth", depth)
+
+            if (depth >= maxDepth || func in visited) {
+                node.addProperty("truncated", true)
+                return node
+            }
+            visited.add(func)
+
+            val callees = socketResolvedCallGraph[func] ?: emptyList()
+            if (callees.isNotEmpty()) {
+                val children = JsonArray()
+                for (callee in callees.take(10)) {
+                    children.add(buildTree(callee, depth + 1, visited.toMutableSet()))
+                }
+                node.add("children", children)
+            }
+
+            return node
+        }
+
+        val roots = if (!rootFunction.isNullOrEmpty()) {
+            socketAllDefinedFunctions.filter { it.lowercase().contains(rootFunction.lowercase()) }.take(3)
+        } else {
+            entryPoints.take(5)
+        }
+
+        val treeArray = JsonArray()
+        for (root in roots) {
+            treeArray.add(buildTree(root, 0, mutableSetOf()))
+        }
+        result.add("tree", treeArray)
+
+        val entryPointsArray = JsonArray()
+        entryPoints.take(20).forEach { entryPointsArray.add(it) }
+        result.add("entry_points", entryPointsArray)
+
+        return result
+    }
+
+    /**
+     * List Manim videos for RPC.
+     */
+    fun getRpcManimVideos(): JsonObject {
+        val result = JsonObject()
+        val videosArray = JsonArray()
+
+        val mediaDir = File(project.basePath ?: "", ".pycharm_plugin/manim/media/videos")
+        if (mediaDir.exists()) {
+            mediaDir.walkTopDown()
+                .filter { it.extension == "mp4" }
+                .take(20)
+                .forEach { file ->
+                    val obj = JsonObject()
+                    obj.addProperty("path", file.absolutePath)
+                    obj.addProperty("name", file.name)
+                    obj.addProperty("size_mb", file.length() / 1024.0 / 1024.0)
+                    obj.addProperty("modified", file.lastModified())
+                    videosArray.add(obj)
+                }
+        }
+
+        result.add("videos", videosArray)
+        result.addProperty("count", videosArray.size())
+        return result
+    }
+
+    // ==================== End RPC Data Accessors ====================
 
     fun dispose() {
         // Stop timers

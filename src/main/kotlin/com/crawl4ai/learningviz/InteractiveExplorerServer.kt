@@ -34,7 +34,12 @@ class InteractiveExplorerServer(
     private val llmEndpoint: String = "http://127.0.0.1:8080/v1",  // llama.cpp server (OpenAI-compatible)
     private val onServerStarted: (url: String) -> Unit = {},
     private val onServerStopped: () -> Unit = {},
-    private val onError: (Exception) -> Unit = {}
+    private val onError: (Exception) -> Unit = {},
+    // Unified explain handler - routes through same logic as IDE mode
+    // Takes (funcName, filePath, isDead, whyNotCovered) and callback for result
+    private val onExplainRequest: ((funcName: String, filePath: String, isDead: Boolean, whyNotCovered: String?, onResult: (String?, Boolean) -> Unit) -> Unit)? = null,
+    // Prioritize handler - for preemptive caching based on user searches/focus
+    private val onPrioritizeRequest: ((funcNames: List<String>, reason: String) -> Unit)? = null
 ) {
     private var server: HttpServer? = null
     private val gson = Gson()
@@ -85,6 +90,11 @@ class InteractiveExplorerServer(
             // AI status endpoint
             server?.createContext("/api/ai/status") { exchange ->
                 handleAIStatus(exchange)
+            }
+
+            // AI prioritize endpoint (for preemptive caching)
+            server?.createContext("/api/ai/prioritize") { exchange ->
+                handleAIPrioritize(exchange)
             }
 
             server?.start()
@@ -291,18 +301,40 @@ class InteractiveExplorerServer(
 
             val functionName = request.get("function")?.asString ?: "unknown"
             val fileName = request.get("file")?.asString ?: ""
-            val context = request.get("context")?.asString ?: ""
+            val isDead = request.get("isDead")?.asBoolean ?: false
+            val whyNotCovered = request.get("whyNotCovered")?.asString
 
-            // Build prompt for LLM
+            // Use unified explain handler if available (same logic as IDE mode)
+            if (onExplainRequest != null) {
+                PluginLogger.info("[ExplorerServer] Routing explain request to unified handler: $functionName")
+                onExplainRequest.invoke(functionName, fileName, isDead, whyNotCovered) { explanation, cached ->
+                    if (explanation != null) {
+                        sendJsonResponse(exchange, 200, mapOf(
+                            "success" to true,
+                            "explanation" to explanation,
+                            "cached" to cached
+                        ))
+                    } else {
+                        sendJsonResponse(exchange, 500, mapOf(
+                            "success" to false,
+                            "error" to "Failed to get AI explanation"
+                        ))
+                    }
+                }
+                return
+            }
+
+            // Fallback: use simple direct LLM call (no unified handler available)
+            val context = request.get("context")?.asString ?: ""
             val prompt = buildExplanationPrompt(functionName, fileName, context)
 
-            // Call llama.cpp server API
             thread {
                 try {
                     val response = callLLM(prompt)
                     sendJsonResponse(exchange, 200, mapOf(
                         "success" to true,
-                        "explanation" to response
+                        "explanation" to response,
+                        "cached" to false
                     ))
                 } catch (e: Exception) {
                     PluginLogger.error("[ExplorerServer] LLM error: ${e.message}", e)
@@ -349,6 +381,70 @@ class InteractiveExplorerServer(
                 "available" to false,
                 "error" to (e.message ?: "Unknown error")
             ))
+        }
+    }
+
+    /**
+     * Handle AI prioritize request - queues functions for preemptive caching.
+     */
+    private fun handleAIPrioritize(exchange: HttpExchange) {
+        try {
+            // CORS headers
+            exchange.responseHeaders.add("Access-Control-Allow-Origin", "*")
+            exchange.responseHeaders.add("Access-Control-Allow-Methods", "POST, OPTIONS")
+            exchange.responseHeaders.add("Access-Control-Allow-Headers", "Content-Type")
+
+            if (exchange.requestMethod == "OPTIONS") {
+                exchange.sendResponseHeaders(200, -1)
+                return
+            }
+
+            if (exchange.requestMethod != "POST") {
+                sendJsonResponse(exchange, 405, mapOf("error" to "Method not allowed"))
+                return
+            }
+
+            // Parse request body
+            val body = exchange.requestBody.bufferedReader().readText()
+            val request = gson.fromJson(body, JsonObject::class.java)
+
+            val reason = request.get("reason")?.asString ?: "user_interaction"
+            val funcNames = mutableListOf<String>()
+
+            // Support both single function and array of functions
+            val singleFunc = request.get("function")?.asString
+            val funcArray = request.getAsJsonArray("functions")
+
+            if (singleFunc != null) {
+                funcNames.add(singleFunc)
+            }
+            if (funcArray != null) {
+                funcArray.forEach { funcNames.add(it.asString) }
+            }
+
+            if (funcNames.isEmpty()) {
+                sendJsonResponse(exchange, 400, mapOf("error" to "No functions specified"))
+                return
+            }
+
+            // Call the prioritize handler
+            if (onPrioritizeRequest != null) {
+                onPrioritizeRequest.invoke(funcNames, reason)
+                sendJsonResponse(exchange, 200, mapOf(
+                    "success" to true,
+                    "prioritized" to funcNames.size,
+                    "reason" to reason
+                ))
+            } else {
+                sendJsonResponse(exchange, 200, mapOf(
+                    "success" to false,
+                    "message" to "Prioritization not available in browser mode"
+                ))
+            }
+
+        } catch (e: Exception) {
+            PluginLogger.error("[ExplorerServer] Error handling AI prioritize: ${e.message}", e)
+            sendJsonResponse(exchange, 500, mapOf("error" to "Internal Server Error"))
         }
     }
 

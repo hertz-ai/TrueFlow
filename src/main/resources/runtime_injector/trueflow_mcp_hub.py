@@ -1,37 +1,34 @@
 #!/usr/bin/env python3
 """
-TrueFlow MCP Hub - Unified MCP Server with WebSocket Pub/Sub + RPC
+TrueFlow MCP Hub - Thin Routing Layer to IDE
 
-This is a SINGLE MCP server instance that:
-1. Acts as an MCP server for Claude Code / AI agents
-2. Provides WebSocket pub/sub for real-time IDE coordination
-3. Maintains a registry of connected IDE instances (projects)
-4. Routes MCP tool calls to the correct IDE/project with RPC response waiting
+This MCP server delegates analysis to the connected IDE (PyCharm/VS Code).
+The IDE has the superior implementation with:
+- Pre-parsed function registry from Python instrumentor
+- Class inference for accurate dead code detection
+- Branch tracking for "why not covered" analysis
+- Real-time trace data
 
 Architecture:
-- Single instance runs on port 5679 (MCP) + 5680 (WebSocket)
-- First IDE to start launches the hub
-- All IDEs connect as clients to the hub
-- AI agents connect via MCP protocol
-- MCP calls wait for IDE responses (true RPC)
+    Claude Code --MCP--> Hub --RPC--> IDE Plugin (analysis engine)
+                              |
+                              v
+                         WebSocket (5680)
 
-Usage:
-    # First instance (from any IDE) starts the hub
-    python trueflow_mcp_hub.py --start
-
-    # Other IDEs connect as clients
-    python trueflow_mcp_hub.py --connect --project "MyProject" --ide "vscode"
+The hub does NOT duplicate analysis logic - it routes to IDE.
 """
 
 import asyncio
 import json
-import sys
 import os
+import subprocess
+import sys
+import time
 import uuid
-import socket
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Set, Optional, Any
+from typing import Any, Dict, Optional, Sequence, Set
 import logging
 
 # MCP SDK imports
@@ -56,145 +53,127 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Global state
+
+# ============================================================================
+# HUB STATE (coordination only, no analysis state)
+# ============================================================================
+
+@dataclass
 class HubState:
+    """State for hub coordination - delegates analysis to IDE."""
+    # Project directory
+    project_dir: Path = field(default_factory=lambda: Path(os.environ.get("TRUEFLOW_PROJECT_DIR", str(Path.cwd()))))
+
     # Connected IDE instances: {project_id: {ide, project_path, websocket, capabilities}}
-    projects: Dict[str, Dict] = {}
+    projects: Dict[str, Dict] = field(default_factory=dict)
 
     # WebSocket connections for pub/sub
-    subscribers: Set = set()
+    subscribers: Set = field(default_factory=set)
 
-    # AI server status (shared across all IDEs)
-    ai_server_status: Dict = {
-        "running": False,
-        "port": 8080,
-        "model": None,
-        "started_by": None,
-        "started_at": None
-    }
-
-    # Trace data by project
-    trace_data: Dict[str, Dict] = {}
+    # AI server status (shared across IDEs)
+    ai_server_status: Dict = field(default_factory=lambda: {
+        "running": False, "port": 8080, "model": None, "started_by": None, "started_at": None
+    })
+    ai_server_process: Optional[subprocess.Popen] = None
 
     # Pending RPC requests: {request_id: asyncio.Future}
-    pending_requests: Dict[str, asyncio.Future] = {}
+    pending_requests: Dict[str, asyncio.Future] = field(default_factory=dict)
 
-hub = HubState()
 
-# RPC timeout in seconds
+state = HubState()
 RPC_TIMEOUT = 30
-
-# Status file for cross-process coordination
 STATUS_FILE = Path.home() / ".trueflow" / "hub_status.json"
-LOCK_FILE = Path.home() / ".trueflow" / "hub.lock"
+
 
 def is_hub_running() -> bool:
-    """Check if hub is already running by trying to connect to its port."""
+    """Check if hub is already running."""
+    import socket as sock
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        with sock.socket(sock.AF_INET, sock.SOCK_STREAM) as s:
             s.settimeout(1)
             s.connect(("127.0.0.1", 5680))
             return True
-    except (socket.error, socket.timeout):
+    except:
         return False
 
-def write_hub_status(running: bool, pid: int = None):
+
+def write_hub_status(running: bool):
     """Write hub status to shared file."""
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    status = {
-        "running": running,
-        "pid": pid or os.getpid(),
-        "mcp_port": 5679,
-        "ws_port": 5680,
-        "started_at": datetime.now().isoformat()
-    }
-    STATUS_FILE.write_text(json.dumps(status, indent=2))
+    STATUS_FILE.write_text(json.dumps({
+        "running": running, "pid": os.getpid(), "ws_port": 5680, "started_at": datetime.now().isoformat()
+    }, indent=2))
 
-def read_hub_status() -> Optional[Dict]:
-    """Read hub status from shared file."""
-    try:
-        if STATUS_FILE.exists():
-            return json.loads(STATUS_FILE.read_text())
-    except Exception:
-        pass
-    return None
 
-# ==================== RPC Helpers ====================
+# ============================================================================
+# RPC TO IDE (the core routing mechanism)
+# ============================================================================
 
-async def rpc_call(project_id: str, command: str, args: dict = None, timeout: float = RPC_TIMEOUT) -> Optional[Dict]:
+async def rpc_to_ide(command: str, args: dict = None, timeout: float = RPC_TIMEOUT) -> Optional[Dict]:
     """
-    Send RPC request to a project and wait for response.
-    Returns the response data or None on timeout/error.
+    Send RPC request to connected IDE and wait for response.
+    This is the ONLY way analysis happens - via IDE delegation.
     """
-    if project_id not in hub.projects:
+    if not state.projects:
         return None
 
-    ws = hub.projects[project_id].get("websocket")
+    # Use first connected IDE
+    project_id = list(state.projects.keys())[0]
+    ws = state.projects[project_id].get("websocket")
     if not ws:
         return None
 
-    # Generate unique request ID
     request_id = str(uuid.uuid4())
-
-    # Create future to wait for response
     future = asyncio.get_event_loop().create_future()
-    hub.pending_requests[request_id] = future
+    state.pending_requests[request_id] = future
 
     try:
-        # Send request with ID
         await ws.send(json.dumps({
-            "type": "rpc_request",
-            "request_id": request_id,
-            "command": command,
-            "args": args or {}
+            "type": "rpc_request", "request_id": request_id, "command": command, "args": args or {}
         }))
-
-        logger.info(f"RPC request {request_id} sent to {project_id}: {command}")
-
-        # Wait for response with timeout
-        response = await asyncio.wait_for(future, timeout=timeout)
-        logger.info(f"RPC response {request_id} received from {project_id}")
-        return response
-
+        return await asyncio.wait_for(future, timeout=timeout)
     except asyncio.TimeoutError:
-        logger.warning(f"RPC request {request_id} to {project_id} timed out")
+        logger.warning(f"RPC {command} timed out")
         return None
     except Exception as e:
-        logger.error(f"RPC request {request_id} failed: {e}")
+        logger.warning(f"RPC {command} failed: {e}")
         return None
     finally:
-        # Clean up pending request
-        hub.pending_requests.pop(request_id, None)
+        state.pending_requests.pop(request_id, None)
 
-# ==================== WebSocket Pub/Sub ====================
+
+def require_ide(tool_name: str) -> str:
+    """Return error message when IDE is required but not connected."""
+    return json.dumps({
+        "error": f"No IDE connected. {tool_name} requires PyCharm or VS Code with TrueFlow plugin.",
+        "hint": "Open your project in PyCharm/VS Code with TrueFlow plugin installed and running.",
+        "connected_ides": len(state.projects)
+    }, indent=2)
+
 
 async def broadcast(event_type: str, data: dict, exclude_ws=None):
     """Broadcast event to all connected subscribers."""
-    message = json.dumps({
-        "type": event_type,
-        "timestamp": datetime.now().isoformat(),
-        "data": data
-    })
-
-    dead_connections = set()
-    for ws in hub.subscribers:
+    message = json.dumps({"type": event_type, "timestamp": datetime.now().isoformat(), "data": data})
+    dead = set()
+    for ws in state.subscribers:
         if ws != exclude_ws:
             try:
                 await ws.send(message)
-            except websockets.exceptions.ConnectionClosed:
-                dead_connections.add(ws)
+            except:
+                dead.add(ws)
+    state.subscribers -= dead
 
-    # Clean up dead connections
-    hub.subscribers -= dead_connections
+
+# ============================================================================
+# WEBSOCKET SERVER (IDE coordination)
+# ============================================================================
 
 async def handle_ws_client(websocket):
-    """Handle incoming WebSocket connection from IDE."""
-    hub.subscribers.add(websocket)
+    """Handle WebSocket connection from IDE."""
+    state.subscribers.add(websocket)
     project_id = None
 
     try:
-        logger.info(f"New WebSocket connection from {websocket.remote_address}")
-
         async for message in websocket:
             try:
                 msg = json.loads(message)
@@ -202,9 +181,8 @@ async def handle_ws_client(websocket):
                 data = msg.get("data", {})
 
                 if msg_type == "register":
-                    # IDE registering itself
-                    project_id = data.get("project_id") or f"project_{len(hub.projects)}"
-                    hub.projects[project_id] = {
+                    project_id = data.get("project_id") or f"project_{len(state.projects)}"
+                    state.projects[project_id] = {
                         "ide": data.get("ide", "unknown"),
                         "project_path": data.get("project_path"),
                         "project_name": data.get("project_name"),
@@ -212,439 +190,372 @@ async def handle_ws_client(websocket):
                         "capabilities": data.get("capabilities", []),
                         "registered_at": datetime.now().isoformat()
                     }
-                    logger.info(f"Registered project: {project_id} ({data.get('ide')})")
-
-                    # Broadcast project list update
-                    await broadcast("projects_updated", {
-                        "projects": list(hub.projects.keys())
-                    })
-
-                    # Send current AI server status to new client
-                    await websocket.send(json.dumps({
-                        "type": "ai_server_status",
-                        "data": hub.ai_server_status
-                    }))
+                    logger.info(f"IDE registered: {project_id} ({data.get('ide')})")
+                    await broadcast("projects_updated", {"projects": list(state.projects.keys())})
 
                 elif msg_type == "ai_server_started":
-                    # AI server started by this IDE
-                    hub.ai_server_status = {
-                        "running": True,
-                        "port": data.get("port", 8080),
-                        "model": data.get("model"),
-                        "started_by": data.get("started_by", project_id),
-                        "started_at": datetime.now().isoformat()
+                    state.ai_server_status = {
+                        "running": True, "port": data.get("port", 8080), "model": data.get("model"),
+                        "started_by": project_id, "started_at": datetime.now().isoformat()
                     }
-                    await broadcast("ai_server_status", hub.ai_server_status, exclude_ws=websocket)
-                    logger.info(f"AI server started by {project_id}")
+                    await broadcast("ai_server_status", state.ai_server_status, exclude_ws=websocket)
 
                 elif msg_type == "ai_server_stopped":
-                    # AI server stopped
-                    hub.ai_server_status = {
-                        "running": False,
-                        "port": 8080,
-                        "model": None,
-                        "started_by": None,
-                        "started_at": None
-                    }
-                    await broadcast("ai_server_status", hub.ai_server_status, exclude_ws=websocket)
-                    logger.info(f"AI server stopped by {project_id}")
-
-                elif msg_type == "trace_update":
-                    # Trace data from IDE - store it
-                    if project_id:
-                        hub.trace_data[project_id] = data
-                    await broadcast("trace_update", {
-                        "project_id": project_id,
-                        **data
-                    }, exclude_ws=websocket)
+                    state.ai_server_status = {"running": False, "port": 8080, "model": None, "started_by": None, "started_at": None}
+                    await broadcast("ai_server_status", state.ai_server_status, exclude_ws=websocket)
 
                 elif msg_type == "rpc_response":
-                    # Response to an RPC request
                     request_id = msg.get("request_id")
-                    response_data = msg.get("data", {})
-
-                    if request_id and request_id in hub.pending_requests:
-                        future = hub.pending_requests[request_id]
+                    if request_id and request_id in state.pending_requests:
+                        future = state.pending_requests[request_id]
                         if not future.done():
-                            future.set_result(response_data)
-                        logger.debug(f"RPC response received for {request_id}")
-
-                elif msg_type == "request":
-                    # Legacy request to specific project or broadcast
-                    target_project = data.get("target_project")
-                    if target_project and target_project in hub.projects:
-                        target_ws = hub.projects[target_project].get("websocket")
-                        if target_ws:
-                            await target_ws.send(json.dumps({
-                                "type": "request",
-                                "from_project": project_id,
-                                "data": data
-                            }))
-                    else:
-                        await broadcast("request", {
-                            "from_project": project_id,
-                            **data
-                        }, exclude_ws=websocket)
-
-                elif msg_type == "response":
-                    # Legacy response to a previous request
-                    target_project = data.get("target_project")
-                    if target_project and target_project in hub.projects:
-                        target_ws = hub.projects[target_project].get("websocket")
-                        if target_ws:
-                            await target_ws.send(json.dumps({
-                                "type": "response",
-                                "from_project": project_id,
-                                "data": data
-                            }))
+                            future.set_result(msg.get("data", {}))
 
             except json.JSONDecodeError:
-                logger.warning(f"Invalid JSON from {websocket.remote_address}")
-
-    except websockets.exceptions.ConnectionClosed:
+                pass
+    except:
         pass
     finally:
-        hub.subscribers.discard(websocket)
-        if project_id and project_id in hub.projects:
-            del hub.projects[project_id]
-            logger.info(f"Unregistered project: {project_id}")
-            await broadcast("projects_updated", {
-                "projects": list(hub.projects.keys())
-            })
+        state.subscribers.discard(websocket)
+        if project_id and project_id in state.projects:
+            del state.projects[project_id]
+            logger.info(f"IDE disconnected: {project_id}")
+            await broadcast("projects_updated", {"projects": list(state.projects.keys())})
+
 
 async def run_websocket_server():
-    """Run WebSocket server for pub/sub."""
+    """Run WebSocket server for IDE connections."""
+    if not HAS_WEBSOCKETS:
+        return
     async with ws_serve(handle_ws_client, "127.0.0.1", 5680):
-        logger.info("WebSocket pub/sub server running on ws://127.0.0.1:5680")
-        await asyncio.Future()  # Run forever
+        logger.info("Hub WebSocket server on ws://127.0.0.1:5680")
+        await asyncio.Future()
 
-# ==================== MCP Server Tools ====================
+
+# ============================================================================
+# MCP TOOLS - All delegate to IDE
+# ============================================================================
 
 if HAS_MCP:
     mcp_server = Server("trueflow-hub")
 
     @mcp_server.list_tools()
-    async def list_tools():
-        """List all available MCP tools."""
+    async def list_tools() -> list[Tool]:
+        """List available tools - all delegate to IDE."""
         return [
-            Tool(
-                name="list_projects",
-                description="List all connected IDE projects with their capabilities",
-                inputSchema={"type": "object", "properties": {}}
-            ),
-            Tool(
-                name="get_ai_server_status",
-                description="Get current AI server status across all IDEs",
-                inputSchema={"type": "object", "properties": {}}
-            ),
-            Tool(
-                name="start_ai_server",
-                description="Start AI server from a specific project",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string", "description": "Target project ID (optional, uses first available)"},
-                        "model": {"type": "string", "description": "Model to load (optional)"}
-                    }
-                }
-            ),
-            Tool(
-                name="stop_ai_server",
-                description="Stop the running AI server",
-                inputSchema={"type": "object", "properties": {}}
-            ),
-            Tool(
-                name="get_trace_data",
-                description="Get execution trace data from an IDE project. Returns JSON with call traces, timing, etc.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string", "description": "Project ID to get traces from"}
-                    },
-                    "required": ["project_id"]
-                }
-            ),
-            Tool(
-                name="get_dead_code",
-                description="Get dead/unreachable code analysis from an IDE project. Returns JSON with dead functions list.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string", "description": "Project ID to analyze"}
-                    },
-                    "required": ["project_id"]
-                }
-            ),
-            Tool(
-                name="get_performance_data",
-                description="Get performance profiling data from an IDE project. Returns JSON with hotspots, timing stats.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string", "description": "Project ID to get performance data from"}
-                    },
-                    "required": ["project_id"]
-                }
-            ),
-            Tool(
-                name="export_diagram",
-                description="Export sequence diagram (PlantUML/Mermaid) from an IDE project.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string", "description": "Project ID"},
-                        "format": {"type": "string", "enum": ["plantuml", "mermaid"], "description": "Diagram format"}
-                    },
-                    "required": ["project_id"]
-                }
-            ),
-            Tool(
-                name="generate_manim_video",
-                description="Generate Manim execution video for a project. Returns path to generated video.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string", "description": "Project ID"},
-                        "trace_id": {"type": "string", "description": "Trace/correlation ID (optional)"}
-                    },
-                    "required": ["project_id"]
-                }
-            ),
-            Tool(
-                name="send_command",
-                description="Send a custom command to an IDE project and get the response.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string", "description": "Target project ID"},
-                        "command": {"type": "string", "description": "Command name"},
-                        "args": {"type": "object", "description": "Command arguments"}
-                    },
-                    "required": ["project_id", "command"]
-                }
-            ),
-            Tool(
-                name="broadcast_message",
-                description="Broadcast a message to all connected IDEs (fire-and-forget).",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "message": {"type": "string", "description": "Message to broadcast"},
-                        "data": {"type": "object", "description": "Additional data"}
-                    },
-                    "required": ["message"]
-                }
-            )
+            # Hub status
+            Tool(name="list_projects", description="List connected IDE instances", inputSchema={"type": "object", "properties": {}, "required": []}),
+            Tool(name="get_project_info", description="Get hub and project info", inputSchema={"type": "object", "properties": {}, "required": []}),
+
+            # Analysis tools (delegate to IDE)
+            Tool(name="analyze_dead_code", description="Find dead/unreachable code (requires IDE)", inputSchema={"type": "object", "properties": {"source_dir": {"type": "string", "default": "src"}}, "required": []}),
+            Tool(name="analyze_performance", description="Analyze performance hotspots (requires IDE)", inputSchema={"type": "object", "properties": {"sort_by": {"type": "string", "default": "total_ms"}, "limit": {"type": "integer", "default": 20}}, "required": []}),
+            Tool(name="analyze_call_tree", description="Generate call tree (requires IDE)", inputSchema={"type": "object", "properties": {"root_function": {"type": "string"}, "max_depth": {"type": "integer", "default": 5}}, "required": []}),
+
+            # Explorer tools (delegate to IDE)
+            Tool(name="explorer_get_callers", description="Get all callers of a function (requires IDE)", inputSchema={"type": "object", "properties": {"function_name": {"type": "string"}, "max_depth": {"type": "integer", "default": 3}}, "required": ["function_name"]}),
+            Tool(name="explorer_get_callees", description="Get all callees of a function (requires IDE)", inputSchema={"type": "object", "properties": {"function_name": {"type": "string"}, "max_depth": {"type": "integer", "default": 3}}, "required": ["function_name"]}),
+            Tool(name="explorer_search", description="Search functions by name (requires IDE)", inputSchema={"type": "object", "properties": {"query": {"type": "string"}, "search_type": {"type": "string", "default": "function"}}, "required": ["query"]}),
+            Tool(name="explorer_get_call_chain", description="Get full call chain (requires IDE)", inputSchema={"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]}),
+            Tool(name="explorer_get_coverage_summary", description="Get coverage summary (requires IDE)", inputSchema={"type": "object", "properties": {}, "required": []}),
+            Tool(name="explorer_find_path", description="Find path between functions (requires IDE)", inputSchema={"type": "object", "properties": {"source": {"type": "string"}, "target": {"type": "string"}}, "required": ["source", "target"]}),
+            Tool(name="explorer_explain_function", description="AI explanation of a function (requires IDE)", inputSchema={"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]}),
+
+            # Export tools (delegate to IDE)
+            Tool(name="export_diagram", description="Export PlantUML/Mermaid diagram (requires IDE)", inputSchema={"type": "object", "properties": {"format": {"type": "string", "default": "plantuml"}, "output_file": {"type": "string"}}, "required": []}),
+            Tool(name="export_flamegraph", description="Export flamegraph JSON (requires IDE)", inputSchema={"type": "object", "properties": {"output_file": {"type": "string"}}, "required": []}),
+
+            # Manim tools (delegate to IDE)
+            Tool(name="manim_generate_video", description="Generate Manim video (requires IDE)", inputSchema={"type": "object", "properties": {"trace_file": {"type": "string"}, "quality": {"type": "string", "default": "low_quality"}}, "required": []}),
+            Tool(name="manim_list_videos", description="List generated videos (requires IDE)", inputSchema={"type": "object", "properties": {}, "required": []}),
+
+            # AI server tools (hub manages, IDE can start)
+            Tool(name="ai_server_start", description="Start llama.cpp server", inputSchema={"type": "object", "properties": {"model_path": {"type": "string"}, "port": {"type": "integer", "default": 8080}}, "required": []}),
+            Tool(name="ai_server_stop", description="Stop AI server", inputSchema={"type": "object", "properties": {}, "required": []}),
+            Tool(name="ai_server_status", description="Get AI server status", inputSchema={"type": "object", "properties": {}, "required": []}),
+
+            # Lazy tool loading (for low-throughput LLMs)
+            Tool(name="get_tool_categories", description="Get tool categories for lazy loading", inputSchema={"type": "object", "properties": {}, "required": []}),
+            Tool(name="smart_query", description="Auto-classify and route query to appropriate tool", inputSchema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
         ]
 
     @mcp_server.call_tool()
-    async def call_tool(name: str, arguments: dict):
-        """Handle MCP tool calls with RPC response waiting."""
+    async def call_tool(name: str, arguments: dict) -> Sequence[TextContent]:
+        """Route tool calls to IDE."""
+        try:
+            result = await _route_tool(name, arguments)
+            return [TextContent(type="text", text=result)]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
 
-        if name == "list_projects":
-            projects_info = []
-            for pid, info in hub.projects.items():
-                projects_info.append({
-                    "id": pid,
-                    "ide": info.get("ide"),
-                    "name": info.get("project_name"),
-                    "path": info.get("project_path"),
-                    "capabilities": info.get("capabilities", []),
-                    "registered_at": info.get("registered_at")
-                })
-            return [TextContent(
-                type="text",
-                text=json.dumps({"projects": projects_info, "count": len(projects_info)}, indent=2)
-            )]
 
-        elif name == "get_ai_server_status":
-            return [TextContent(
-                type="text",
-                text=json.dumps(hub.ai_server_status, indent=2)
-            )]
+async def _route_tool(name: str, args: dict) -> str:
+    """Route tool to IDE via RPC or handle locally."""
 
-        elif name == "start_ai_server":
-            project_id = arguments.get("project_id")
-            if not project_id or project_id not in hub.projects:
-                # Pick first available project
-                if hub.projects:
-                    project_id = list(hub.projects.keys())[0]
-                else:
-                    return [TextContent(type="text", text=json.dumps({"error": "No projects connected"}))]
+    # === Hub-local tools (no IDE needed) ===
 
-            # Send RPC request and wait for response
-            response = await rpc_call(project_id, "start_ai_server", {"model": arguments.get("model")})
-            if response:
-                return [TextContent(type="text", text=json.dumps(response, indent=2))]
-            return [TextContent(type="text", text=json.dumps({"status": "requested", "project": project_id}))]
+    if name == "list_projects":
+        return json.dumps({
+            "projects": [{
+                "id": pid,
+                "ide": info.get("ide"),
+                "project_name": info.get("project_name"),
+                "project_path": info.get("project_path"),
+                "capabilities": info.get("capabilities", []),
+                "registered_at": info.get("registered_at")
+            } for pid, info in state.projects.items()],
+            "count": len(state.projects),
+            "hub_status": "running"
+        }, indent=2)
 
-        elif name == "stop_ai_server":
-            # Broadcast stop command to all IDEs
-            await broadcast("command", {"command": "stop_ai_server"})
-            return [TextContent(type="text", text=json.dumps({"status": "broadcast_sent", "subscribers": len(hub.subscribers)}))]
+    if name == "get_project_info":
+        return json.dumps({
+            "hub_running": True,
+            "project_dir": str(state.project_dir),
+            "connected_ides": len(state.projects),
+            "ai_server": state.ai_server_status
+        }, indent=2)
 
-        elif name == "get_trace_data":
-            project_id = arguments.get("project_id")
+    if name == "ai_server_status":
+        return json.dumps(state.ai_server_status, indent=2)
 
-            # First check if we have cached trace data
-            if project_id in hub.trace_data:
-                return [TextContent(
-                    type="text",
-                    text=json.dumps(hub.trace_data[project_id], indent=2)
-                )]
+    if name == "get_tool_categories":
+        return json.dumps({
+            "categories": {
+                "analysis": {"tools": ["analyze_dead_code", "analyze_performance", "analyze_call_tree"], "requires_ide": True},
+                "explorer": {"tools": ["explorer_get_callers", "explorer_get_callees", "explorer_search", "explorer_get_call_chain", "explorer_find_path"], "requires_ide": True},
+                "export": {"tools": ["export_diagram", "export_flamegraph"], "requires_ide": True},
+                "video": {"tools": ["manim_generate_video", "manim_list_videos"], "requires_ide": True},
+                "ai": {"tools": ["ai_server_start", "ai_server_stop", "ai_server_status"], "requires_ide": False},
+                "hub": {"tools": ["list_projects", "get_project_info"], "requires_ide": False}
+            },
+            "note": "Most tools require an IDE (PyCharm/VS Code) with TrueFlow plugin connected."
+        }, indent=2)
 
-            # Otherwise, request fresh data via RPC
-            if project_id not in hub.projects:
-                return [TextContent(type="text", text=json.dumps({"error": f"Project {project_id} not found"}))]
+    if name == "smart_query":
+        return await _smart_query(args.get("query", ""))
 
-            response = await rpc_call(project_id, "get_trace_data", {})
-            if response:
-                return [TextContent(type="text", text=json.dumps(response, indent=2))]
-            return [TextContent(type="text", text=json.dumps({"error": f"No trace data from {project_id} (timeout)"}))]
+    # === AI server tools (hub can manage directly) ===
 
-        elif name == "get_dead_code":
-            project_id = arguments.get("project_id")
-            if project_id not in hub.projects:
-                return [TextContent(type="text", text=json.dumps({"error": f"Project {project_id} not found"}))]
+    if name == "ai_server_start":
+        return await _ai_server_start(args.get("model_path", ""), args.get("port", 8080))
 
-            response = await rpc_call(project_id, "get_dead_code", {})
-            if response:
-                return [TextContent(type="text", text=json.dumps(response, indent=2))]
-            return [TextContent(type="text", text=json.dumps({"error": f"No dead code data from {project_id} (timeout)"}))]
+    if name == "ai_server_stop":
+        return await _ai_server_stop()
 
-        elif name == "get_performance_data":
-            project_id = arguments.get("project_id")
-            if project_id not in hub.projects:
-                return [TextContent(type="text", text=json.dumps({"error": f"Project {project_id} not found"}))]
+    # === Tools that REQUIRE IDE ===
 
-            response = await rpc_call(project_id, "get_performance_data", {})
-            if response:
-                return [TextContent(type="text", text=json.dumps(response, indent=2))]
-            return [TextContent(type="text", text=json.dumps({"error": f"No performance data from {project_id} (timeout)"}))]
+    if not state.projects:
+        return require_ide(name)
 
-        elif name == "export_diagram":
-            project_id = arguments.get("project_id")
-            diagram_format = arguments.get("format", "plantuml")
+    # Map tool names to RPC commands
+    rpc_commands = {
+        "analyze_dead_code": "get_dead_code",
+        "analyze_performance": "get_performance_data",
+        "analyze_call_tree": "get_call_tree",
+        "explorer_get_callers": "get_callers",
+        "explorer_get_callees": "get_callees",
+        "explorer_search": "search_functions",
+        "explorer_get_call_chain": "get_call_chain",
+        "explorer_get_coverage_summary": "get_coverage_summary",
+        "explorer_find_path": "find_path",
+        "explorer_explain_function": "explain_function",
+        "export_diagram": "export_diagram",
+        "export_flamegraph": "export_flamegraph",
+        "manim_generate_video": "generate_manim",
+        "manim_list_videos": "list_videos",
+    }
 
-            if project_id not in hub.projects:
-                return [TextContent(type="text", text=json.dumps({"error": f"Project {project_id} not found"}))]
+    rpc_command = rpc_commands.get(name)
+    if not rpc_command:
+        return json.dumps({"error": f"Unknown tool: {name}"})
 
-            response = await rpc_call(project_id, "export_diagram", {"format": diagram_format})
-            if response:
-                return [TextContent(type="text", text=json.dumps(response, indent=2))]
-            return [TextContent(type="text", text=json.dumps({"error": f"No diagram from {project_id} (timeout)"}))]
+    # Send RPC to IDE
+    response = await rpc_to_ide(rpc_command, args)
 
-        elif name == "generate_manim_video":
-            project_id = arguments.get("project_id")
-            if project_id not in hub.projects:
-                return [TextContent(type="text", text=json.dumps({"error": f"Project {project_id} not found"}))]
+    if response is None:
+        return json.dumps({
+            "error": f"IDE did not respond to {name}",
+            "hint": "Ensure TrueFlow plugin is running in your IDE"
+        }, indent=2)
 
-            response = await rpc_call(project_id, "generate_manim", {"trace_id": arguments.get("trace_id")}, timeout=120)
-            if response:
-                return [TextContent(type="text", text=json.dumps(response, indent=2))]
-            return [TextContent(type="text", text=json.dumps({"error": f"Manim generation failed or timed out"}))]
+    return json.dumps(response, indent=2)
 
-        elif name == "send_command":
-            project_id = arguments.get("project_id")
-            command = arguments.get("command")
-            args = arguments.get("args", {})
 
-            if project_id not in hub.projects:
-                return [TextContent(type="text", text=json.dumps({"error": f"Project {project_id} not found"}))]
+# ============================================================================
+# AI SERVER MANAGEMENT (hub can do this directly)
+# ============================================================================
 
-            response = await rpc_call(project_id, command, args)
-            if response:
-                return [TextContent(type="text", text=json.dumps(response, indent=2))]
-            return [TextContent(type="text", text=json.dumps({"error": f"Command {command} failed or timed out"}))]
+async def _ai_server_start(model_path: str, port: int) -> str:
+    """Start AI server - try IDE first, fallback to direct."""
+    if state.ai_server_process and state.ai_server_process.poll() is None:
+        return json.dumps({"status": "already_running", **state.ai_server_status}, indent=2)
 
-        elif name == "broadcast_message":
-            await broadcast("message", {
-                "message": arguments.get("message"),
-                "data": arguments.get("data", {})
-            })
-            return [TextContent(type="text", text=json.dumps({"status": "broadcast_sent", "subscribers": len(hub.subscribers)}))]
+    # Try IDE first (may have GPU configured)
+    if state.projects:
+        response = await rpc_to_ide("start_ai_server", {"model": model_path, "port": port})
+        if response and response.get("status") == "started":
+            state.ai_server_status = {"running": True, "port": port, "model": model_path, "started_at": datetime.now().isoformat()}
+            return json.dumps({"status": "started_by_ide", **state.ai_server_status}, indent=2)
 
-        return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+    # Direct start
+    home = Path.home()
+    llama = home / ".trueflow" / "llama.cpp" / "build" / "bin" / "Release" / "llama-server.exe"
+    if not llama.exists():
+        llama = home / ".trueflow" / "llama.cpp" / "build" / "bin" / "llama-server"
+    if not llama.exists():
+        return json.dumps({"error": "llama-server not found", "hint": "Install llama.cpp to ~/.trueflow/llama.cpp"})
 
-# ==================== Main Entry Points ====================
-
-async def run_hub():
-    """Run both MCP server and WebSocket server."""
-    write_hub_status(True)
+    if not model_path:
+        models = home / ".trueflow" / "models"
+        if models.exists():
+            for g in models.glob("*.gguf"):
+                model_path = str(g)
+                break
+    if not model_path:
+        return json.dumps({"error": "No model found", "hint": "Download a model to ~/.trueflow/models/"})
 
     try:
-        # Run WebSocket server in background
-        ws_task = asyncio.create_task(run_websocket_server())
+        state.ai_server_process = subprocess.Popen(
+            [str(llama), "--model", model_path, "--port", str(port), "--ctx-size", "4096", "--host", "127.0.0.1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        # Wait for server to be ready
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                import urllib.request
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
+                state.ai_server_status = {"running": True, "port": port, "model": model_path, "started_at": datetime.now().isoformat()}
+                return json.dumps({"status": "started", **state.ai_server_status}, indent=2)
+            except:
+                continue
+        return json.dumps({"status": "starting", "note": "Server still loading..."})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
-        # Run MCP server on stdio
+
+async def _ai_server_stop() -> str:
+    """Stop AI server."""
+    if state.ai_server_process:
+        try:
+            state.ai_server_process.terminate()
+            state.ai_server_process.wait(timeout=5)
+        except:
+            pass
+        state.ai_server_process = None
+
+    state.ai_server_status = {"running": False, "port": 8080, "model": None, "started_by": None, "started_at": None}
+
+    # Also notify IDEs
+    if state.projects:
+        await rpc_to_ide("stop_ai_server", {})
+
+    return json.dumps({"status": "stopped"})
+
+
+# ============================================================================
+# SMART QUERY (auto-routing for lazy loading)
+# ============================================================================
+
+TOOL_KEYWORDS = {
+    "analyze_dead_code": ["dead", "unused", "unreachable", "uncalled"],
+    "analyze_performance": ["slow", "performance", "bottleneck", "hotspot", "time"],
+    "explorer_get_callers": ["who calls", "callers", "called by"],
+    "explorer_get_callees": ["what does", "callees", "calls to"],
+    "explorer_search": ["find", "search", "where is"],
+    "export_diagram": ["diagram", "plantuml", "mermaid", "sequence"],
+    "manim_generate_video": ["video", "animation", "manim"],
+}
+
+
+async def _smart_query(query: str) -> str:
+    """Classify query and route to appropriate tool."""
+    query_lower = query.lower()
+
+    # Check for greetings
+    if any(g in query_lower for g in ["hi", "hello", "hey", "help"]):
+        return json.dumps({
+            "response": "Hello! I'm TrueFlow. I can analyze your code for dead code, performance issues, and more. Ask me things like 'find dead code' or 'who calls step()'.",
+            "requires_ide": True,
+            "ide_connected": len(state.projects) > 0
+        }, indent=2)
+
+    # Find matching tool
+    best_tool = None
+    best_score = 0
+    for tool, keywords in TOOL_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in query_lower)
+        if score > best_score:
+            best_score = score
+            best_tool = tool
+
+    if not best_tool:
+        return json.dumps({
+            "response": "I'm not sure what you're asking. Try: 'find dead code', 'show performance hotspots', or 'who calls <function>'",
+            "available_tools": list(TOOL_KEYWORDS.keys())
+        }, indent=2)
+
+    if not state.projects:
+        return require_ide(best_tool)
+
+    # Extract function name if needed
+    args = {}
+    if "function" in best_tool or "callers" in best_tool or "callees" in best_tool:
+        import re
+        match = re.search(r'(?:calls?|function)\s+[`"\']?(\w+)[`"\']?', query_lower)
+        if match:
+            args["function_name"] = match.group(1)
+
+    # Route to tool
+    return await _route_tool(best_tool, args)
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+async def run_hub():
+    """Run the hub."""
+    write_hub_status(True)
+    try:
+        if HAS_WEBSOCKETS:
+            ws_task = asyncio.create_task(run_websocket_server())
         if HAS_MCP:
-            logger.info("Starting MCP server on stdio...")
-            async with stdio_server() as (read_stream, write_stream):
-                await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
-        else:
-            # Just run WebSocket if no MCP
+            logger.info("TrueFlow Hub starting (delegates to IDE for analysis)...")
+            async with stdio_server() as (read, write):
+                await mcp_server.run(read, write, mcp_server.create_initialization_options())
+        elif HAS_WEBSOCKETS:
             await ws_task
     finally:
         write_hub_status(False)
 
-async def run_ws_only():
-    """Run only WebSocket server (no MCP)."""
-    write_hub_status(True)
-    try:
-        await run_websocket_server()
-    finally:
-        write_hub_status(False)
 
 def main():
-    """Main entry point."""
     import argparse
     parser = argparse.ArgumentParser(description="TrueFlow MCP Hub")
-    parser.add_argument("--start", action="store_true", help="Start the hub server")
-    parser.add_argument("--ws-only", action="store_true", help="Run WebSocket server only (no MCP)")
-    parser.add_argument("--connect", action="store_true", help="Connect to existing hub")
-    parser.add_argument("--project", type=str, help="Project ID when connecting")
-    parser.add_argument("--ide", type=str, default="unknown", help="IDE type (vscode/pycharm)")
-    parser.add_argument("--status", action="store_true", help="Check hub status")
+    parser.add_argument("--start", action="store_true", help="Start the hub")
+    parser.add_argument("--status", action="store_true", help="Check status")
+    parser.add_argument("--ws-only", action="store_true", help="WebSocket only mode (no MCP)")
     args = parser.parse_args()
 
     if args.status:
-        status = read_hub_status()
-        if status:
-            print(json.dumps(status, indent=2))
+        if STATUS_FILE.exists():
+            print(STATUS_FILE.read_text())
         else:
             print("Hub not running")
         return
 
-    if args.start:
-        if is_hub_running():
-            print("Hub is already running on port 5680")
-            return
+    if is_hub_running():
+        print("Hub already running on port 5680")
+        return
 
-        print("Starting TrueFlow MCP Hub...")
-        try:
-            if args.ws_only:
-                asyncio.run(run_ws_only())
-            else:
-                asyncio.run(run_hub())
-        except KeyboardInterrupt:
-            print("\nShutting down...")
+    print("Starting TrueFlow Hub...")
+    try:
+        asyncio.run(run_hub())
+    except KeyboardInterrupt:
+        print("\nShutdown")
 
-    elif args.ws_only:
-        if is_hub_running():
-            print("Hub is already running on port 5680")
-            return
-
-        print("Starting TrueFlow WebSocket Hub (no MCP)...")
-        try:
-            asyncio.run(run_ws_only())
-        except KeyboardInterrupt:
-            print("\nShutting down...")
-
-    elif args.connect:
-        # This mode is for IDEs to connect as clients
-        # The actual connection logic would be in the IDE plugins
-        print(f"Connect mode - project={args.project}, ide={args.ide}")
-        print("Use the IDE plugin to connect to ws://127.0.0.1:5680")
 
 if __name__ == "__main__":
     main()

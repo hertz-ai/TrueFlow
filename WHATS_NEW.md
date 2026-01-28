@@ -28,7 +28,7 @@ The "Why Not Covered" analysis now intelligently traces up the entire call chain
 
 **Real Branch Conditions from Source Code**
 No more guessing! TrueFlow now parses your actual source code (Python and Java) to show the real branch conditions:
-- Before: "condition was False"
+- Before: "condition was False"fii
 - After: `if config.enabled and user.is_admin:` with line number for one-click navigation
 
 **Java Instrumentation Support**

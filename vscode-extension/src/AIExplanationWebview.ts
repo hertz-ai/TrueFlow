@@ -161,6 +161,13 @@ export class AIExplanationProvider {
     private currentDiagramData: string = '';
     private contextSelection: number = 0;
 
+    // Extended data for RPC (set via setExplorerData)
+    private callGraphData: Record<string, string[]> = {};
+    private allDefinedFunctions: Set<string> = new Set();
+    private functionDefinitions: Map<string, { file: string; line: number }> = new Map();
+    private coveredFunctions: Set<string> = new Set();
+    private functionDurations: Map<string, number[]> = new Map();
+
     // Chunking and interrupt control
     private isOperationCancelled = false;
     private readonly TOKEN_CHUNK_SIZE = 200;
@@ -606,6 +613,52 @@ export class AIExplanationProvider {
                 case 'stop_ai_server':
                     this.stopServer();
                     responseData = { status: 'stopped' };
+                    break;
+
+                // === New RPC handlers for MCP Hub ===
+
+                case 'get_call_tree':
+                    responseData = this.buildCallTree(args.root_function, args.max_depth || 5);
+                    break;
+
+                case 'get_callers':
+                    responseData = this.getCallers(args.function_name || '', args.max_depth || 3);
+                    break;
+
+                case 'get_callees':
+                    responseData = this.getCallees(args.function_name || '', args.max_depth || 3);
+                    break;
+
+                case 'search_functions':
+                    responseData = this.searchFunctions(args.query || '');
+                    break;
+
+                case 'get_call_chain':
+                    responseData = this.getCallChain(args.function_name || '');
+                    break;
+
+                case 'get_coverage_summary':
+                    responseData = this.getCoverageSummary();
+                    break;
+
+                case 'find_path':
+                    responseData = this.findPath(args.source || '', args.target || '');
+                    break;
+
+                case 'explain_function':
+                    responseData = this.explainFunction(args.function_name || '');
+                    break;
+
+                case 'export_flamegraph':
+                    responseData = this.getFlamegraphData();
+                    break;
+
+                case 'generate_manim':
+                    responseData = { status: 'triggered', note: 'Manim generation is async' };
+                    break;
+
+                case 'list_videos':
+                    responseData = this.listManimVideos();
                     break;
 
                 default:
@@ -3140,6 +3193,286 @@ Command: ${llamaServer} ${args.join(' ')}
 
     public setSqlAnalysisData(data: any): void {
         this.sqlAnalysisData = data;
+    }
+
+    /**
+     * Set explorer data for RPC handlers (call graph, coverage, etc.)
+     */
+    public setExplorerData(data: {
+        callGraph?: Record<string, string[]>;
+        functions?: Array<{ name: string; file: string; line: number }>;
+        coveredFunctions?: string[];
+        functionDurations?: Record<string, number[]>;
+    }): void {
+        if (data.callGraph) {
+            this.callGraphData = data.callGraph;
+        }
+        if (data.functions) {
+            this.allDefinedFunctions.clear();
+            this.functionDefinitions.clear();
+            data.functions.forEach(f => {
+                this.allDefinedFunctions.add(f.name);
+                this.functionDefinitions.set(f.name, { file: f.file, line: f.line });
+            });
+        }
+        if (data.coveredFunctions) {
+            this.coveredFunctions = new Set(data.coveredFunctions);
+        }
+        if (data.functionDurations) {
+            this.functionDurations.clear();
+            Object.entries(data.functionDurations).forEach(([k, v]) => {
+                this.functionDurations.set(k, v);
+            });
+        }
+    }
+
+    // ==================== RPC Helper Methods ====================
+
+    private buildReverseCallGraph(): Record<string, string[]> {
+        const reverse: Record<string, string[]> = {};
+        Object.entries(this.callGraphData).forEach(([caller, callees]) => {
+            callees.forEach(callee => {
+                if (!reverse[callee]) reverse[callee] = [];
+                if (!reverse[callee].includes(caller)) reverse[callee].push(caller);
+            });
+        });
+        return reverse;
+    }
+
+    private buildCallTree(rootFunction: string | undefined, maxDepth: number): any {
+        const entryPoints = Array.from(this.allDefinedFunctions).filter(f => {
+            const reverse = this.buildReverseCallGraph();
+            return !reverse[f] || reverse[f].length === 0;
+        });
+
+        const buildNode = (func: string, depth: number, visited: Set<string>): any => {
+            if (depth >= maxDepth || visited.has(func)) {
+                return { function: func, depth, truncated: true };
+            }
+            visited.add(func);
+            const callees = this.callGraphData[func] || [];
+            return {
+                function: func,
+                depth,
+                children: callees.slice(0, 10).map(c => buildNode(c, depth + 1, new Set(visited)))
+            };
+        };
+
+        const roots = rootFunction
+            ? Array.from(this.allDefinedFunctions).filter(f => f.toLowerCase().includes(rootFunction.toLowerCase())).slice(0, 3)
+            : entryPoints.slice(0, 5);
+
+        return {
+            tree: roots.map(r => buildNode(r, 0, new Set())),
+            entry_points: entryPoints.slice(0, 20)
+        };
+    }
+
+    private getCallers(functionName: string, maxDepth: number): any {
+        const matches = Array.from(this.allDefinedFunctions).filter(f => f.toLowerCase().includes(functionName.toLowerCase()));
+        if (matches.length === 0) return { error: `Function '${functionName}' not found` };
+
+        const func = matches[0];
+        const reverse = this.buildReverseCallGraph();
+
+        const getCallersRecursive = (f: string, depth: number, visited: Set<string>): string[] => {
+            if (depth > maxDepth || visited.has(f)) return [];
+            visited.add(f);
+            const callers = reverse[f] || [];
+            return [...callers, ...callers.flatMap(c => getCallersRecursive(c, depth + 1, new Set(visited)))];
+        };
+
+        const callers = [...new Set(getCallersRecursive(func, 0, new Set()))];
+        return { function: func, callers: callers.slice(0, 50), count: callers.length };
+    }
+
+    private getCallees(functionName: string, maxDepth: number): any {
+        const matches = Array.from(this.allDefinedFunctions).filter(f => f.toLowerCase().includes(functionName.toLowerCase()));
+        if (matches.length === 0) return { error: `Function '${functionName}' not found` };
+
+        const func = matches[0];
+
+        const getCalleesRecursive = (f: string, depth: number, visited: Set<string>): string[] => {
+            if (depth > maxDepth || visited.has(f)) return [];
+            visited.add(f);
+            const callees = this.callGraphData[f] || [];
+            return [...callees, ...callees.flatMap(c => getCalleesRecursive(c, depth + 1, new Set(visited)))];
+        };
+
+        const callees = [...new Set(getCalleesRecursive(func, 0, new Set()))];
+        return { function: func, callees: callees.slice(0, 50), count: callees.length };
+    }
+
+    private searchFunctions(query: string): any {
+        const matches = Array.from(this.allDefinedFunctions)
+            .filter(f => f.toLowerCase().includes(query.toLowerCase()))
+            .slice(0, 50)
+            .map(f => {
+                const def = this.functionDefinitions.get(f);
+                return {
+                    function: f,
+                    file: def?.file || '-',
+                    line: def?.line || 0,
+                    covered: this.coveredFunctions.has(f)
+                };
+            });
+        return { query, results: matches, total: matches.length };
+    }
+
+    private getCallChain(functionName: string): any {
+        const matches = Array.from(this.allDefinedFunctions).filter(f => f.toLowerCase().includes(functionName.toLowerCase()));
+        if (matches.length === 0) return { error: `Function '${functionName}' not found` };
+
+        const func = matches[0];
+        const reverse = this.buildReverseCallGraph();
+
+        const getUpstream = (f: string, visited: Set<string>): string[] => {
+            if (visited.has(f)) return [];
+            visited.add(f);
+            const callers = reverse[f] || [];
+            return [...callers, ...callers.flatMap(c => getUpstream(c, new Set(visited)))];
+        };
+
+        const getDownstream = (f: string, visited: Set<string>): string[] => {
+            if (visited.has(f)) return [];
+            visited.add(f);
+            const callees = this.callGraphData[f] || [];
+            return [...callees, ...callees.flatMap(c => getDownstream(c, new Set(visited)))];
+        };
+
+        const upstream = [...new Set(getUpstream(func, new Set()))];
+        const downstream = [...new Set(getDownstream(func, new Set()))];
+
+        return {
+            function: func,
+            upstream: upstream.slice(0, 50),
+            downstream: downstream.slice(0, 50),
+            upstream_count: upstream.length,
+            downstream_count: downstream.length
+        };
+    }
+
+    private getCoverageSummary(): any {
+        const totalDefined = this.allDefinedFunctions.size;
+        const totalCovered = this.coveredFunctions.size;
+        const deadCount = totalDefined - totalCovered;
+
+        const moduleStats: Record<string, { defined: number; covered: number }> = {};
+        this.allDefinedFunctions.forEach(func => {
+            const module = func.includes('.') ? func.substring(0, func.lastIndexOf('.')) : 'unknown';
+            if (!moduleStats[module]) moduleStats[module] = { defined: 0, covered: 0 };
+            moduleStats[module].defined++;
+            if (this.coveredFunctions.has(func)) moduleStats[module].covered++;
+        });
+
+        return {
+            total_defined: totalDefined,
+            total_covered: totalCovered,
+            dead_count: deadCount,
+            coverage_percent: totalDefined > 0 ? (totalCovered / totalDefined) * 100 : 0,
+            modules: Object.entries(moduleStats)
+                .sort((a, b) => b[1].defined - a[1].defined)
+                .slice(0, 20)
+                .map(([module, stats]) => ({ module, ...stats }))
+        };
+    }
+
+    private findPath(source: string, target: string): any {
+        const srcMatches = Array.from(this.allDefinedFunctions).filter(f => f.toLowerCase().includes(source.toLowerCase()));
+        const tgtMatches = Array.from(this.allDefinedFunctions).filter(f => f.toLowerCase().includes(target.toLowerCase()));
+
+        if (srcMatches.length === 0) return { error: `Source '${source}' not found` };
+        if (tgtMatches.length === 0) return { error: `Target '${target}' not found` };
+
+        const srcKey = srcMatches[0];
+        const tgtKey = tgtMatches[0];
+
+        // BFS
+        const queue: Array<{ node: string; path: string[] }> = [{ node: srcKey, path: [srcKey] }];
+        const visited = new Set([srcKey]);
+
+        while (queue.length > 0) {
+            const { node, path } = queue.shift()!;
+            if (node === tgtKey) {
+                return { source: srcKey, target: tgtKey, path, length: path.length - 1, reachable: true };
+            }
+            for (const callee of this.callGraphData[node] || []) {
+                if (!visited.has(callee)) {
+                    visited.add(callee);
+                    queue.push({ node: callee, path: [...path, callee] });
+                }
+            }
+        }
+
+        return { source: srcKey, target: tgtKey, reachable: false };
+    }
+
+    private explainFunction(functionName: string): any {
+        const chain = this.getCallChain(functionName);
+        if (chain.error) return chain;
+        return {
+            function: chain.function,
+            call_chain: chain,
+            context: `Function: ${chain.function}\nUpstream: ${chain.upstream_count} callers\nDownstream: ${chain.downstream_count} callees`
+        };
+    }
+
+    private getFlamegraphData(): any {
+        const frames: any[] = [];
+        const samples: number[][] = [];
+        const weights: number[] = [];
+
+        const funcList = Array.from(this.functionDurations.keys());
+        funcList.forEach((func, index) => {
+            const def = this.functionDefinitions.get(func);
+            frames.push({ name: func, file: def?.file || '' });
+            samples.push([index]);
+            const durations = this.functionDurations.get(func) || [];
+            weights.push(durations.reduce((a, b) => a + b, 0));
+        });
+
+        return {
+            shared: { frames },
+            profiles: [{
+                type: 'sampled',
+                name: 'TrueFlow',
+                unit: 'milliseconds',
+                startValue: 0,
+                endValue: weights.reduce((a, b) => a + b, 0),
+                samples,
+                weights
+            }]
+        };
+    }
+
+    private listManimVideos(): any {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) return { videos: [], count: 0 };
+
+        const mediaDir = path.join(workspaceFolders[0].uri.fsPath, '.vscode', 'manim', 'media', 'videos');
+        const videos: any[] = [];
+
+        if (fs.existsSync(mediaDir)) {
+            const walkSync = (dir: string) => {
+                fs.readdirSync(dir).forEach(file => {
+                    const filePath = path.join(dir, file);
+                    if (fs.statSync(filePath).isDirectory()) {
+                        walkSync(filePath);
+                    } else if (file.endsWith('.mp4')) {
+                        const stat = fs.statSync(filePath);
+                        videos.push({
+                            path: filePath,
+                            name: file,
+                            size_mb: stat.size / 1024 / 1024,
+                            modified: stat.mtimeMs
+                        });
+                    }
+                });
+            };
+            try { walkSync(mediaDir); } catch (e) { /* ignore */ }
+        }
+
+        return { videos: videos.slice(0, 20), count: videos.length };
     }
 
     /**

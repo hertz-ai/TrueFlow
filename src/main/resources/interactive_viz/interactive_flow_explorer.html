@@ -1745,6 +1745,12 @@
                 searchResults.innerHTML = html;
                 searchResults.classList.add('visible');
 
+                // Prioritize search results for auto-explain caching
+                const searchedFunctions = functionMatches.map(m => m.name);
+                if (searchedFunctions.length > 0) {
+                    this.prioritizeFunctionsForCache(searchedFunctions, 'search');
+                }
+
                 // Add click handlers
                 searchResults.querySelectorAll('.search-result-item').forEach(item => {
                     item.addEventListener('click', () => {
@@ -3842,10 +3848,19 @@
                 this.selectedNode = node;
                 const funcName = node.userData.name;
 
+                // Prioritize focused node and its path for auto-explain caching
+                this.prioritizeFunctionForCache(funcName, 'focus');
+
                 // Find upstream and downstream paths
                 const upstreamNodes = new Set(this.findUpstreamPath(funcName));
                 const downstreamNodes = new Set(this.findDownstreamPath(funcName));
                 console.log('[selectNode] upstream:', upstreamNodes.size, 'downstream:', downstreamNodes.size);
+
+                // Also prioritize nodes in the path (user is likely interested in these)
+                const pathNodes = [...upstreamNodes, ...downstreamNodes].slice(0, 10);
+                if (pathNodes.length > 0) {
+                    this.prioritizeFunctionsForCache(pathNodes, 'focus_path');
+                }
 
                 // Store current highlight info
                 this.currentHighlight = {
@@ -4757,16 +4772,27 @@
                 const hasDeadIncomingPaths = data.hasDeadIncomingPaths || false;
 
                 // Find which callers are dead vs alive (for partial coverage explanation)
+                // Include file/line info so we can read their source code
                 const deadCallers = [];
                 const aliveCallers = [];
+                const deadCallerFiles = [];  // Full file info for dead callers
                 if (isAlive && hasDeadIncomingPaths) {
                     const allCallers = this.findAllParents(funcName);
                     const coveredFunctions = new Set(this.data?.covered_functions || []);
                     allCallers.forEach(caller => {
+                        const callerNode = this.nodes.get(caller);
                         if (coveredFunctions.has(caller)) {
                             aliveCallers.push(caller);
                         } else {
                             deadCallers.push(caller);
+                            // Add file info for dead callers so we can read their source
+                            if (callerNode?.userData?.info?.file) {
+                                deadCallerFiles.push({
+                                    function: caller,
+                                    file: callerNode.userData.info.file,
+                                    line: callerNode.userData.info.line || 0
+                                });
+                            }
                         }
                     });
                 }
@@ -4865,7 +4891,8 @@ ${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
                             // Partial incoming coverage info
                             hasDeadIncomingPaths: hasDeadIncomingPaths,
                             deadCallers: deadCallers,
-                            aliveCallers: aliveCallers
+                            aliveCallers: aliveCallers,
+                            deadCallerFiles: deadCallerFiles  // File info for reading dead caller source
                         }),
                         onSuccess: function(response) {
                             console.log('[Explorer] AI explanation request sent');
@@ -4934,6 +4961,72 @@ ${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
             }
 
             /**
+             * Prioritize a single function for auto-explain caching.
+             * Called when user focuses/clicks on a node.
+             */
+            prioritizeFunctionForCache(funcName, reason = 'user_interaction') {
+                if (!funcName) return;
+
+                // Only prioritize dead/uncovered functions (they need explanations)
+                const coveredSet = new Set(this.data?.covered_functions || []);
+                if (coveredSet.has(funcName)) return;  // Already covered, no need
+
+                if (typeof window.cefQuery === 'function') {
+                    window.cefQuery({
+                        request: JSON.stringify({
+                            action: 'prioritize',
+                            function: funcName,
+                            reason: reason
+                        }),
+                        onSuccess: () => {},
+                        onFailure: (code, msg) => console.log('[Prioritize] Failed:', msg)
+                    });
+                } else {
+                    // Browser mode - use HTTP API (non-blocking)
+                    fetch('/api/ai/prioritize', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ function: funcName, reason: reason })
+                    }).catch(() => {});  // Ignore errors for background prioritization
+                }
+            }
+
+            /**
+             * Prioritize multiple functions for auto-explain caching.
+             * Called when user searches (to preemptively cache search results).
+             */
+            prioritizeFunctionsForCache(funcNames, reason = 'search') {
+                if (!funcNames || funcNames.length === 0) return;
+
+                // Only prioritize dead/uncovered functions
+                const coveredSet = new Set(this.data?.covered_functions || []);
+                const deadFunctions = funcNames.filter(f => !coveredSet.has(f));
+                if (deadFunctions.length === 0) return;
+
+                // Limit to top 10 to avoid overwhelming the queue
+                const toSend = deadFunctions.slice(0, 10);
+
+                if (typeof window.cefQuery === 'function') {
+                    window.cefQuery({
+                        request: JSON.stringify({
+                            action: 'prioritize',
+                            functions: toSend,
+                            reason: reason
+                        }),
+                        onSuccess: () => {},
+                        onFailure: (code, msg) => console.log('[Prioritize] Failed:', msg)
+                    });
+                } else {
+                    // Browser mode - use HTTP API (non-blocking)
+                    fetch('/api/ai/prioritize', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ functions: toSend, reason: reason })
+                    }).catch(() => {});
+                }
+            }
+
+            /**
              * Show LLM status message in the info panel.
              */
             showLLMMessage(message, type) {
@@ -4969,7 +5062,7 @@ ${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
             /**
              * Show AI explanation response.
              */
-            showAIExplanation(funcName, explanation) {
+            showAIExplanation(funcName, explanation, cached = false) {
                 const content = document.getElementById('info-content');
                 if (!content) return;
 
@@ -4987,12 +5080,43 @@ ${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
                     .replace(/\n/g, '<br>')
                     .replace(/`([^`]+)`/g, '<code style="background: rgba(0,0,0,0.3); padding: 2px 4px; border-radius: 3px;">$1</code>');
 
+                const cacheIndicator = cached
+                    ? '<span style="color: #f97316; font-size: 10px; margin-left: 8px;">⚡ cached</span>'
+                    : '';
+
                 aiSection.innerHTML = `
-                    <h4 style="color: #4ade80; margin-bottom: 8px; font-size: 12px;">✨ AI Explanation</h4>
+                    <h4 style="color: #4ade80; margin-bottom: 8px; font-size: 12px;">✨ AI Explanation${cacheIndicator}</h4>
                     <div style="color: #ccc; font-size: 11px; line-height: 1.6; max-height: 200px; overflow-y: auto;">
                         ${formattedExplanation}
                     </div>
                 `;
+            }
+
+            /**
+             * Mark a node as having a cached explanation (visual indicator).
+             */
+            markNodeHasCachedExplanation(funcName) {
+                const node = this.nodes.get(funcName);
+                if (!node) return;
+
+                // Store the cached flag in userData
+                node.userData.hasCachedExplanation = true;
+
+                // Add a small indicator (tiny dot) to show cached explanation available
+                // Only add if not already added
+                if (!node.userData.cacheIndicator) {
+                    const indicatorGeometry = new THREE.SphereGeometry(0.15, 8, 8);
+                    const indicatorMaterial = new THREE.MeshBasicMaterial({
+                        color: 0xf97316,  // Orange
+                        transparent: true,
+                        opacity: 0.9
+                    });
+                    const indicator = new THREE.Mesh(indicatorGeometry, indicatorMaterial);
+                    indicator.position.set(0.8, 0.8, 0);  // Top-right corner
+                    indicator.renderOrder = 10;
+                    node.add(indicator);
+                    node.userData.cacheIndicator = indicator;
+                }
             }
         }
 
@@ -5025,10 +5149,31 @@ ${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
         window.handleLLMResponse = function(responseData) {
             try {
                 const data = typeof responseData === 'string' ? JSON.parse(responseData) : responseData;
-                console.log('[Explorer] LLM Response for:', data.function);
-                explorer.showAIExplanation(data.function, data.explanation);
+                console.log('[Explorer] LLM Response for:', data.function, data.cached ? '(cached)' : '(fresh)');
+                explorer.showAIExplanation(data.function, data.explanation, data.cached);
             } catch (e) {
                 console.error('Failed to handle LLM response:', e);
+            }
+        };
+
+        // Handle cached explanation from background auto-explain
+        window.handleCachedExplanation = function(responseData) {
+            try {
+                const data = typeof responseData === 'string' ? JSON.parse(responseData) : responseData;
+                console.log('[Explorer] Cached explanation received for:', data.function);
+                // Store in local cache for quick tooltip display
+                if (!window.cachedExplanations) {
+                    window.cachedExplanations = {};
+                }
+                window.cachedExplanations[data.function] = {
+                    explanation: data.explanation,
+                    whyNotCovered: data.whyNotCovered,
+                    cached: true
+                };
+                // Update node to show it has a cached explanation (add indicator)
+                explorer.markNodeHasCachedExplanation(data.function);
+            } catch (e) {
+                console.error('Failed to handle cached explanation:', e);
             }
         };
 
