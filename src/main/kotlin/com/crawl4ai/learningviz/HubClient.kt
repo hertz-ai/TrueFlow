@@ -99,13 +99,21 @@ class HubClient private constructor() : Disposable {
             PluginLogger.info("[TrueFlow Hub] Hub not running, starting...")
             startHub()
 
-            // Wait a bit for hub to start
-            Thread.sleep(2000)
+            // Hub needs time to start (Python startup + module imports + bind port)
+            // Retry with backoff: 2s, 3s, 4s = ~9s total wait
+            for (attempt in 1..3) {
+                Thread.sleep(1000L + attempt * 1000L)
+                PluginLogger.debug("[TrueFlow Hub] Post-start connect attempt $attempt/3")
+                if (tryConnect()) {
+                    reconnectAttempts = 0 // Reset since hub just started fresh
+                    isConnecting.set(false)
+                    return true
+                }
+            }
 
-            // Try connecting again
-            val connected = tryConnect()
+            PluginLogger.warn("[TrueFlow Hub] Hub started but connection still failing")
             isConnecting.set(false)
-            return connected
+            return false
 
         } catch (e: Exception) {
             PluginLogger.warn("[TrueFlow Hub] Connection error: ${e.message}")
@@ -218,7 +226,9 @@ class HubClient private constructor() : Disposable {
 
     private fun scheduleReconnect() {
         if (reconnectAttempts >= maxReconnectAttempts) {
-            PluginLogger.info("[TrueFlow Hub] Max reconnect attempts reached")
+            PluginLogger.info("[TrueFlow Hub] Max reconnect attempts reached, will restart hub on next connect()")
+            // Reset so next explicit connect() call will restart the hub
+            reconnectAttempts = 0
             return
         }
 
@@ -322,16 +332,37 @@ class HubClient private constructor() : Disposable {
             }
 
             if (hubScript == null) {
-                PluginLogger.warn("[TrueFlow Hub] Hub script not found")
+                PluginLogger.warn("[TrueFlow Hub] Hub script not found in: $possiblePaths")
                 return
             }
 
-            // Start hub in background (WebSocket only mode)
+            PluginLogger.info("[TrueFlow Hub] Starting hub from: ${hubScript.absolutePath}")
+
+            // Start hub in background (WebSocket only mode - no MCP stdio)
             val process = ProcessBuilder(findPython(), hubScript.absolutePath, "--ws-only")
                 .redirectErrorStream(true)
                 .start()
 
-            PluginLogger.info("[TrueFlow Hub] Started hub process")
+            // Capture hub output in background thread for debugging
+            Thread({
+                try {
+                    process.inputStream.bufferedReader().useLines { lines ->
+                        for (line in lines) {
+                            PluginLogger.debug("[TrueFlow Hub stdout] $line")
+                        }
+                    }
+                } catch (_: Exception) { }
+
+                // Log exit code when process ends
+                val exitCode = try { process.waitFor() } catch (_: Exception) { -1 }
+                if (exitCode != 0) {
+                    PluginLogger.warn("[TrueFlow Hub] Hub process exited with code $exitCode")
+                } else {
+                    PluginLogger.info("[TrueFlow Hub] Hub process exited normally")
+                }
+            }, "trueflow-hub-output").apply { isDaemon = true }.start()
+
+            PluginLogger.info("[TrueFlow Hub] Started hub process (PID pending)")
 
         } catch (e: Exception) {
             PluginLogger.warn("[TrueFlow Hub] Failed to start hub: ${e.message}")

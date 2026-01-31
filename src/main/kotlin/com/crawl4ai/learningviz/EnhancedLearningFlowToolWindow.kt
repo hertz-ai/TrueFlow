@@ -299,6 +299,14 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private val lastServerDetectedPort = AtomicInteger(0)
     private val serverNotificationShown = AtomicBoolean(false)
     private val defaultTracePort = 5678
+// Debounce / anti-spam for server detection notifications
+private val serverNotificationCooldownMs = 60_000L // 1 minute
+private val lastServerNotificationAt = AtomicLong(0)
+private val serverIsUp = AtomicBoolean(false) // Tracks "server up epoch" (DOWN -> UP transition)
+
+// Avoid resetting detection state on a single transient failure
+private val consecutiveServerMisses = AtomicInteger(0)
+private val missesToReset = 3
 
     // Button pulse animation
     private var buttonPulseTimer: javax.swing.Timer? = null
@@ -2958,24 +2966,44 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     }
 
     private fun checkForTraceServer() {
-        // Check MCP/AI server status (llama.cpp on port 8080)
-        val mcpPort = 8080
-        val mcpAvailable = isPortListening("127.0.0.1", mcpPort)
+        // Check MCP Hub status (WebSocket on port 5680) + AI server (llama.cpp on port 8080)
+        val hubConnected = try { HubClient.getInstance().isConnected() } catch (_: Exception) { false }
+        val hubPortUp = if (!hubConnected) isPortListening("127.0.0.1", 5680) else true
+        val aiPort = 8080
+        val aiAvailable = isPortListening("127.0.0.1", aiPort)
+
         SwingUtilities.invokeLater {
-            if (mcpAvailable) {
-                mcpStatusLabel.text = "MCP: ●"
-                mcpStatusLabel.foreground = JBColor(0x228B22, 0x66CC66)  // Green
-                mcpStatusLabel.toolTipText = "MCP/AI Server running on port $mcpPort (llama.cpp)"
-            } else {
-                mcpStatusLabel.text = "MCP: ○"
-                mcpStatusLabel.foreground = JBColor(0x888888, 0x888888)  // Gray
-                mcpStatusLabel.toolTipText = "MCP/AI Server not running - start llama.cpp on port $mcpPort for AI features"
+            when {
+                hubConnected && aiAvailable -> {
+                    mcpStatusLabel.text = "MCP: ●  AI: ●"
+                    mcpStatusLabel.foreground = JBColor(0x228B22, 0x66CC66)  // Green
+                    mcpStatusLabel.toolTipText = "MCP Hub connected (ws://127.0.0.1:5680) | AI server running on port $aiPort"
+                }
+                hubConnected && !aiAvailable -> {
+                    mcpStatusLabel.text = "MCP: ●  AI: ○"
+                    mcpStatusLabel.foreground = JBColor(0x228B22, 0x66CC66)  // Green
+                    mcpStatusLabel.toolTipText = "MCP Hub connected (ws://127.0.0.1:5680) | AI server offline - start llama.cpp on port $aiPort"
+                }
+                hubPortUp && !hubConnected -> {
+                    mcpStatusLabel.text = "MCP: ◐  AI: ${if (aiAvailable) "●" else "○"}"
+                    mcpStatusLabel.foreground = JBColor(0xDAA520, 0xFFD700)  // Amber
+                    mcpStatusLabel.toolTipText = "MCP Hub running but not connected (ws://127.0.0.1:5680)"
+                }
+                !hubConnected && aiAvailable -> {
+                    mcpStatusLabel.text = "MCP: ○  AI: ●"
+                    mcpStatusLabel.foreground = JBColor(0xDAA520, 0xFFD700)  // Amber
+                    mcpStatusLabel.toolTipText = "MCP Hub offline | AI server running on port $aiPort"
+                }
+                else -> {
+                    mcpStatusLabel.text = "MCP: ○  AI: ○"
+                    mcpStatusLabel.foreground = JBColor(0x888888, 0x888888)  // Gray
+                    mcpStatusLabel.toolTipText = "MCP Hub offline (ws://127.0.0.1:5680) | AI server offline (port $aiPort)"
+                }
             }
         }
 
         // Don't check if already connected
         if (currentTraceMode == TraceMode.SOCKET_REALTIME && traceSocketClient?.isConnected() == true) {
-            serverNotificationShown.set(false) // Reset so we can notify again after disconnect
             SwingUtilities.invokeLater { resetAttachButtonStyle() }
             return
         }
@@ -3017,24 +3045,66 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
         }
 
         if (isAvailable) {
-            // Server detected - keep button in "detected" state
-            SwingUtilities.invokeLater { setAttachButtonServerDetected(port) }
+            consecutiveServerMisses.set(0)
 
-            // Show notification only once per detection
-            if (lastServerDetectedPort.get() != port || !serverNotificationShown.getAndSet(true)) {
-                lastServerDetectedPort.set(port)
-                SwingUtilities.invokeLater {
-                    showServerDetectedNotification(port)
+            SwingUtilities.invokeLater { setAttachButtonServerDetected(port) }
+            // DOWN -> UP transition => new epoch (e.g., app process restarted)
+            val wasUp = serverIsUp.getAndSet(true)
+            if (!wasUp) {
+                // Allow exactly one notification for this new "up" epoch
+                serverNotificationShown.set(false)
+                PluginLogger.debug("[ServerDetection] DOWN->UP transition detected, resetting notification flag")
+            }
+
+            // Only notify when NOT connected (extra safety)
+            val isConnectedNow = (currentTraceMode == TraceMode.SOCKET_REALTIME && traceSocketClient?.isConnected() == true)
+            if (!isConnectedNow) {
+                val now = System.currentTimeMillis()
+
+                // If the port changed, allow a new notification (but still cooldown it)
+                val portChanged = lastServerDetectedPort.get() != port
+                val cooldownPassed = (now - lastServerNotificationAt.get()) >= serverNotificationCooldownMs
+                val wasShown = serverNotificationShown.getAndSet(true) // Always mark as shown
+
+                // First time = port changed OR was not shown before
+                val firstTimeForThisDetection = portChanged || !wasShown
+
+                PluginLogger.debug("[ServerDetection] port=$port, portChanged=$portChanged, cooldownPassed=$cooldownPassed, wasShown=$wasShown, firstTime=$firstTimeForThisDetection")
+
+                if (firstTimeForThisDetection && cooldownPassed) {
+                    lastServerDetectedPort.set(port)
+                    lastServerNotificationAt.set(now)
+                    PluginLogger.info("[ServerDetection] Showing notification for port $port")
+
+                    SwingUtilities.invokeLater {
+                        showServerDetectedNotification(port)
+                    }
+                } else {
+                    // still remember port even if we skip notifying due to cooldown
+                    lastServerDetectedPort.set(port)
+                    PluginLogger.debug("[ServerDetection] Skipping notification: firstTime=$firstTimeForThisDetection, cooldownPassed=$cooldownPassed")
                 }
+            } else {
+                PluginLogger.debug("[ServerDetection] Already connected, skipping notification")
             }
         } else {
-            // Server not available - reset to normal state
-            if (lastServerDetectedPort.get() == port) {
-                lastServerDetectedPort.set(0)
-                serverNotificationShown.set(false)
-                SwingUtilities.invokeLater { resetAttachButtonStyle() }
+            // Don't reset "shown" on a single miss; socket connect can flap.
+            val misses = consecutiveServerMisses.incrementAndGet()
+            if (misses >= missesToReset) {
+                // after N consecutive misses, reset button + detection port,
+                // but KEEP serverNotificationShown=true so we don't spam when it comes back.
+                // Declare server DOWN after enough consecutive misses
+                serverIsUp.set(false)
+
+                // Reset UI state for detection
+                if (lastServerDetectedPort.get() == port) {
+                    lastServerDetectedPort.set(0)
+                    SwingUtilities.invokeLater { resetAttachButtonStyle() }
+                }
+
             }
         }
+
     }
 
     private fun isPortListening(host: String, port: Int): Boolean {
@@ -3112,9 +3182,16 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     }
 
     private fun showServerDetectedNotification(port: Int) {
+        PluginLogger.info("[ServerDetection] showServerDetectedNotification called for port $port")
         try {
             val notificationGroup = NotificationGroupManager.getInstance()
                 .getNotificationGroup("TrueFlow Notifications")
+
+            if (notificationGroup == null) {
+                PluginLogger.warn("[ServerDetection] Notification group 'TrueFlow Notifications' not found!")
+                flashAttachButton()
+                return
+            }
 
             val notification = notificationGroup.createNotification(
                 "TrueFlow Trace Server Detected",
@@ -3134,18 +3211,18 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
             notification.addAction(object : com.intellij.notification.NotificationAction("Ignore") {
                 override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent, notification: com.intellij.notification.Notification) {
                     notification.expire()
-                    // Mark as shown so we don't immediately re-notify
-                    serverNotificationShown.set(true)
                 }
             })
 
             notification.notify(project)
+            PluginLogger.info("[ServerDetection] Notification displayed successfully for port $port")
 
             // Also flash the attach button
             flashAttachButton()
 
         } catch (e: Exception) {
             PluginLogger.warn("[ServerDetection] Failed to show notification: ${e.message}")
+            e.printStackTrace()
             // Fallback: just flash the button
             flashAttachButton()
         }

@@ -41,6 +41,17 @@ except ImportError:
     HAS_MCP = False
     print("Warning: MCP SDK not installed. Run: pip install mcp", file=sys.stderr)
 
+# MCP SSE transport (HTTP-based, always accessible)
+try:
+    from mcp.server.sse import SseServerTransport
+    from starlette.applications import Starlette
+    from starlette.routing import Route, Mount
+    from starlette.responses import JSONResponse
+    import uvicorn
+    HAS_SSE = True
+except ImportError:
+    HAS_SSE = False
+
 # WebSocket imports
 try:
     import websockets
@@ -512,21 +523,150 @@ async def _smart_query(query: str) -> str:
 
 
 # ============================================================================
+# HTTP/SSE MCP SERVER (always-on, accessible by any MCP client)
+# ============================================================================
+
+MCP_SSE_PORT = 5681
+
+async def run_sse_mcp_server():
+    """Run MCP server over HTTP/SSE on port 5681.
+
+    This is always-on so Claude Desktop, AI Explanations tab, or any MCP client
+    can connect without needing stdio.
+    """
+    if not HAS_SSE or not HAS_MCP:
+        logger.warning("SSE transport not available (need: mcp, starlette, uvicorn)")
+        return
+
+    sse = SseServerTransport("/messages/")
+
+    async def handle_sse(request):
+        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+            await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+
+    async def handle_health(request):
+        return JSONResponse({
+            "status": "ok",
+            "name": "trueflow-hub",
+            "transports": {
+                "sse": f"http://127.0.0.1:{MCP_SSE_PORT}/sse",
+                "websocket": "ws://127.0.0.1:5680",
+            },
+            "connected_ides": len(state.projects),
+            "projects": [
+                {
+                    "project_id": pid,
+                    "ide": info.get("ide", "unknown"),
+                    "project_name": info.get("project_name", "unknown"),
+                    "project_path": info.get("project_path"),
+                    "capabilities": info.get("capabilities", []),
+                }
+                for pid, info in state.projects.items()
+            ],
+        })
+
+    async def handle_well_known_mcp(request):
+        """Standard /.well-known/mcp endpoint for auto-discovery by MCP clients."""
+        return JSONResponse({
+            "name": "trueflow-hub",
+            "version": "1.0",
+            "type": "mcp_server",
+            "transport": "sse",
+            "endpoint": f"http://127.0.0.1:{MCP_SSE_PORT}/sse",
+            "capabilities": {"tools": True, "resources": False, "prompts": False},
+            "tools": [
+                "get_trace_data", "get_dead_code", "get_performance_data",
+                "search_function", "get_call_graph", "get_callers",
+                "get_callees", "get_source_code", "get_project_structure",
+                "get_why_not_covered", "ai_server_start", "ai_server_stop",
+                "ai_server_status",
+            ],
+            "projects": list(state.projects.keys()),
+            "health": f"http://127.0.0.1:{MCP_SSE_PORT}/health",
+        })
+
+    async def handle_projects(request):
+        """List all connected IDE projects with details."""
+        return JSONResponse({
+            "projects": [
+                {
+                    "project_id": pid,
+                    "ide": info.get("ide", "unknown"),
+                    "project_name": info.get("project_name", "unknown"),
+                    "project_path": info.get("project_path"),
+                    "capabilities": info.get("capabilities", []),
+                    "connected_at": info.get("connected_at"),
+                }
+                for pid, info in state.projects.items()
+            ],
+            "count": len(state.projects),
+        })
+
+    app = Starlette(
+        routes=[
+            Route("/health", handle_health),
+            Route("/projects", handle_projects),
+            Route("/.well-known/mcp", handle_well_known_mcp),
+            Route("/sse", handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
+        ],
+    )
+
+    config = uvicorn.Config(
+        app, host="127.0.0.1", port=MCP_SSE_PORT,
+        log_level="warning", access_log=False,
+    )
+    server = uvicorn.Server(config)
+    logger.info(f"MCP SSE server on http://127.0.0.1:{MCP_SSE_PORT}/sse")
+    await server.serve()
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
-async def run_hub():
-    """Run the hub."""
+async def run_hub(ws_only: bool = False):
+    """Run the hub with all available transports.
+
+    Always starts:
+      - WebSocket server on port 5680 (IDE plugin communication)
+      - HTTP/SSE MCP server on port 5681 (universal MCP access)
+
+    Optionally:
+      - MCP stdio (only when launched by an MCP client, not from IDE)
+
+    Args:
+        ws_only: If True, skip MCP stdio (no client on stdin).
+                 IDE always passes this since it launches via ProcessBuilder.
+    """
     write_hub_status(True)
     try:
+        tasks = []
+
+        # Always start WebSocket server for IDE
         if HAS_WEBSOCKETS:
-            ws_task = asyncio.create_task(run_websocket_server())
-        if HAS_MCP:
-            logger.info("TrueFlow Hub starting (delegates to IDE for analysis)...")
+            tasks.append(asyncio.create_task(run_websocket_server()))
+
+        # Always start HTTP/SSE MCP server for universal access
+        if HAS_SSE and HAS_MCP:
+            tasks.append(asyncio.create_task(run_sse_mcp_server()))
+
+        transports = []
+        if HAS_WEBSOCKETS:
+            transports.append("WebSocket:5680")
+        if HAS_SSE and HAS_MCP:
+            transports.append(f"SSE:{MCP_SSE_PORT}")
+
+        if not ws_only and HAS_MCP:
+            transports.append("stdio")
+            logger.info(f"TrueFlow Hub starting [{', '.join(transports)}]")
             async with stdio_server() as (read, write):
                 await mcp_server.run(read, write, mcp_server.create_initialization_options())
-        elif HAS_WEBSOCKETS:
-            await ws_task
+        elif tasks:
+            logger.info(f"TrueFlow Hub starting [{', '.join(transports)}]")
+            await asyncio.gather(*tasks)
+        else:
+            logger.error("No transport available: install 'websockets' or 'mcp' package")
     finally:
         write_hub_status(False)
 
@@ -536,8 +676,12 @@ def main():
     parser = argparse.ArgumentParser(description="TrueFlow MCP Hub")
     parser.add_argument("--start", action="store_true", help="Start the hub")
     parser.add_argument("--status", action="store_true", help="Check status")
-    parser.add_argument("--ws-only", action="store_true", help="WebSocket only mode (no MCP)")
+    parser.add_argument("--ws-only", action="store_true", help="Skip MCP stdio (IDE mode)")
+    parser.add_argument("--sse-port", type=int, default=5681, help="HTTP/SSE MCP port (default: 5681)")
     args = parser.parse_args()
+
+    global MCP_SSE_PORT
+    MCP_SSE_PORT = args.sse_port
 
     if args.status:
         if STATUS_FILE.exists():
@@ -552,7 +696,7 @@ def main():
 
     print("Starting TrueFlow Hub...")
     try:
-        asyncio.run(run_hub())
+        asyncio.run(run_hub(ws_only=args.ws_only))
     except KeyboardInterrupt:
         print("\nShutdown")
 

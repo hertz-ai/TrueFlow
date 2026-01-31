@@ -7,6 +7,7 @@ import * as child_process from 'child_process';
 import { TraceSocketClient, TraceEvent, PerformanceData } from './TraceSocketClient';
 import { AIExplanationProvider } from './AIExplanationWebview';
 import { InteractiveExplorerServer } from './InteractiveExplorerServer';
+import { HubClient } from './HubClient';
 
 // Model presets for AI explanation
 interface ModelPreset {
@@ -190,6 +191,9 @@ let lastServerDetectedPort = 0;  // Store detected port for direct connect
 const SERVER_DETECTION_INTERVAL_MS = 3000;
 const SERVER_NOTIFICATION_COOLDOWN_MS = 60000;
 let serverNotificationShown = false;
+let serverIsUp = false;          // Tracks DOWN->UP transitions
+let consecutiveServerMisses = 0;
+const MISSES_TO_RESET = 3;
 
 // Task/run detection state
 let taskDetectionDisabled = false;
@@ -4816,16 +4820,32 @@ function startServerDetection(context: vscode.ExtensionContext): void {
 }
 
 async function checkForTraceServer(): Promise<void> {
-    // Check MCP/AI server status (llama.cpp on port 8080)
-    const mcpPort = 8080;
-    const mcpAvailable = await isPortListening('127.0.0.1', mcpPort);
-    if (mcpAvailable) {
-        mcpStatusBarItem.text = '$(circle-filled) MCP';
-        mcpStatusBarItem.tooltip = `MCP/AI Server running on port ${mcpPort} (llama.cpp)`;
+    // Check MCP Hub status (WebSocket on port 5680) + AI server (llama.cpp on port 8080)
+    let hubConnected = false;
+    try { hubConnected = HubClient.getInstance().isConnected(); } catch (_) { /* not initialized */ }
+    const hubPortUp = hubConnected ? true : await isPortListening('127.0.0.1', 5680);
+    const aiPort = 8080;
+    const aiAvailable = await isPortListening('127.0.0.1', aiPort);
+
+    if (hubConnected && aiAvailable) {
+        mcpStatusBarItem.text = '$(circle-filled) MCP  $(circle-filled) AI';
+        mcpStatusBarItem.tooltip = `MCP Hub connected (ws://127.0.0.1:5680) | AI server running on port ${aiPort}`;
         mcpStatusBarItem.backgroundColor = undefined;
+    } else if (hubConnected && !aiAvailable) {
+        mcpStatusBarItem.text = '$(circle-filled) MCP  $(circle-outline) AI';
+        mcpStatusBarItem.tooltip = `MCP Hub connected (ws://127.0.0.1:5680) | AI server offline - start llama.cpp on port ${aiPort}`;
+        mcpStatusBarItem.backgroundColor = undefined;
+    } else if (hubPortUp && !hubConnected) {
+        mcpStatusBarItem.text = '$(circle-slash) MCP  $(circle-${aiAvailable ? "filled" : "outline"}) AI';
+        mcpStatusBarItem.tooltip = 'MCP Hub running but not connected (ws://127.0.0.1:5680)';
+        mcpStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    } else if (!hubConnected && aiAvailable) {
+        mcpStatusBarItem.text = '$(circle-outline) MCP  $(circle-filled) AI';
+        mcpStatusBarItem.tooltip = `MCP Hub offline | AI server running on port ${aiPort}`;
+        mcpStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
     } else {
-        mcpStatusBarItem.text = '$(circle-outline) MCP';
-        mcpStatusBarItem.tooltip = 'MCP/AI Server: Not running - start llama.cpp on port 8080 for AI features';
+        mcpStatusBarItem.text = '$(circle-outline) MCP  $(circle-outline) AI';
+        mcpStatusBarItem.tooltip = 'MCP Hub offline (ws://127.0.0.1:5680) | AI server offline (port 8080)';
         mcpStatusBarItem.backgroundColor = undefined;
     }
 
@@ -4836,7 +4856,6 @@ async function checkForTraceServer(): Promise<void> {
 
     // Don't check if already connected
     if (traceSocketClient?.isConnected()) {
-        serverNotificationShown = false;  // Reset for next time
         return;
     }
 
@@ -4844,16 +4863,38 @@ async function checkForTraceServer(): Promise<void> {
     const isAvailable = await isPortListening('127.0.0.1', port);
 
     if (isAvailable) {
-        lastServerDetectedPort = port;  // Store detected port for direct connect
+        consecutiveServerMisses = 0;
+
+        // DOWN -> UP transition => new epoch
+        const wasUp = serverIsUp;
+        serverIsUp = true;
+        if (!wasUp) {
+            serverNotificationShown = false;
+        }
+
         const now = Date.now();
-        if (!serverNotificationShown && now - lastServerNotificationTime > SERVER_NOTIFICATION_COOLDOWN_MS) {
-            serverNotificationShown = true;
+        const portChanged = lastServerDetectedPort !== port;
+        const cooldownPassed = (now - lastServerNotificationTime) >= SERVER_NOTIFICATION_COOLDOWN_MS;
+        const wasShown = serverNotificationShown;
+        serverNotificationShown = true; // Mark as shown immediately
+
+        const firstTimeForThisDetection = portChanged || !wasShown;
+
+        if (firstTimeForThisDetection && cooldownPassed) {
+            lastServerDetectedPort = port;
             lastServerNotificationTime = now;
             showServerDetectedNotification(port);
+        } else {
+            lastServerDetectedPort = port;
         }
     } else {
-        lastServerDetectedPort = 0;  // Reset when server not available
-        serverNotificationShown = false;
+        consecutiveServerMisses++;
+        if (consecutiveServerMisses >= MISSES_TO_RESET) {
+            serverIsUp = false;
+            if (lastServerDetectedPort === port) {
+                lastServerDetectedPort = 0;
+            }
+        }
     }
 }
 
