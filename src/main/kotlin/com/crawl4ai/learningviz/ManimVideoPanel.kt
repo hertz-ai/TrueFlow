@@ -752,15 +752,17 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             }
 
             // Forward JCEF console messages to plugin log (for debugging JS issues)
-            interactiveBrowser?.jbCefClient?.addDisplayHandler(object : org.cef.handler.CefDisplayHandlerAdapter() {
-                override fun onConsoleMessage(browser: org.cef.browser.CefBrowser?, level: org.cef.CefSettings.LogSeverity?,
-                                              message: String?, source: String?, line: Int): Boolean {
-                    if (message != null) {
-                        PluginLogger.info("[JCEF Console] $message")
+            if (cefBrowser != null) {
+                interactiveBrowser?.jbCefClient?.addDisplayHandler(object : org.cef.handler.CefDisplayHandlerAdapter() {
+                    override fun onConsoleMessage(browser: org.cef.browser.CefBrowser?, level: org.cef.CefSettings.LogSeverity?,
+                                                  message: String?, source: String?, line: Int): Boolean {
+                        if (message != null) {
+                            PluginLogger.info("[JCEF Console] $message")
+                        }
+                        return false
                     }
-                    return false
-                }
-            }, cefBrowser)
+                }, cefBrowser)
+            }
 
             // Load the Three.js visualization HTML from resources
             val htmlContent = loadInteractiveHtml()
