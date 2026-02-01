@@ -89,9 +89,11 @@
                 displayName="TrueFlow"
                 nonDefaultProject="true"/>
 
-        <!-- Project Service -->
+        <!-- Project Services -->
         <projectService
                 serviceImplementation="com.crawl4ai.learningviz.TraceWatcherService"/>
+        <projectService
+                serviceImplementation="com.crawl4ai.learningviz.SessionSettings"/>
 
         <!-- Notification Group for server detection -->
         <notificationGroup id="TrueFlow Notifications"

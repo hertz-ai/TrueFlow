@@ -665,24 +665,33 @@ class ManimAutoRenderer(
      * Find Python executable (check common locations).
      */
     private fun findPythonExecutable(): String? {
-        val candidates = listOf(
-            "C:/Python310/python.exe",
-            "C:/Python39/python.exe",
-            "C:/Python38/python.exe",
-            "python",
-            "python3"
-        )
+        val homeDir = System.getProperty("user.home")
+        val isWindows = System.getProperty("os.name").lowercase().contains("win")
+        val candidates = mutableListOf<String>()
+
+        // Conda/miniconda
+        if (isWindows) {
+            candidates.add("$homeDir/miniconda3/python.exe")
+            candidates.add("$homeDir/anaconda3/python.exe")
+            candidates.add("$homeDir/miniconda3/Scripts/python.exe")
+            candidates.add("$homeDir/anaconda3/Scripts/python.exe")
+        } else {
+            candidates.add("$homeDir/miniconda3/bin/python")
+            candidates.add("$homeDir/anaconda3/bin/python")
+        }
+        candidates.add("python")
+        candidates.add("python3")
 
         for (candidate in candidates) {
             try {
+                val file = java.io.File(candidate)
+                if (candidate.contains("/") && !file.exists()) continue
                 val process = ProcessBuilder(candidate, "--version").start()
                 if (process.waitFor(2, TimeUnit.SECONDS) && process.exitValue() == 0) {
                     PluginLogger.info("Found Python: $candidate")
                     return candidate
                 }
-            } catch (e: Exception) {
-                // Try next candidate
-            }
+            } catch (_: Exception) { }
         }
 
         return null

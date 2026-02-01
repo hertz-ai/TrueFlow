@@ -41,7 +41,8 @@ public class RuntimeInstrumentor {
     // Global state
     private final ConcurrentHashMap<String, MethodCall> activeCalls = new ConcurrentHashMap<>();
     private final List<MethodCall> completedCalls = Collections.synchronizedList(new ArrayList<>());
-    private final Set<String> registeredMethods = ConcurrentHashMap.newKeySet();
+    // methodKey -> [sourceFile, lineNumber]
+    private final ConcurrentHashMap<String, String[]> registeredMethods = new ConcurrentHashMap<>();
 
     // Counters
     private final AtomicLong callIdCounter = new AtomicLong(0);
@@ -143,9 +144,9 @@ public class RuntimeInstrumentor {
             currentDepth.set(depth + 1);
             totalCalls.incrementAndGet();
 
-            // Register method for function registry
+            // Register method for function registry (with file/line for dead code detection)
             String methodKey = className + "." + methodName;
-            registeredMethods.add(methodKey);
+            registeredMethods.putIfAbsent(methodKey, new String[]{sourceFile, String.valueOf(lineNumber)});
 
             // Emit call event
             emitEvent(call.toCallJson(sessionId).toString());
@@ -259,11 +260,15 @@ public class RuntimeInstrumentor {
         traceData.addProperty("total_functions", registeredMethods.size());
 
         JsonArray functions = new JsonArray();
-        for (String method : registeredMethods) {
+        for (Map.Entry<String, String[]> entry : registeredMethods.entrySet()) {
+            String method = entry.getKey();
+            String[] info = entry.getValue();
             String[] parts = method.split("\\.", 2);
             JsonObject func = new JsonObject();
             func.addProperty("module", parts.length > 0 ? parts[0] : "");
             func.addProperty("function", parts.length > 1 ? parts[1] : method);
+            func.addProperty("file", info[0] != null ? info[0] : "");
+            func.addProperty("line", Integer.parseInt(info[1]));
             functions.add(func);
         }
         traceData.add("functions", functions);

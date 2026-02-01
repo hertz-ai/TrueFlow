@@ -131,10 +131,58 @@ object ResourceDeployer {
      * Call this during plugin initialization.
      *
      * NOTE: All Python code (tracing, visualization, Manim scenes) is in runtime_injector.
+     * @return true if this is a new version (hub should be restarted to pick up new code)
      */
-    fun deployAll(project: Project) {
+    fun deployAll(project: Project): Boolean {
         PluginLogger.info("Starting resource deployment...")
         deployRuntimeInjector(project)
-        PluginLogger.info("Resource deployment completed")
+
+        // Check if plugin version changed — hub needs restart to load new Python code
+        val versionChanged = checkAndUpdateVersionMarker(project)
+        if (versionChanged) {
+            PluginLogger.info("Resource deployment completed — plugin version changed, hub restart needed")
+        } else {
+            PluginLogger.info("Resource deployment completed")
+        }
+        return versionChanged
+    }
+
+    /**
+     * Write a version marker to .pycharm_plugin/.plugin_version.
+     * Returns true if the version changed (or marker didn't exist).
+     */
+    private fun checkAndUpdateVersionMarker(project: Project): Boolean {
+        val targetDir = PluginPaths.getRuntimeInjectorDir(project)
+        val versionFile = File(targetDir, ".plugin_version")
+        val currentVersion = getCurrentPluginVersion()
+
+        val versionChanged = if (versionFile.exists()) {
+            val deployedVersion = versionFile.readText().trim()
+            deployedVersion != currentVersion
+        } else {
+            true // First deploy
+        }
+
+        versionFile.writeText(currentVersion)
+        return versionChanged
+    }
+
+    /**
+     * Read plugin version from plugin-version.properties bundled in the JAR.
+     */
+    private fun getCurrentPluginVersion(): String {
+        return try {
+            val stream = ResourceDeployer::class.java.getResourceAsStream("/plugin-version.properties")
+            if (stream != null) {
+                val props = java.util.Properties()
+                props.load(stream)
+                stream.close()
+                props.getProperty("pluginVersion", "unknown")
+            } else {
+                "unknown"
+            }
+        } catch (_: Exception) {
+            "unknown"
+        }
     }
 }

@@ -52,11 +52,31 @@ class HubClient private constructor() : Disposable {
 
         private const val HUB_URL = "ws://127.0.0.1:5680"
         private val STATUS_FILE = java.io.File(System.getProperty("user.home"), ".trueflow/hub_status.json")
+
+        fun detectIdeType(): String {
+            return try {
+                val appInfo = com.intellij.openapi.application.ApplicationInfo.getInstance()
+                when (appInfo.build.productCode.uppercase()) {
+                    "IC" -> "intellij_community"
+                    "IU" -> "intellij_ultimate"
+                    "PC" -> "pycharm_community"
+                    "PY" -> "pycharm_professional"
+                    "WS" -> "webstorm"
+                    "GO" -> "goland"
+                    "CL" -> "clion"
+                    "RD" -> "rider"
+                    "RM" -> "rubymine"
+                    else -> appInfo.build.productCode.lowercase()
+                }
+            } catch (_: Exception) {
+                "jetbrains_ide"
+            }
+        }
     }
 
     // State
     private var wsClient: WebSocketClient? = null
-    private var projectId: String = "pycharm_${System.currentTimeMillis()}"
+    private var projectId: String = "${detectIdeType()}_${System.currentTimeMillis()}"
     private var projectName: String = "unknown"
     private var projectPath: String? = null
     private var reconnectAttempts = 0
@@ -69,7 +89,7 @@ class HubClient private constructor() : Disposable {
     private val gson = Gson()
 
     fun setProject(project: Project) {
-        projectId = "pycharm_${project.name}_${System.currentTimeMillis()}"
+        projectId = "${detectIdeType()}_${project.name}_${System.currentTimeMillis()}"
         projectName = project.name
         projectPath = project.basePath
     }
@@ -178,7 +198,7 @@ class HubClient private constructor() : Disposable {
     private fun register() {
         val data = JsonObject().apply {
             addProperty("project_id", projectId)
-            addProperty("ide", "pycharm")
+            addProperty("ide", detectIdeType())
             addProperty("project_name", projectName)
             addProperty("project_path", projectPath)
             add("capabilities", gson.toJsonTree(listOf(
@@ -336,19 +356,37 @@ class HubClient private constructor() : Disposable {
                 return
             }
 
-            PluginLogger.info("[TrueFlow Hub] Starting hub from: ${hubScript.absolutePath}")
+            val python = findPython()
+            if (python.isEmpty()) {
+                PluginLogger.warn("[TrueFlow Hub] Python not available, cannot start hub")
+                return
+            }
+            PluginLogger.info("[TrueFlow Hub] Starting hub from: ${hubScript.absolutePath} (python: $python)")
+
+            // Ensure hub dependencies are installed locally
+            val depsDir = ensureHubDependencies(python)
 
             // Start hub in background (WebSocket only mode - no MCP stdio)
-            val process = ProcessBuilder(findPython(), hubScript.absolutePath, "--ws-only")
+            val pb = ProcessBuilder(python, hubScript.absolutePath, "--ws-only")
                 .redirectErrorStream(true)
-                .start()
 
-            // Capture hub output in background thread for debugging
+            // Add hub_deps to PYTHONPATH so imports find locally-installed packages
+            if (depsDir != null) {
+                val env = pb.environment()
+                val existing = env["PYTHONPATH"] ?: ""
+                val depsPath = depsDir.absolutePath
+                env["PYTHONPATH"] = if (existing.isEmpty()) depsPath else "$depsPath${java.io.File.pathSeparator}$existing"
+                PluginLogger.info("[TrueFlow Hub] PYTHONPATH includes: $depsPath")
+            }
+
+            val process = pb.start()
+
+            // Capture hub output in background thread (INFO level so errors are visible in idea.log)
             Thread({
                 try {
                     process.inputStream.bufferedReader().useLines { lines ->
                         for (line in lines) {
-                            PluginLogger.debug("[TrueFlow Hub stdout] $line")
+                            PluginLogger.info("[TrueFlow Hub stdout] $line")
                         }
                     }
                 } catch (_: Exception) { }
@@ -369,15 +407,120 @@ class HubClient private constructor() : Disposable {
         }
     }
 
-    private fun findPython(): String {
-        val paths = listOf("python", "python3", "C:/Python310/python.exe", "C:/Python311/python.exe", "C:/Python312/python.exe")
-        for (path in paths) {
-            try {
-                if (ProcessBuilder(path, "--version").start().waitFor() == 0) return path
-            } catch (e: Exception) { }
+    /**
+     * Ensure hub Python dependencies are installed locally in .pycharm_plugin/hub_deps/.
+     * Returns the deps directory if successful, null otherwise.
+     */
+    private fun ensureHubDependencies(python: String): java.io.File? {
+        val depsDir = projectPath?.let { java.io.File(it, ".pycharm_plugin/hub_deps") }
+            ?: java.io.File(System.getProperty("user.home"), ".trueflow/hub_deps")
+
+        // Check if websockets is already importable from deps dir
+        val markerFile = java.io.File(depsDir, ".deps_installed")
+        if (markerFile.exists()) {
+            return depsDir
         }
-        return "python"
+
+        try {
+            depsDir.mkdirs()
+            PluginLogger.info("[TrueFlow Hub] Installing hub dependencies to: ${depsDir.absolutePath}")
+
+            val packages = listOf("websockets", "mcp", "starlette", "uvicorn")
+            val cmd = mutableListOf(python, "-m", "pip", "install", "--target", depsDir.absolutePath, "--upgrade", "--quiet")
+            cmd.addAll(packages)
+
+            val process = ProcessBuilder(cmd)
+                .redirectErrorStream(true)
+                .start()
+
+            val output = process.inputStream.bufferedReader().readText()
+            val exitCode = process.waitFor()
+
+            if (exitCode == 0) {
+                markerFile.writeText("installed=${System.currentTimeMillis()}")
+                PluginLogger.info("[TrueFlow Hub] Hub dependencies installed successfully")
+            } else {
+                PluginLogger.warn("[TrueFlow Hub] pip install failed (exit $exitCode): $output")
+            }
+
+            return depsDir
+        } catch (e: Exception) {
+            PluginLogger.warn("[TrueFlow Hub] Failed to install hub dependencies: ${e.message}")
+            return depsDir // Return it anyway - maybe some packages are already there
+        }
     }
+
+    private fun findPython(): String {
+        val homeDir = System.getProperty("user.home")
+        val isWindows = System.getProperty("os.name").lowercase().contains("win")
+
+        // Build candidate list: project venv first, then conda, then system PATH
+        val candidates = mutableListOf<String>()
+
+        // 1. Project virtualenv
+        if (projectPath != null) {
+            if (isWindows) {
+                candidates.add("$projectPath/.venv/Scripts/python.exe")
+                candidates.add("$projectPath/venv/Scripts/python.exe")
+            } else {
+                candidates.add("$projectPath/.venv/bin/python")
+                candidates.add("$projectPath/venv/bin/python")
+            }
+        }
+
+        // 2. Conda/miniconda in user home
+        if (isWindows) {
+            candidates.add("$homeDir/miniconda3/python.exe")
+            candidates.add("$homeDir/anaconda3/python.exe")
+            candidates.add("$homeDir/miniconda3/Scripts/python.exe")
+            candidates.add("$homeDir/anaconda3/Scripts/python.exe")
+        } else {
+            candidates.add("$homeDir/miniconda3/bin/python")
+            candidates.add("$homeDir/anaconda3/bin/python")
+        }
+
+        // 3. System Python (resolved via PATH)
+        candidates.add("python")
+        candidates.add("python3")
+
+        for (path in candidates) {
+            try {
+                val file = java.io.File(path)
+                // For absolute paths, check file exists first
+                if (path.contains("/") && !file.exists()) continue
+
+                val process = ProcessBuilder(path, "--version")
+                    .redirectErrorStream(true)
+                    .start()
+                if (process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS) && process.exitValue() == 0) {
+                    PluginLogger.info("[TrueFlow Hub] Found Python: $path")
+                    return path
+                }
+            } catch (_: Exception) { }
+        }
+
+        PluginLogger.warn("[TrueFlow Hub] No Python found — MCP features will be unavailable")
+        showPythonNotFoundNotification()
+        return ""
+    }
+
+    private fun showPythonNotFoundNotification() {
+        try {
+            ApplicationManager.getApplication().invokeLater {
+                com.intellij.notification.NotificationGroupManager.getInstance()
+                    .getNotificationGroup("TrueFlow Notifications")
+                    ?.createNotification(
+                        "TrueFlow MCP Hub requires Python 3.8+",
+                        "Install Python to enable MCP tools for Claude Code/Claude Desktop. " +
+                            "All IDE tabs continue to work without Python.",
+                        com.intellij.notification.NotificationType.WARNING
+                    )?.notify(null)
+            }
+        } catch (_: Exception) {
+            // Notification group may not exist — silently ignore
+        }
+    }
+
 
     // ==================== Public API ====================
 
@@ -409,6 +552,50 @@ class HubClient private constructor() : Disposable {
         isConnected.set(false)
         wsClient?.close()
         wsClient = null
+    }
+
+    /**
+     * Stop the hub process by killing it via PID from status file.
+     * Used when plugin files are updated and hub needs to reload new code.
+     */
+    fun stopHub() {
+        disconnect()
+        try {
+            if (!STATUS_FILE.exists()) return
+
+            val content = STATUS_FILE.readText()
+            val status = gson.fromJson(content, JsonObject::class.java)
+            val pid = status.get("pid")?.asLong ?: return
+
+            val isWindows = System.getProperty("os.name").lowercase().contains("win")
+            val killProcess = if (isWindows) {
+                ProcessBuilder("taskkill", "/F", "/PID", pid.toString())
+                    .redirectErrorStream(true)
+                    .start()
+            } else {
+                ProcessBuilder("kill", pid.toString())
+                    .redirectErrorStream(true)
+                    .start()
+            }
+            killProcess.waitFor()
+            PluginLogger.info("[TrueFlow Hub] Stopped hub process (PID: $pid)")
+
+            // Clean up status file so startHub() won't think it's still running
+            STATUS_FILE.delete()
+        } catch (e: Exception) {
+            PluginLogger.warn("[TrueFlow Hub] Failed to stop hub: ${e.message}")
+        }
+    }
+
+    /**
+     * Restart the hub process. Used after plugin update to reload new Python code.
+     */
+    fun restartHub(): Boolean {
+        PluginLogger.info("[TrueFlow Hub] Restarting hub (plugin updated)...")
+        stopHub()
+        Thread.sleep(1000) // Give process time to exit
+        reconnectAttempts = 0
+        return connect()
     }
 
     // ==================== Convenience Methods ====================

@@ -63,8 +63,8 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     private var visualizationData: InteractiveVisualizationData? = null
 
     // Track if the browser page is loaded and ready
-    private var browserPageReady = false
-    private var pendingDataRefresh = false
+    @Volatile private var browserPageReady = false
+    @Volatile private var pendingDataRefresh = false
 
     // Live server for real-time browser viewing
     private var explorerServer: InteractiveExplorerServer? = null
@@ -517,6 +517,13 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     // Explanation cache instance
     private var explanationCache: ExplanationCacheManager? = null
 
+    /**
+     * Public accessor for cached AI explanations (used by MCP RPC handlers).
+     */
+    fun getCachedExplanation(funcName: String, filePath: String): CachedExplanation? {
+        return explanationCache?.getExplanation(funcName, filePath)
+    }
+
     private fun notifyExplorerOfCachedExplanation(explanation: CachedExplanation) {
         ApplicationManager.getApplication().invokeLater {
             val escapedExplanation = explanation.explanation
@@ -717,13 +724,14 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     override fun onLoadEnd(browser: org.cef.browser.CefBrowser?, frame: org.cef.browser.CefFrame?, httpStatusCode: Int) {
                         if (frame?.isMain == true) {
                             browserPageReady = true
-                            PluginLogger.info("Interactive Explorer page loaded, ready for data (mode: $currentViewMode)")
+                            PluginLogger.info("[ManimVideoPanel] onLoadEnd: page ready (mode=$currentViewMode, pendingDataRefresh=$pendingDataRefresh, hasVisualizationData=${visualizationData != null})")
 
                             // Inject the cefQuery function for JS to Kotlin communication
                             injectCefQuery()
 
                             // If we have pending data, send it now based on current view mode
                             if (pendingDataRefresh || visualizationData != null) {
+                                PluginLogger.info("[ManimVideoPanel] onLoadEnd: sending pending data to browser")
                                 pendingDataRefresh = false
                                 ApplicationManager.getApplication().invokeLater {
                                     when (currentViewMode) {
@@ -742,6 +750,17 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     }
                 }, cefBrowser)
             }
+
+            // Forward JCEF console messages to plugin log (for debugging JS issues)
+            interactiveBrowser?.jbCefClient?.addDisplayHandler(object : org.cef.handler.CefDisplayHandlerAdapter() {
+                override fun onConsoleMessage(browser: org.cef.browser.CefBrowser?, level: org.cef.CefSettings.LogSeverity?,
+                                              message: String?, source: String?, line: Int): Boolean {
+                    if (message != null) {
+                        PluginLogger.info("[JCEF Console] $message")
+                    }
+                    return false
+                }
+            }, cefBrowser)
 
             // Load the Three.js visualization HTML from resources
             val htmlContent = loadInteractiveHtml()
@@ -2202,11 +2221,18 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             PluginLogger.info("[ManimVideoPanel]   Sample calledFunctions: ${calledFunctions.keys.take(3)}")
         }
 
-        ApplicationManager.getApplication().invokeLater {
-            interactiveBrowser?.cefBrowser?.executeJavaScript(
-                "if (typeof loadVisualizationData === 'function') { loadVisualizationData($jsonData); }",
-                "", 0
-            )
+        if (browserPageReady) {
+            ApplicationManager.getApplication().invokeLater {
+                PluginLogger.info("[ManimVideoPanel] Injecting data via executeJavaScript (browserPageReady=true)")
+                interactiveBrowser?.cefBrowser?.executeJavaScript(
+                    "if (typeof loadVisualizationData === 'function') { loadVisualizationData($jsonData); }",
+                    "", 0
+                )
+            }
+        } else {
+            // Browser not ready yet — the onLoadEnd handler will pick up visualizationData
+            pendingDataRefresh = true
+            PluginLogger.info("[ManimVideoPanel] Browser not ready, set pendingDataRefresh=true (data stored in visualizationData)")
         }
     }
 

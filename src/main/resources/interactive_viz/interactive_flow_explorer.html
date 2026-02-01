@@ -1085,6 +1085,8 @@
                 this.lowPowerMode = false;
                 this.animationId = null;
                 this.isVisible = true;
+                // If document.hidden at load time, we're in JCEF — disable visibility tracking
+                this._jcefMode = document.hidden;
 
                 // Right-click drag state
                 this.isPanning = false;
@@ -1229,11 +1231,15 @@
                 });
 
                 // Visibility change - pause rendering when tab not visible
+                // In JCEF (IDE embedded), document.hidden is always true — skip entirely
                 document.addEventListener('visibilitychange', () => {
+                    if (this._jcefMode) return;  // JCEF: never pause render loop
                     this.isVisible = !document.hidden;
                     if (this.isVisible) {
                         this.needsRender = true;
-                        this.animate();
+                        if (!this.animationId) {
+                            this.animate();
+                        }
                     }
                 });
 
@@ -1275,7 +1281,7 @@
                     }
 
                     frameCount++;
-                    if (this.isVisible) {
+                    if (this.isVisible || this._jcefMode) {
                         requestAnimationFrame(checkPerformance);
                     }
                 };
@@ -3492,13 +3498,17 @@
             }
 
             updateStats() {
-                if (!this.data) return;
+                if (!this.data) {
+                    console.log('[Stats] No data, skipping');
+                    return;
+                }
 
                 const functions = this.data.functions || {};
                 const coveredSet = new Set(this.data.covered_functions || []);
                 const functionKeys = new Set(Object.keys(functions));
 
                 const total = functionKeys.size;
+                console.log('[Stats] total=' + total + ', coveredSet.size=' + coveredSet.size + ', covered_functions type=' + typeof this.data.covered_functions + ', is array=' + Array.isArray(this.data.covered_functions));
 
                 // Count covered as functions that are BOTH in functions map AND in covered list
                 // This handles the case where covered_functions may include items not in filtered functions
@@ -3929,6 +3939,12 @@
                 };
 
                 animate();
+
+                // Ensure main render loop is running (JCEF may have paused it)
+                this.isVisible = true;
+                if (!this.animationId) {
+                    this.animate();
+                }
             }
 
             showInfoPanel(data) {
@@ -4116,6 +4132,7 @@
             animate() {
                 // Don't render if page not visible
                 if (!this.isVisible) {
+                    this.animationId = null;  // Reset so focusOnNode can restart
                     return;
                 }
 
@@ -5127,7 +5144,10 @@ ${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
         // Load data from parent (injected by JCEF)
         window.loadVisualizationData = function(jsonData) {
             try {
+                window._realDataLoaded = true;
+                if (window._demoTimeout) { clearTimeout(window._demoTimeout); window._demoTimeout = null; }
                 const data = typeof jsonData === 'string' ? JSON.parse(jsonData) : jsonData;
+                console.log('[Explorer] loadVisualizationData called, functions:', Object.keys(data.functions || {}).length);
                 explorer.loadData(data);
             } catch (e) {
                 console.error('Failed to load visualization data:', e);
@@ -5363,16 +5383,17 @@ ${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
             }
         };
 
-        // Load demo data after short delay (simulating load)
-        setTimeout(() => {
-            console.log('[Demo] Loading demo data...');
-            console.log('[Demo] Functions:', Object.keys(demoData.functions));
-            console.log('[Demo] Call graph:', demoData.call_graph);
-            console.log('[Demo] Covered:', demoData.covered_functions);
-            console.log('[Demo] Dead:', demoData.dead_functions);
-            console.log('[Demo] WhyNotCovered:', Object.keys(demoData.why_not_covered));
-            explorer.loadData(demoData);
-        }, 500);
+        // Load demo data after short delay — only if NOT running inside JCEF (IDE)
+        // In JCEF, real data will be injected via loadVisualizationData()
+        if (!explorer._jcefMode) {
+            window._demoTimeout = setTimeout(() => {
+                // Only load demo if no real data has arrived yet
+                if (!window._realDataLoaded) {
+                    console.log('[Demo] Loading demo data...');
+                    explorer.loadData(demoData);
+                }
+            }, 500);
+        }
     </script>
 </body>
 </html>

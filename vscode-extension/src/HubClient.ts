@@ -80,13 +80,22 @@ export class HubClient {
             console.log('[TrueFlow Hub] Hub not running, starting...');
             await this.startHub();
 
-            // Wait a bit for hub to start
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            // Hub needs time to start (Python startup + module imports + bind port)
+            // Retry with backoff: 2s, 3s, 4s = ~9s total wait (matches PyCharm plugin)
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                await new Promise(resolve => setTimeout(resolve, 1000 + attempt * 1000));
+                console.log(`[TrueFlow Hub] Post-start connect attempt ${attempt}/3`);
+                const connectedAfterStart = await this.tryConnect();
+                if (connectedAfterStart) {
+                    this.reconnectAttempts = 0;
+                    this.isConnecting = false;
+                    return true;
+                }
+            }
 
-            // Try connecting again
-            const connectedAfterStart = await this.tryConnect();
+            console.warn('[TrueFlow Hub] Hub started but connection still failing');
             this.isConnecting = false;
-            return connectedAfterStart;
+            return false;
 
         } catch (error) {
             console.error('[TrueFlow Hub] Connection error:', error);
@@ -184,7 +193,9 @@ export class HubClient {
 
     private scheduleReconnect(): void {
         if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-            console.log('[TrueFlow Hub] Max reconnect attempts reached');
+            console.log('[TrueFlow Hub] Max reconnect attempts reached, will restart hub on next connect()');
+            // Reset so next explicit connect() call will restart the hub
+            this.reconnectAttempts = 0;
             return;
         }
 
@@ -268,15 +279,134 @@ export class HubClient {
         }
 
         try {
-            // Start hub in background (WebSocket only mode for now)
-            this.hubProcess = child_process.spawn('python', [hubScript, '--ws-only'], {
+            const python = await this.findPython();
+            console.log(`[TrueFlow Hub] Starting hub from: ${hubScript} (python: ${python})`);
+
+            // Ensure hub dependencies are installed locally
+            const depsDir = await this.ensureHubDependencies(python, workspaceFolder?.uri.fsPath);
+
+            // Build environment with PYTHONPATH pointing to local deps
+            const env: Record<string, string | undefined> = { ...process.env };
+            if (depsDir && fs.existsSync(depsDir)) {
+                const existing = env.PYTHONPATH || '';
+                env.PYTHONPATH = existing ? `${depsDir}${path.delimiter}${existing}` : depsDir;
+                console.log(`[TrueFlow Hub] PYTHONPATH includes: ${depsDir}`);
+            }
+
+            // Start hub in background (WebSocket only mode - no MCP stdio)
+            this.hubProcess = child_process.spawn(python, [hubScript, '--ws-only'], {
                 detached: true,
-                stdio: 'ignore'
+                stdio: ['ignore', 'pipe', 'pipe'],
+                env
             });
             this.hubProcess.unref();
+
+            // Capture hub output for debugging
+            this.hubProcess.stdout?.on('data', (data: Buffer) => {
+                console.log(`[TrueFlow Hub stdout] ${data.toString().trim()}`);
+            });
+            this.hubProcess.stderr?.on('data', (data: Buffer) => {
+                console.error(`[TrueFlow Hub stderr] ${data.toString().trim()}`);
+            });
+            this.hubProcess.on('exit', (code: number | null) => {
+                if (code !== 0 && code !== null) {
+                    console.warn(`[TrueFlow Hub] Hub process exited with code ${code}`);
+                } else {
+                    console.log('[TrueFlow Hub] Hub process exited normally');
+                }
+            });
+
             console.log('[TrueFlow Hub] Started hub process');
         } catch (error) {
             console.error('[TrueFlow Hub] Failed to start hub:', error);
+        }
+    }
+
+    /**
+     * Find a working Python executable, preferring project venv and conda.
+     */
+    private async findPython(): Promise<string> {
+        const homeDir = os.homedir();
+        const isWindows = process.platform === 'win32';
+        const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+        const candidates: string[] = [];
+
+        // 1. Project virtualenv
+        if (workspacePath) {
+            if (isWindows) {
+                candidates.push(path.join(workspacePath, '.venv', 'Scripts', 'python.exe'));
+                candidates.push(path.join(workspacePath, 'venv', 'Scripts', 'python.exe'));
+            } else {
+                candidates.push(path.join(workspacePath, '.venv', 'bin', 'python'));
+                candidates.push(path.join(workspacePath, 'venv', 'bin', 'python'));
+            }
+        }
+
+        // 2. Conda/miniconda
+        if (isWindows) {
+            candidates.push(path.join(homeDir, 'miniconda3', 'python.exe'));
+            candidates.push(path.join(homeDir, 'anaconda3', 'python.exe'));
+            candidates.push(path.join(homeDir, 'miniconda3', 'Scripts', 'python.exe'));
+            candidates.push(path.join(homeDir, 'anaconda3', 'Scripts', 'python.exe'));
+        } else {
+            candidates.push(path.join(homeDir, 'miniconda3', 'bin', 'python'));
+            candidates.push(path.join(homeDir, 'anaconda3', 'bin', 'python'));
+        }
+
+        // 3. System Python
+        candidates.push('python3', 'python');
+
+        for (const candidate of candidates) {
+            try {
+                // For absolute paths, check file exists first
+                if (path.isAbsolute(candidate) && !fs.existsSync(candidate)) {
+                    continue;
+                }
+                const result = child_process.spawnSync(candidate, ['--version'], { timeout: 3000 });
+                if (result.status === 0) {
+                    console.log(`[TrueFlow Hub] Found Python: ${candidate}`);
+                    return candidate;
+                }
+            } catch (_) { /* try next */ }
+        }
+
+        console.warn('[TrueFlow Hub] No Python found, falling back to "python"');
+        return 'python';
+    }
+
+    /**
+     * Ensure hub Python dependencies are installed locally.
+     */
+    private async ensureHubDependencies(python: string, workspacePath?: string): Promise<string | null> {
+        const depsDir = workspacePath
+            ? path.join(workspacePath, '.pycharm_plugin', 'hub_deps')
+            : path.join(os.homedir(), '.trueflow', 'hub_deps');
+
+        const markerFile = path.join(depsDir, '.deps_installed');
+        if (fs.existsSync(markerFile)) {
+            return depsDir;
+        }
+
+        try {
+            fs.mkdirSync(depsDir, { recursive: true });
+            console.log(`[TrueFlow Hub] Installing hub dependencies to: ${depsDir}`);
+
+            const packages = ['websockets', 'mcp', 'starlette', 'uvicorn'];
+            const args = ['-m', 'pip', 'install', '--target', depsDir, '--upgrade', '--quiet', ...packages];
+
+            const result = child_process.spawnSync(python, args, { timeout: 120000 });
+            if (result.status === 0) {
+                fs.writeFileSync(markerFile, `installed=${Date.now()}`);
+                console.log('[TrueFlow Hub] Hub dependencies installed successfully');
+            } else {
+                const stderr = result.stderr?.toString() || '';
+                console.warn(`[TrueFlow Hub] pip install failed (exit ${result.status}): ${stderr}`);
+            }
+            return depsDir;
+        } catch (e: any) {
+            console.warn(`[TrueFlow Hub] Failed to install hub dependencies: ${e.message}`);
+            return depsDir;
         }
     }
 

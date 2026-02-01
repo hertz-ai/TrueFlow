@@ -662,7 +662,7 @@ async def analyze_dead_code(source_dir: str = "src/crawl4ai/embodied_ai") -> str
             "coverage_percent": round(len(runtime_covered) / len(defined_functions) * 100, 1) if defined_functions else 0
         },
         "dead_functions_count": len(dead_functions),
-        "dead_functions": dead_functions[:50],
+        "dead_functions": dead_functions,
         "note": "Connect to trace server and run code to improve accuracy" if not state.trace_connected else "Based on runtime execution data"
     }
 

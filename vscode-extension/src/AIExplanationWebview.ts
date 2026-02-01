@@ -5,6 +5,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as child_process from 'child_process';
 import { HubClient } from './HubClient';
+import { TraceSessionManager } from './TraceSessionManager';
+import { getGlobalTraceSocketClient } from './extension';
 
 /**
  * AI Explanation Webview - Interactive chat interface with local VLM (Qwen3-VL).
@@ -183,6 +185,10 @@ export class AIExplanationProvider {
     private serverLogFile: string | undefined;
     private serverLogStream: fs.WriteStream | undefined;
 
+    // Session auto-save
+    private sessionManager: TraceSessionManager | undefined;
+    private autoSaveInterval: NodeJS.Timeout | undefined;
+
     /**
      * Get the logs directory - uses workspace folder if available, falls back to home dir
      */
@@ -224,6 +230,15 @@ export class AIExplanationProvider {
         // Initialize hub client
         this.hubClient = HubClient.getInstance();
         this.setupHubHandlers();
+
+        // Initialize session manager and auto-save
+        try {
+            this.sessionManager = new TraceSessionManager();
+            this.startAutoSaveTimer();
+            this.tryAutoRestoreOnStartup();
+        } catch (e) {
+            console.warn('[TrueFlow] Session manager init failed (no workspace?):', e);
+        }
 
         // Detect GPU availability
         this.detectGpuAcceleration();
@@ -580,19 +595,36 @@ export class AIExplanationProvider {
                     };
                     break;
 
-                case 'get_dead_code':
-                    responseData = {
-                        dead_functions: this.deadCodeData?.dead_functions || [],
-                        called_functions: this.deadCodeData?.called_functions || []
-                    };
+                case 'get_dead_code': {
+                    // Try cached data first, then fall back to live socket data
+                    const dcData = this.deadCodeData || this.buildDeadCodeFromLiveData();
+                    if (dcData) {
+                        responseData.dead_functions = dcData.dead_functions || [];
+                        responseData.alive_functions = dcData.alive_functions || [];
+                        responseData.external_functions = dcData.external_functions || [];
+                        responseData.called_functions = dcData.called_functions || [];
+                        if (dcData.total_functions !== undefined) { responseData.total_functions = dcData.total_functions; }
+                        if (dcData.total_dead !== undefined) { responseData.total_dead = dcData.total_dead; }
+                        if (dcData.total_called !== undefined) { responseData.total_called = dcData.total_called; }
+                        if (dcData.total_external !== undefined) { responseData.total_external = dcData.total_external; }
+                        if (dcData.dead_percent !== undefined) { responseData.dead_percent = dcData.dead_percent; }
+                        if (dcData.module_breakdown) { responseData.module_breakdown = dcData.module_breakdown; }
+                        if (dcData.error) { responseData.error = dcData.error; }
+                    } else {
+                        responseData.error = 'No trace data loaded. Run your application first.';
+                    }
                     break;
+                }
 
-                case 'get_performance_data':
+                case 'get_performance_data': {
+                    // Try cached data first, then fall back to live socket data
+                    const perfData = this.performanceData || this.buildPerformanceFromLiveData();
                     responseData = {
-                        hotspots: this.performanceData?.hotspots || [],
-                        total_time_ms: this.performanceData?.total_time_ms || 0
+                        hotspots: perfData?.hotspots || [],
+                        total_time_ms: perfData?.total_time_ms || 0
                     };
                     break;
+                }
 
                 case 'export_diagram':
                     responseData = {
@@ -660,6 +692,62 @@ export class AIExplanationProvider {
                 case 'list_videos':
                     responseData = this.listManimVideos();
                     break;
+
+                // === Session Save/Restore RPC handlers ===
+
+                case 'save_session': {
+                    const sessionName = args.name || 'unnamed';
+                    try {
+                        if (!this.sessionManager) { this.sessionManager = new TraceSessionManager(); }
+                        const state = this.buildFullSessionState();
+                        const filePath = this.sessionManager.saveSession(sessionName, state);
+                        const stats = fs.statSync(filePath);
+                        responseData = { status: 'saved', file: path.basename(filePath), size_kb: Math.round(stats.size / 1024) };
+                    } catch (e: any) {
+                        responseData = { error: `Failed to save: ${e.message}` };
+                    }
+                    break;
+                }
+
+                case 'list_sessions': {
+                    try {
+                        if (!this.sessionManager) { this.sessionManager = new TraceSessionManager(); }
+                        const sessions = this.sessionManager.listSessions();
+                        responseData = {
+                            sessions: sessions.map(s => ({
+                                name: s.name,
+                                timestamp: s.timestamp,
+                                file: path.basename(s.file),
+                                size_mb: s.sizeMB.toFixed(2)
+                            })),
+                            count: sessions.length
+                        };
+                    } catch (e: any) {
+                        responseData = { error: `Failed to list: ${e.message}` };
+                    }
+                    break;
+                }
+
+                case 'restore_session': {
+                    const sesName = args.name;
+                    try {
+                        if (!this.sessionManager) { this.sessionManager = new TraceSessionManager(); }
+                        const sessions = this.sessionManager.listSessions();
+                        const match = sesName
+                            ? sessions.find(s => s.name.toLowerCase().includes(sesName.toLowerCase()) || path.basename(s.file).includes(sesName))
+                            : sessions[0];
+                        if (match) {
+                            const state = this.sessionManager.restoreSession(match.file);
+                            this.restoreFullSessionState(state);
+                            responseData = { status: 'restored', name: match.name, timestamp: match.timestamp };
+                        } else {
+                            responseData = { error: `Session not found: ${sesName}`, available_sessions: sessions.map(s => s.name).join(', ') };
+                        }
+                    } catch (e: any) {
+                        responseData = { error: `Failed to restore: ${e.message}` };
+                    }
+                    break;
+                }
 
                 default:
                     responseData = { error: `Unknown command: ${command}` };
@@ -3617,6 +3705,252 @@ Command: ${llamaServer} ${args.join(' ')}
         }
     }
 
+    // ==================== Session Save/Restore ====================
+
+    /**
+     * Build full session state from all in-memory + socket data.
+     */
+    private buildFullSessionState(): any {
+        const socketClient = getGlobalTraceSocketClient();
+        const state: any = {};
+
+        // Call stats from socket client
+        if (socketClient) {
+            const callStats: any = {};
+            socketClient.getCallStats().forEach((v, k) => { callStats[k] = v; });
+            state.socketTraceCalls = {};
+            socketClient.getCallStats().forEach((v, k) => { state.socketTraceCalls[k] = v.count; });
+
+            // Function registry
+            const regArr: any[] = [];
+            socketClient.getFunctionRegistry().forEach((v, k) => {
+                regArr.push({ key: k, file: v.file, line: v.line });
+            });
+            state.socketFunctionDefinitions = regArr;
+
+            // Call sites and branches
+            state.socketCallSites = socketClient.getCallSites();
+            const branches: any = {};
+            socketClient.getFunctionBranches().forEach((v, k) => { branches[k] = v; });
+            state.socketFunctionBranches = branches;
+
+            // Call graph
+            state.socketResolvedCallGraph = socketClient.getResolvedCallGraph();
+
+            // Event buffer (last 10000)
+            state.socketTraceBuffer = socketClient.getEventBuffer().map(e => `${e.module} -> ${e.module}: ${e.function}()`);
+            state.traceEventCount = socketClient.getEventCount();
+        }
+
+        // In-memory data from AIExplanationWebview
+        state.socketAllDefinedFunctions = Array.from(this.allDefinedFunctions);
+        state.socketTraceAllFunctions = Array.from(this.coveredFunctions);
+        state.socketTraceParticipants = [];
+
+        // Function durations
+        if (this.functionDurations.size > 0) {
+            const durObj: any = {};
+            this.functionDurations.forEach((v, k) => { durObj[k] = v; });
+            state.socketFunctionDurations = durObj;
+        }
+
+        // File/line map from function definitions
+        const flMap: any[] = [];
+        this.functionDefinitions.forEach((v, k) => {
+            flMap.push({ key: k, file: v.file, line: v.line });
+        });
+        state.socketTraceFileLineMap = flMap;
+
+        // Cached rich data
+        if (this.deadCodeData) { state._cachedDeadCodeData = this.deadCodeData; }
+        if (this.performanceData) { state._cachedPerformanceData = this.performanceData; }
+        if (this.callTraceData) { state._cachedCallTraceData = this.callTraceData; }
+        if (this.diagramData) { state._cachedDiagramData = this.diagramData; }
+        state._cachedCallGraphData = this.callGraphData;
+
+        return state;
+    }
+
+    /**
+     * Restore full session state from saved JSON.
+     */
+    private restoreFullSessionState(state: any): void {
+        // Restore defined/covered functions
+        this.allDefinedFunctions = new Set(state.socketAllDefinedFunctions || []);
+        this.coveredFunctions = new Set(state.socketTraceAllFunctions || []);
+
+        // Restore function definitions
+        this.functionDefinitions.clear();
+        (state.socketFunctionDefinitions || []).forEach((entry: any) => {
+            this.functionDefinitions.set(entry.key, { file: entry.file, line: entry.line });
+        });
+        (state.socketTraceFileLineMap || []).forEach((entry: any) => {
+            if (!this.functionDefinitions.has(entry.key)) {
+                this.functionDefinitions.set(entry.key, { file: entry.file, line: entry.line });
+            }
+        });
+
+        // Restore durations
+        this.functionDurations.clear();
+        if (state.socketFunctionDurations) {
+            for (const [k, v] of Object.entries(state.socketFunctionDurations)) {
+                this.functionDurations.set(k, v as number[]);
+            }
+        }
+
+        // Restore call graph
+        this.callGraphData = state.socketResolvedCallGraph || state._cachedCallGraphData || {};
+
+        // Restore cached rich data
+        if (state._cachedDeadCodeData) { this.deadCodeData = state._cachedDeadCodeData; }
+        if (state._cachedPerformanceData) { this.performanceData = state._cachedPerformanceData; }
+        if (state._cachedCallTraceData) { this.callTraceData = state._cachedCallTraceData; }
+        if (state._cachedDiagramData) { this.diagramData = state._cachedDiagramData; }
+
+        // If no cached data, build from restored state
+        if (!this.deadCodeData) { this.deadCodeData = this.buildDeadCodeFromLiveData(); }
+        if (!this.performanceData) { this.performanceData = this.buildPerformanceFromLiveData(); }
+
+        console.log(`[TraceSessionManager] Restored session: ${this.allDefinedFunctions.size} defined, ${this.coveredFunctions.size} covered`);
+    }
+
+    /**
+     * Build dead code data from live socket/in-memory state (fallback for RPC).
+     */
+    private buildDeadCodeFromLiveData(): any {
+        if (this.allDefinedFunctions.size === 0 && this.coveredFunctions.size === 0) { return null; }
+
+        const deadFunctions: any[] = [];
+        const aliveFunctions: any[] = [];
+
+        this.allDefinedFunctions.forEach(funcKey => {
+            const parts = funcKey.split('.');
+            const moduleName = parts.slice(0, -1).join('.') || '__main__';
+            const funcName = parts[parts.length - 1] || funcKey;
+            const def = this.functionDefinitions.get(funcKey);
+
+            if (this.coveredFunctions.has(funcKey)) {
+                aliveFunctions.push({
+                    key: funcKey, status: 'ALIVE', module: moduleName, function: funcName,
+                    file: def?.file || '-', line: def?.line || 0, call_count: 1
+                });
+            } else {
+                deadFunctions.push({
+                    key: funcKey, status: 'DEAD', module: moduleName, function: funcName,
+                    file: def?.file || '-', line: def?.line || 0, call_count: 0
+                });
+            }
+        });
+
+        const total = this.allDefinedFunctions.size;
+        const deadCount = deadFunctions.length;
+        const calledCount = aliveFunctions.length;
+        const deadPercent = total > 0 ? (deadCount / total) * 100 : 0;
+
+        return {
+            dead_functions: deadFunctions,
+            alive_functions: aliveFunctions,
+            called_functions: Array.from(this.coveredFunctions),
+            total_functions: total,
+            total_dead: deadCount,
+            total_called: calledCount,
+            dead_percent: parseFloat(deadPercent.toFixed(1))
+        };
+    }
+
+    /**
+     * Build performance data from live socket state (fallback for RPC).
+     */
+    private buildPerformanceFromLiveData(): any {
+        const socketClient = getGlobalTraceSocketClient();
+        if (!socketClient) { return null; }
+
+        const perfData = socketClient.getPerformanceData();
+        if (perfData.length === 0) { return null; }
+
+        const hotspots = perfData.slice(0, 50).map(p => ({
+            function: p.function,
+            module: p.module,
+            calls: p.calls,
+            total_ms: parseFloat(p.total.toFixed(2)),
+            avg_ms: parseFloat(p.avg.toFixed(2)),
+            min_ms: parseFloat(p.min.toFixed(2)),
+            max_ms: parseFloat(p.max.toFixed(2))
+        }));
+
+        const totalTimeMs = perfData.reduce((sum, p) => sum + p.total, 0);
+
+        return { hotspots, total_time_ms: parseFloat(totalTimeMs.toFixed(2)) };
+    }
+
+    /**
+     * Start auto-save timer based on VS Code settings.
+     */
+    private startAutoSaveTimer(): void {
+        if (this.autoSaveInterval) { clearInterval(this.autoSaveInterval); }
+
+        const config = vscode.workspace.getConfiguration('trueflow');
+        const enabled = config.get<boolean>('autoSaveEnabled', true);
+        if (!enabled) { return; }
+
+        const minutes = config.get<number>('autoSaveIntervalMinutes', 5);
+        const intervalMs = minutes * 60 * 1000;
+
+        this.autoSaveInterval = setInterval(() => {
+            if (this.hasTraceData()) {
+                this.performAutoSave();
+            }
+        }, intervalMs);
+
+        console.log(`[AutoSave] Timer started (${minutes}min)`);
+    }
+
+    private hasTraceData(): boolean {
+        return this.allDefinedFunctions.size > 0 || this.coveredFunctions.size > 0 ||
+               (this.deadCodeData !== null) || (this.performanceData !== null);
+    }
+
+    private performAutoSave(): void {
+        try {
+            if (!this.sessionManager) { this.sessionManager = new TraceSessionManager(); }
+            const state = this.buildFullSessionState();
+            this.sessionManager.saveSession('autosave', state);
+
+            // Cleanup old auto-saves
+            const config = vscode.workspace.getConfiguration('trueflow');
+            const maxSessions = config.get<number>('maxAutoSavedSessions', 10);
+            const sessions = this.sessionManager.listSessions()
+                .filter(s => s.name.startsWith('autosave'));
+            if (sessions.length > maxSessions) {
+                sessions.slice(maxSessions).forEach(s => this.sessionManager!.deleteSession(s.file));
+            }
+        } catch (e) {
+            console.warn('[AutoSave] Failed:', e);
+        }
+    }
+
+    /**
+     * Auto-restore most recent session on startup if no live server.
+     */
+    private tryAutoRestoreOnStartup(): void {
+        const config = vscode.workspace.getConfiguration('trueflow');
+        if (!config.get<boolean>('autoRestoreOnStartup', true)) { return; }
+
+        try {
+            if (!this.sessionManager) { this.sessionManager = new TraceSessionManager(); }
+            const sessions = this.sessionManager.listSessions();
+            if (sessions.length === 0) { return; }
+
+            // Prefer manual sessions over autosaves
+            const session = sessions.find(s => !s.name.startsWith('autosave')) || sessions[0];
+            const state = this.sessionManager.restoreSession(session.file);
+            this.restoreFullSessionState(state);
+            console.log(`[AutoRestore] Restored: ${session.name}`);
+        } catch (e) {
+            console.warn('[AutoRestore] Failed:', e);
+        }
+    }
+
     /**
      * Load trace data from workspace snapshot/trace files when not available from socket.
      * First tries to find snapshot files (comprehensive), then falls back to raw trace files.
@@ -3849,6 +4183,7 @@ ${methodCode}
     }
 
     public dispose(): void {
+        if (this.autoSaveInterval) { clearInterval(this.autoSaveInterval); }
         this.stopServer();
         this.panel?.dispose();
     }

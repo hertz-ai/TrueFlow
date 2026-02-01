@@ -84,6 +84,13 @@ let mcpStatusBarItem: vscode.StatusBarItem;
 let sidebarProvider: TrueFlowSidebarProvider | undefined;
 let explorerServer: InteractiveExplorerServer | undefined;
 
+/**
+ * Get the global TraceSocketClient instance (for session save/restore and RPC fallback).
+ */
+export function getGlobalTraceSocketClient(): TraceSocketClient | undefined {
+    return traceSocketClient;
+}
+
 // Track active processes started by this VS Code instance (without tracing)
 let activeProcessesWithoutTracing = new Set<string>();
 let statusBarPulseInterval: NodeJS.Timeout | undefined;
@@ -195,6 +202,34 @@ let serverIsUp = false;          // Tracks DOWN->UP transitions
 let consecutiveServerMisses = 0;
 const MISSES_TO_RESET = 3;
 
+// Hub restart debounce - prevent multiple simultaneous start attempts
+let lastHubRestartAttempt = 0;
+const HUB_RESTART_DEBOUNCE_MS = 15000; // 15 seconds between restart attempts
+let hubRestartInProgress = false;
+
+/**
+ * Debounced hub restart - ensures only one restart attempt within HUB_RESTART_DEBOUNCE_MS.
+ * Returns true if this call won the debounce and should proceed.
+ */
+function tryEnsureHubRunning(reason: string): boolean {
+    const now = Date.now();
+    if (now - lastHubRestartAttempt < HUB_RESTART_DEBOUNCE_MS) {
+        console.log(`[TrueFlow] Hub restart debounced (${reason}), last attempt ${now - lastHubRestartAttempt}ms ago`);
+        return false;
+    }
+    if (hubRestartInProgress) {
+        console.log(`[TrueFlow] Hub restart already in progress (${reason})`);
+        return false;
+    }
+    lastHubRestartAttempt = now;
+    hubRestartInProgress = true;
+    console.log(`[TrueFlow] ${reason}, ensuring MCP hub is running...`);
+    HubClient.getInstance().connect()
+        .catch((e: any) => console.log('[TrueFlow] Hub ensure attempt failed:', e))
+        .finally(() => { hubRestartInProgress = false; });
+    return true;
+}
+
 // Task/run detection state
 let taskDetectionDisabled = false;
 let lastTaskNotificationTime = 0;
@@ -270,6 +305,13 @@ function setupSocketClientHandlers(): void {
         if (sidebarProvider) {
             sidebarProvider.postMessage({ type: 'socketConnected' });
         }
+
+        // Ensure MCP Hub is also running (may have been killed by taskkill /F /IM python.exe)
+        let hubConnected = false;
+        try { hubConnected = HubClient.getInstance().isConnected(); } catch (_) { /* not initialized */ }
+        if (!hubConnected) {
+            tryEnsureHubRunning('Trace server connected but hub down');
+        }
     });
 
     traceSocketClient.on('disconnected', () => {
@@ -325,6 +367,8 @@ function setupSocketClientHandlers(): void {
             };
             aiProvider.setCallTraceData(callTraceData);
             aiProvider.setPerformanceData(perfData);
+            // Update rich dead code data for MCP RPC
+            buildAndSetRichDeadCodeData();
             // Save snapshot after data update
             aiProvider.saveSnapshot();
         }
@@ -338,6 +382,8 @@ function setupSocketClientHandlers(): void {
                 data: event.trace_data
             });
         }
+        // Update RPC dead code data when registry changes
+        buildAndSetRichDeadCodeData();
     });
 
     // Handle branch registry for "Why Not Covered" with actual branch conditions
@@ -348,7 +394,231 @@ function setupSocketClientHandlers(): void {
                 data: event.trace_data
             });
         }
+        // Update RPC dead code data when call graph changes
+        buildAndSetRichDeadCodeData();
     });
+}
+
+/**
+ * Build rich dead code data (matching PyCharm's updateAIExplanationPanel) and pass to AI provider for RPC.
+ * Uses data from TraceSocketClient: functionRegistry, callStats, resolvedCallGraph, callSites.
+ */
+function buildAndSetRichDeadCodeData(): void {
+    if (!traceSocketClient) return;
+
+    const functionRegistry = traceSocketClient.getFunctionRegistry();
+    const callStats = traceSocketClient.getCallStats();
+    const resolvedCallGraph = traceSocketClient.getResolvedCallGraph();
+    const callSites = traceSocketClient.getCallSites();
+
+    if (functionRegistry.size === 0) return; // No registry yet
+
+    // All defined functions from registry
+    const allDefined = new Set(functionRegistry.keys());
+
+    // Add functions from resolved call graph that aren't in registry
+    for (const [caller, callees] of Object.entries(resolvedCallGraph)) {
+        allDefined.add(caller);
+        for (const callee of callees) {
+            allDefined.add(callee);
+        }
+    }
+
+    // Covered functions (those with call stats)
+    const coveredKeys = new Set(callStats.keys());
+
+    // Build reverse call graph
+    const reverseGraph: Record<string, string[]> = {};
+    for (const [caller, callees] of Object.entries(resolvedCallGraph)) {
+        for (const callee of callees) {
+            if (!reverseGraph[callee]) reverseGraph[callee] = [];
+            if (!reverseGraph[callee].includes(caller)) {
+                reverseGraph[callee].push(caller);
+            }
+        }
+    }
+
+    // Root cause tracing (same as PyCharm)
+    function traceToRootCause(func: string, visited: Set<string>, chain: string[]): { type: string; rootFunc: string; chain: string[] } | null {
+        if (visited.has(func)) return null;
+        visited.add(func);
+        chain.push(func);
+        const callers = reverseGraph[func] || [];
+        if (callers.length === 0) return { type: 'NO_CALL_SITES', rootFunc: func, chain: [...chain] };
+        for (const caller of callers) {
+            if (coveredKeys.has(caller)) return { type: 'BRANCH_NOT_TAKEN', rootFunc: caller, chain: [...chain] };
+        }
+        for (const caller of callers) {
+            const result = traceToRootCause(caller, visited, chain);
+            if (result) return result;
+        }
+        return { type: 'UNREACHABLE_FROM_ENTRY', rootFunc: chain[chain.length - 1], chain: [...chain] };
+    }
+
+    // Helper to build callers array with alive/dead status
+    function buildCallersArray(funcKey: string): any[] {
+        const directCallers = reverseGraph[funcKey] || [];
+        return directCallers.map(caller => {
+            const parts = caller.split('.');
+            const isAlive = coveredKeys.has(caller);
+            return {
+                key: caller,
+                module: parts.slice(0, -1).join('.') || '__main__',
+                function: parts[parts.length - 1] || caller,
+                status: isAlive ? 'ALIVE' : 'DEAD',
+                call_count: callStats.get(caller)?.count || 0,
+                has_call_site: (resolvedCallGraph[caller] || []).includes(funcKey),
+                actually_called: isAlive && coveredKeys.has(funcKey)
+            };
+        });
+    }
+
+    // Categorize functions
+    const deadFunctions: any[] = [];
+    const aliveFunctions: any[] = [];
+    const externalFunctions: any[] = [];
+
+    // Dead functions (in registry, never called)
+    for (const funcKey of [...allDefined].sort()) {
+        if (coveredKeys.has(funcKey)) continue;
+        const parts = funcKey.split('.');
+        const regInfo = functionRegistry.get(funcKey);
+
+        const rootCause = traceToRootCause(funcKey, new Set(), []) ||
+            { type: 'UNKNOWN', rootFunc: funcKey, chain: [funcKey] };
+
+        const whyObj: any = {
+            root_cause: rootCause.type,
+            root_cause_function: rootCause.rootFunc,
+            call_chain: rootCause.chain
+        };
+
+        if (rootCause.type === 'BRANCH_NOT_TAKEN') {
+            const firstDeadInChain = rootCause.chain[0] || funcKey;
+            const relevantCallSite = callSites.find(site => {
+                const fullCaller = site.caller_module + '.' + site.caller;
+                return (fullCaller === rootCause.rootFunc || site.caller === rootCause.rootFunc) &&
+                    (site.callee === firstDeadInChain ||
+                     rootCause.chain.some(chainFunc => site.callee === chainFunc || chainFunc.endsWith('.' + site.callee)));
+            });
+            if (relevantCallSite?.in_branch) {
+                whyObj.branch_type = relevantCallSite.in_branch.type || 'if';
+                whyObj.branch_condition = relevantCallSite.in_branch.condition || 'condition was False';
+                whyObj.branch_line = relevantCallSite.in_branch.line || 0;
+            }
+        }
+
+        deadFunctions.push({
+            key: funcKey,
+            status: 'DEAD',
+            module: parts.slice(0, -1).join('.') || '__main__',
+            function: parts[parts.length - 1] || funcKey,
+            file: regInfo?.file || '-',
+            line: regInfo?.line || 0,
+            call_count: 0,
+            callers: buildCallersArray(funcKey),
+            why_not_covered: whyObj
+        });
+
+        // Add cached AI explanation if available
+        const cache = explorerServer?.getCache();
+        if (cache) {
+            const cached = cache.getExplanation(funcKey, regInfo?.file || '');
+            if (cached) {
+                deadFunctions[deadFunctions.length - 1].ai_explanation = {
+                    explanation: cached.explanation,
+                    why_not_covered: cached.whyNotCovered,
+                    model: cached.modelUsed,
+                    timestamp: cached.timestamp
+                };
+            }
+        }
+    }
+
+    // Alive functions (in registry and called, sorted by call count desc)
+    const aliveEntries: [string, { count: number }][] = [];
+    for (const [funcKey, stats] of callStats.entries()) {
+        if (allDefined.has(funcKey)) {
+            aliveEntries.push([funcKey, stats]);
+        }
+    }
+    aliveEntries.sort((a, b) => b[1].count - a[1].count);
+
+    for (const [funcKey, stats] of aliveEntries) {
+        const parts = funcKey.split('.');
+        const regInfo = functionRegistry.get(funcKey);
+        aliveFunctions.push({
+            key: funcKey,
+            status: 'ALIVE',
+            module: parts.slice(0, -1).join('.') || '__main__',
+            function: parts[parts.length - 1] || funcKey,
+            file: regInfo?.file || '-',
+            line: regInfo?.line || 0,
+            call_count: stats.count,
+            callers: buildCallersArray(funcKey)
+        });
+    }
+
+    // External functions (called but not in registry)
+    for (const [funcKey, stats] of callStats.entries()) {
+        if (!allDefined.has(funcKey)) {
+            const parts = funcKey.split('.');
+            externalFunctions.push({
+                key: funcKey,
+                status: 'EXTERNAL',
+                module: parts.slice(0, -1).join('.') || '__main__',
+                function: parts[parts.length - 1] || funcKey,
+                file: '-',
+                line: 0,
+                call_count: stats.count
+            });
+        }
+    }
+    externalFunctions.sort((a, b) => b.call_count - a.call_count);
+
+    // Summary stats
+    const totalDefined = allDefined.size;
+    const deadCount = deadFunctions.length;
+    const calledCount = aliveFunctions.length;
+    const externalCount = externalFunctions.length;
+    const deadPercent = totalDefined > 0 ? Math.round((deadCount / totalDefined) * 1000) / 10 : 0;
+
+    // Module breakdown
+    const moduleGroups: Record<string, { total: number; dead: number; alive: number }> = {};
+    for (const funcKey of allDefined) {
+        const parts = funcKey.split('.');
+        const mod = parts.slice(0, -1).join('.') || '__main__';
+        if (!moduleGroups[mod]) moduleGroups[mod] = { total: 0, dead: 0, alive: 0 };
+        moduleGroups[mod].total++;
+        if (coveredKeys.has(funcKey)) {
+            moduleGroups[mod].alive++;
+        } else {
+            moduleGroups[mod].dead++;
+        }
+    }
+    const moduleBreakdown: Record<string, any> = {};
+    for (const [mod, counts] of Object.entries(moduleGroups)) {
+        moduleBreakdown[mod] = {
+            ...counts,
+            dead_percent: counts.total > 0 ? Math.round((counts.dead / counts.total) * 1000) / 10 : 0
+        };
+    }
+
+    const richData = {
+        dead_functions: deadFunctions,
+        alive_functions: aliveFunctions,
+        external_functions: externalFunctions,
+        called_functions: [...coveredKeys],
+        total_functions: totalDefined,
+        total_dead: deadCount,
+        total_called: calledCount,
+        total_external: externalCount,
+        dead_percent: deadPercent,
+        module_breakdown: moduleBreakdown
+    };
+
+    // Pass to AI provider for RPC handler
+    AIExplanationProvider.getInstance().setDeadCodeData(richData);
 }
 
 async function connectToSocket(detectedPort?: number): Promise<void> {
@@ -844,6 +1114,13 @@ function toggleExplorerLiveServer(
                 });
             }
         );
+
+        // Initialize explanation cache
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (workspaceFolder) {
+            const cacheDir = path.join(workspaceFolder.uri.fsPath, '.trueflow');
+            explorerServer.initCache(cacheDir);
+        }
 
         explorerServer.start();
 
@@ -4837,8 +5114,16 @@ async function checkForTraceServer(): Promise<void> {
         mcpStatusBarItem.backgroundColor = undefined;
     } else if (hubPortUp && !hubConnected) {
         mcpStatusBarItem.text = '$(circle-slash) MCP  $(circle-${aiAvailable ? "filled" : "outline"}) AI';
-        mcpStatusBarItem.tooltip = 'MCP Hub running but not connected (ws://127.0.0.1:5680)';
+        mcpStatusBarItem.tooltip = 'MCP Hub running but not connected (ws://127.0.0.1:5680) - reconnecting...';
         mcpStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        // Auto-reconnect: hub port is up but HubClient is disconnected (debounced)
+        tryEnsureHubRunning('Hub port up but WebSocket disconnected');
+    } else if (!hubConnected && !hubPortUp && traceSocketClient?.isConnected()) {
+        // Hub is completely down but trace server is active - restart hub (debounced)
+        mcpStatusBarItem.text = '$(circle-outline) MCP  $(circle-${aiAvailable ? "filled" : "outline"}) AI';
+        mcpStatusBarItem.tooltip = 'MCP Hub offline - restarting...';
+        mcpStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        tryEnsureHubRunning('Hub down but trace server active');
     } else if (!hubConnected && aiAvailable) {
         mcpStatusBarItem.text = '$(circle-outline) MCP  $(circle-filled) AI';
         mcpStatusBarItem.tooltip = `MCP Hub offline | AI server running on port ${aiPort}`;
@@ -4848,6 +5133,9 @@ async function checkForTraceServer(): Promise<void> {
         mcpStatusBarItem.tooltip = 'MCP Hub offline (ws://127.0.0.1:5680) | AI server offline (port 8080)';
         mcpStatusBarItem.backgroundColor = undefined;
     }
+
+    // Update AI availability for explanation cache
+    explorerServer?.setAIAvailable(aiAvailable);
 
     // Check if we should pulse for auto-integrate (Python running without tracing)
     const isIntegrated = isProjectAlreadyIntegrated();

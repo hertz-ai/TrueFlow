@@ -272,6 +272,10 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private val uiUpdateIntervalMs = 2000L // Update UI every 2 seconds max (was 500ms)
     private var pendingUIUpdate = false
 
+    // Hub restart debounce - prevent multiple simultaneous start attempts
+    private val lastHubRestartAttempt = AtomicLong(0)
+    private val hubRestartDebounceMs = 15000L // 15 seconds between restart attempts
+
     // Event sampling (only process 1 out of N events for UI updates) - Thread-safe
     private val eventCounter = AtomicLong(0)
     private val eventSamplingRate = 10 // Process 1 out of every 10 events (reduced from 100 for better responsiveness)
@@ -292,6 +296,10 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private var autoRefreshInterval = 10000 // Default 10 seconds
     private var autoRefreshEnabled = true
 
+    // Auto-save timer (persists trace sessions at configurable intervals)
+    private var autoSaveTimer: javax.swing.Timer? = null
+    private val sessionSettings = SessionSettings.getInstance(project)
+
     // Server auto-detection
     private var serverDetectionTimer: javax.swing.Timer? = null
     private var serverDetectionEnabled = true
@@ -299,6 +307,7 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private val lastServerDetectedPort = AtomicInteger(0)
     private val serverNotificationShown = AtomicBoolean(false)
     private val defaultTracePort = 5678
+    private val javaTracePort = 5679
 // Debounce / anti-spam for server detection notifications
 private val serverNotificationCooldownMs = 60_000L // 1 minute
 private val lastServerNotificationAt = AtomicLong(0)
@@ -318,7 +327,20 @@ private val missesToReset = 3
     init {
         // Initialize paths and deploy resources
         PluginPaths.initializeAll(project)
-        ResourceDeployer.deployAll(project)
+        val pluginVersionChanged = ResourceDeployer.deployAll(project)
+
+        // If plugin was updated, restart the MCP hub so it picks up new Python code
+        if (pluginVersionChanged) {
+            Thread({
+                try {
+                    val hub = HubClient.getInstance()
+                    hub.setProject(project)
+                    hub.restartHub()
+                } catch (e: Exception) {
+                    PluginLogger.warn("[ToolWindow] Hub restart after plugin update failed: ${e.message}")
+                }
+            }, "trueflow-hub-version-restart").apply { isDaemon = true }.start()
+        }
 
         // Set tool window reference for RPC data access
         aiExplanationPanel.setToolWindow(this)
@@ -389,6 +411,12 @@ private val missesToReset = 3
 
         // Start server auto-detection
         startServerDetection()
+
+        // Start auto-save timer
+        startAutoSaveTimer()
+
+        // Auto-restore most recent session on startup (if enabled and no live server)
+        tryAutoRestoreOnStartup()
     }
 
     private fun createToolbar() {
@@ -452,6 +480,20 @@ private val missesToReset = 3
         attachButton.background = java.awt.Color(33, 150, 243) // Blue highlight
         attachButton.foreground = java.awt.Color.WHITE
         toolbar.add(attachButton)
+
+        toolbar.addSeparator()
+
+        // Save Session button
+        val saveSessionButton = JButton("Save Session")
+        saveSessionButton.toolTipText = "Save current trace data to a named session file for later restore"
+        saveSessionButton.addActionListener { showSaveSessionDialog() }
+        toolbar.add(saveSessionButton)
+
+        // Restore Session button
+        val restoreSessionButton = JButton("Restore Session")
+        restoreSessionButton.toolTipText = "Restore a previously saved trace session"
+        restoreSessionButton.addActionListener { showRestoreSessionDialog() }
+        toolbar.add(restoreSessionButton)
 
         toolbar.addSeparator()
 
@@ -1360,6 +1402,31 @@ private val missesToReset = 3
         }
     }
 
+    /**
+     * Debounced hub restart - ensures only one restart attempt within hubRestartDebounceMs.
+     * Returns true if this call won the debounce and should proceed.
+     */
+    private fun tryEnsureHubRunning(reason: String): Boolean {
+        val now = System.currentTimeMillis()
+        val lastAttempt = lastHubRestartAttempt.get()
+        if (now - lastAttempt < hubRestartDebounceMs) {
+            PluginLogger.debug("[ToolWindow] Hub restart debounced ($reason), last attempt ${now - lastAttempt}ms ago")
+            return false
+        }
+        if (!lastHubRestartAttempt.compareAndSet(lastAttempt, now)) {
+            return false // Another thread won the CAS
+        }
+        Thread({
+            try {
+                PluginLogger.info("[ToolWindow] $reason, ensuring MCP hub is running...")
+                HubClient.getInstance().connect()
+            } catch (e: Exception) {
+                PluginLogger.debug("[ToolWindow] Hub ensure attempt failed: ${e.message}")
+            }
+        }, "trueflow-hub-ensure").apply { isDaemon = true }.start()
+        return true
+    }
+
     private fun connectToTraceServer(host: String, port: Int) {
         // Disconnect from file-based mode if active
         if (currentTraceMode == TraceMode.FILE_BASED) {
@@ -1407,6 +1474,11 @@ private val missesToReset = 3
                     updateAttachButtonState(true) // Change to "Detach"
                     processInfoLabel.text = "Receiving real-time traces..."
                     PluginLogger.info("[ToolWindow] Successfully connected to trace server at $host:$port")
+                }
+                // Ensure MCP Hub is also running (may have been killed by taskkill /F /IM python.exe)
+                val hubConnected = try { HubClient.getInstance().isConnected() } catch (_: Exception) { false }
+                if (!hubConnected) {
+                    tryEnsureHubRunning("Trace server connected but hub down")
                 }
             },
             onDisconnected = { error ->
@@ -1743,12 +1815,234 @@ private val missesToReset = 3
     }
 
     private fun updateAIExplanationPanel() {
-        // Build trace data JSON for AI explanation
+        // Build trace data JSON for AI explanation and MCP RPC
+        // Mirrors the same rich categorized data as the Dead Code tab
         val traceJson = com.google.gson.JsonObject()
 
-        // Add function calls
+        // Apply class-inference normalization (same logic as updateDeadCodeFromSocketTrace)
+        val classInferenceMap = mutableMapOf<String, String>()
+        val ambiguousKeys = mutableSetOf<String>()
+        for (registryKey in socketAllDefinedFunctions) {
+            val parts = registryKey.split(".")
+            if (parts.size >= 2) {
+                val methodName = parts.last()
+                val potentialClassName = parts.getOrNull(parts.size - 2) ?: ""
+                if (potentialClassName.isNotEmpty() && potentialClassName.first().isUpperCase()) {
+                    val moduleParts = parts.dropLast(2)
+                    if (moduleParts.isNotEmpty()) {
+                        val shortKey = moduleParts.joinToString(".") + "." + methodName
+                        if (shortKey in classInferenceMap) {
+                            ambiguousKeys.add(shortKey)
+                        } else {
+                            classInferenceMap[shortKey] = registryKey
+                        }
+                    }
+                }
+            }
+        }
+        ambiguousKeys.forEach { classInferenceMap.remove(it) }
+
+        val normalizedTraceCalls = mutableMapOf<String, Int>()
+        for ((tracedKey, count) in socketTraceCalls) {
+            val normalizedKey = when {
+                tracedKey in socketAllDefinedFunctions -> tracedKey
+                tracedKey in classInferenceMap -> classInferenceMap[tracedKey]!!
+                else -> tracedKey
+            }
+            normalizedTraceCalls[normalizedKey] = (normalizedTraceCalls[normalizedKey] ?: 0) + count
+        }
+
+        // Filter using global trace filter (same as Dead Code tab)
+        val filteredDefinedFunctions = socketAllDefinedFunctions.filter { funcKey ->
+            val filePath = socketFunctionDefinitions[funcKey]?.first ?: ""
+            !traceFilter.shouldExclude(filePath)
+        }
+        val filteredCalledFunctions = normalizedTraceCalls.filter { (funcKey, _) ->
+            val filePath = socketFunctionDefinitions[funcKey]?.first ?: ""
+            !traceFilter.shouldExclude(filePath)
+        }
+
+        // Categorize functions exactly as the Dead Code tab does
+        val registryMatchedCalls = filteredCalledFunctions.filterKeys { it in filteredDefinedFunctions }
+        val externalCalls = filteredCalledFunctions.filterKeys { it !in filteredDefinedFunctions }
+        val deadFunctionKeys = filteredDefinedFunctions.filter { it !in normalizedTraceCalls }.sorted()
+
+        // Build reverse call graph for caller analysis (reuse same pattern as updateInteractiveVisualization)
+        val reverseGraph = mutableMapOf<String, MutableList<String>>()
+        for ((caller, callees) in socketResolvedCallGraph) {
+            for (callee in callees) {
+                reverseGraph.getOrPut(callee) { mutableListOf() }.add(caller)
+            }
+        }
+
+        // Build why-not-covered root cause analysis for dead functions (same logic as updateInteractiveVisualization)
+        val executedFunctions = normalizedTraceCalls.keys
+
+        fun traceToRootCause(
+            func: String,
+            visited: MutableSet<String>,
+            chain: MutableList<String>
+        ): Triple<String, String, List<String>>? {
+            if (func in visited) return null
+            visited.add(func)
+            chain.add(func)
+            val callers = reverseGraph[func] ?: emptyList()
+            if (callers.isEmpty()) return Triple("NO_CALL_SITES", func, chain.toList())
+            for (caller in callers) {
+                if (caller in executedFunctions) return Triple("BRANCH_NOT_TAKEN", caller, chain.toList())
+            }
+            for (caller in callers) {
+                val result = traceToRootCause(caller, visited, chain)
+                if (result != null) return result
+            }
+            return Triple("UNREACHABLE_FROM_ENTRY", chain.last(), chain.toList())
+        }
+
+        // Helper to build callers array with alive/dead status for a function
+        fun buildCallersArray(funcKey: String): com.google.gson.JsonArray {
+            val callersArray = com.google.gson.JsonArray()
+            val directCallers = reverseGraph[funcKey] ?: emptyList()
+            for (caller in directCallers) {
+                val callerObj = com.google.gson.JsonObject()
+                callerObj.addProperty("key", caller)
+                val callerParts = caller.split(".")
+                callerObj.addProperty("module", callerParts.dropLast(1).joinToString(".").ifEmpty { "__main__" })
+                callerObj.addProperty("function", callerParts.lastOrNull() ?: caller)
+                val isAlive = caller in normalizedTraceCalls
+                callerObj.addProperty("status", if (isAlive) "ALIVE" else "DEAD")
+                callerObj.addProperty("call_count", normalizedTraceCalls[caller] ?: 0)
+                // Did this caller actually call funcKey at runtime?
+                val callerCallees = socketResolvedCallGraph[caller] ?: emptyList()
+                val hasStaticEdge = funcKey in callerCallees
+                val callerExecuted = isAlive
+                callerObj.addProperty("has_call_site", hasStaticEdge)
+                callerObj.addProperty("actually_called", callerExecuted && funcKey in normalizedTraceCalls)
+                callersArray.add(callerObj)
+            }
+            return callersArray
+        }
+
+        // Helper to get cached AI explanation for a function
+        fun getCachedExplanationJson(funcKey: String, file: String): com.google.gson.JsonObject? {
+            val cached = manimVideoPanel.getCachedExplanation(funcKey, file) ?: return null
+            val explObj = com.google.gson.JsonObject()
+            explObj.addProperty("explanation", cached.explanation)
+            explObj.addProperty("why_not_covered", cached.whyNotCovered)
+            explObj.addProperty("model", cached.modelUsed)
+            explObj.addProperty("timestamp", cached.timestamp)
+            return explObj
+        }
+
+        // Build DEAD functions array with rich metadata + callers + root cause + AI explanation
+        val deadArray = com.google.gson.JsonArray()
+        for (funcKey in deadFunctionKeys) {
+            val parts = funcKey.split(".")
+            val module = parts.dropLast(1).joinToString(".")
+            val function = parts.lastOrNull() ?: funcKey
+            val (file, line) = socketFunctionDefinitions[funcKey] ?: Pair("-", 0)
+
+            val obj = com.google.gson.JsonObject()
+            obj.addProperty("key", funcKey)
+            obj.addProperty("status", "DEAD")
+            obj.addProperty("module", module.ifEmpty { "__main__" })
+            obj.addProperty("function", function)
+            obj.addProperty("file", file)
+            obj.addProperty("line", line)
+            obj.addProperty("call_count", 0)
+
+            // Callers with status
+            obj.add("callers", buildCallersArray(funcKey))
+
+            // Why not covered - root cause analysis
+            val (rootCauseType, rootCauseFunc, callChain) = traceToRootCause(
+                funcKey, mutableSetOf(), mutableListOf()
+            ) ?: Triple("UNKNOWN", funcKey, listOf(funcKey))
+
+            val whyObj = com.google.gson.JsonObject()
+            whyObj.addProperty("root_cause", rootCauseType)
+            whyObj.addProperty("root_cause_function", rootCauseFunc)
+            val chainArray = com.google.gson.JsonArray()
+            callChain.forEach { chainArray.add(it) }
+            whyObj.add("call_chain", chainArray)
+
+            // Add branch details if BRANCH_NOT_TAKEN
+            if (rootCauseType == "BRANCH_NOT_TAKEN") {
+                val firstDeadInChain = callChain.firstOrNull() ?: funcKey
+                val relevantCallSite = socketCallSites.find { site ->
+                    val fullCaller = "${site.callerModule}.${site.caller}"
+                    (fullCaller == rootCauseFunc || site.caller == rootCauseFunc) &&
+                    (site.callee == firstDeadInChain ||
+                     callChain.any { chainFunc -> site.callee == chainFunc || chainFunc.endsWith(".${site.callee}") })
+                }
+                if (relevantCallSite != null) {
+                    whyObj.addProperty("branch_type", relevantCallSite.inBranch?.branchType ?: "if")
+                    whyObj.addProperty("branch_condition", relevantCallSite.inBranch?.condition ?: "condition was False")
+                    whyObj.addProperty("branch_line", relevantCallSite.inBranch?.line ?: 0)
+                }
+            }
+            obj.add("why_not_covered", whyObj)
+
+            // Cached AI explanation
+            getCachedExplanationJson(funcKey, file)?.let { obj.add("ai_explanation", it) }
+
+            deadArray.add(obj)
+        }
+        traceJson.add("dead_functions", deadArray)
+
+        // Build ALIVE functions array with rich metadata + callers (sorted by call count desc)
+        val aliveArray = com.google.gson.JsonArray()
+        for ((funcKey, count) in registryMatchedCalls.entries.sortedByDescending { it.value }) {
+            val parts = funcKey.split(".")
+            val module = parts.dropLast(1).joinToString(".")
+            val function = parts.lastOrNull() ?: funcKey
+            val (file, line) = socketFunctionDefinitions[funcKey]
+                ?: socketTraceFileLineMap[funcKey]
+                ?: Pair("-", 0)
+
+            val obj = com.google.gson.JsonObject()
+            obj.addProperty("key", funcKey)
+            obj.addProperty("status", "ALIVE")
+            obj.addProperty("module", module.ifEmpty { "__main__" })
+            obj.addProperty("function", function)
+            obj.addProperty("file", file)
+            obj.addProperty("line", line)
+            obj.addProperty("call_count", count)
+
+            // Callers with status (shows which potential callers didn't actually call)
+            obj.add("callers", buildCallersArray(funcKey))
+
+            aliveArray.add(obj)
+        }
+        traceJson.add("alive_functions", aliveArray)
+
+        // Build EXTERNAL functions array (traced but not in registry)
+        val externalArray = com.google.gson.JsonArray()
+        for ((funcKey, count) in externalCalls.entries.sortedByDescending { it.value }) {
+            val parts = funcKey.split(".")
+            val module = parts.dropLast(1).joinToString(".")
+            val function = parts.lastOrNull() ?: funcKey
+            val (file, line) = socketTraceFileLineMap[funcKey] ?: Pair("-", 0)
+
+            val obj = com.google.gson.JsonObject()
+            obj.addProperty("key", funcKey)
+            obj.addProperty("status", "EXTERNAL")
+            obj.addProperty("module", module.ifEmpty { "__main__" })
+            obj.addProperty("function", function)
+            obj.addProperty("file", file)
+            obj.addProperty("line", line)
+            obj.addProperty("call_count", count)
+            externalArray.add(obj)
+        }
+        traceJson.add("external_functions", externalArray)
+
+        // Build backward-compatible called_functions list (bare keys for legacy consumers)
+        val calledArray = com.google.gson.JsonArray()
+        normalizedTraceCalls.keys.forEach { calledArray.add(it) }
+        traceJson.add("called_functions", calledArray)
+
+        // Add ALL function calls with rich metadata (no cap)
         val callsArray = com.google.gson.JsonArray()
-        socketTraceCalls.entries.take(50).forEach { (funcKey, count) ->
+        socketTraceCalls.entries.forEach { (funcKey, count) ->
             val parts = funcKey.split(".")
             val module = parts.dropLast(1).joinToString(".")
             val function = parts.lastOrNull() ?: funcKey
@@ -1769,16 +2063,36 @@ private val missesToReset = 3
         socketTraceParticipants.forEach { modulesArray.add(it) }
         traceJson.add("modules", modulesArray)
 
-        // Add dead functions
-        val deadFunctions = socketAllDefinedFunctions.filter { it !in socketTraceCalls }
-        val deadArray = com.google.gson.JsonArray()
-        deadFunctions.take(20).forEach { deadArray.add(it) }
-        traceJson.add("dead_functions", deadArray)
+        // Summary statistics (matching Dead Code tab)
+        val totalDefined = filteredDefinedFunctions.size
+        val calledCount = registryMatchedCalls.size
+        val deadCount = deadFunctionKeys.size
+        val externalCount = externalCalls.size
+        val deadPercent = if (totalDefined > 0) (deadCount.toDouble() / totalDefined) * 100.0 else 0.0
 
-        // Add called functions
-        val calledArray = com.google.gson.JsonArray()
-        socketTraceCalls.keys.forEach { calledArray.add(it) }
-        traceJson.add("called_functions", calledArray)
+        traceJson.addProperty("total_functions", totalDefined)
+        traceJson.addProperty("total_dead", deadCount)
+        traceJson.addProperty("total_called", calledCount)
+        traceJson.addProperty("total_external", externalCount)
+        traceJson.addProperty("dead_percent", String.format("%.1f", deadPercent).toDouble())
+
+        // Module breakdown
+        val moduleBreakdown = com.google.gson.JsonObject()
+        val moduleGroups = filteredDefinedFunctions.groupBy { funcKey ->
+            val parts = funcKey.split(".")
+            parts.dropLast(1).joinToString(".").ifEmpty { "__main__" }
+        }
+        for ((moduleName, funcs) in moduleGroups) {
+            val modObj = com.google.gson.JsonObject()
+            val modDead = funcs.count { it !in normalizedTraceCalls }
+            val modAlive = funcs.size - modDead
+            modObj.addProperty("total", funcs.size)
+            modObj.addProperty("dead", modDead)
+            modObj.addProperty("alive", modAlive)
+            modObj.addProperty("dead_percent", if (funcs.isNotEmpty()) String.format("%.1f", (modDead.toDouble() / funcs.size) * 100.0).toDouble() else 0.0)
+            moduleBreakdown.add(moduleName, modObj)
+        }
+        traceJson.add("module_breakdown", moduleBreakdown)
 
         // Pass to AI panel - use the new separate setters
         aiExplanationPanel.setDeadCodeData(traceJson)
@@ -2938,6 +3252,78 @@ private val missesToReset = 3
         }
     }
 
+    // === Auto-Save Sessions ===
+
+    fun startAutoSaveTimer() {
+        stopAutoSaveTimer()
+        val settings = sessionSettings.state
+        if (!settings.autoSaveEnabled) return
+
+        val intervalMs = settings.autoSaveIntervalMinutes * 60 * 1000
+        autoSaveTimer = javax.swing.Timer(intervalMs) {
+            if (hasTraceData()) {
+                performAutoSave()
+            }
+        }
+        autoSaveTimer?.start()
+        PluginLogger.info("[AutoSave] Timer started (${settings.autoSaveIntervalMinutes}min)")
+    }
+
+    private fun stopAutoSaveTimer() {
+        autoSaveTimer?.stop()
+        autoSaveTimer = null
+    }
+
+    private fun performAutoSave() {
+        val state = getTraceStateForSave()
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                val manager = TraceSessionManager(project)
+                val file = manager.saveSession("autosave", state)
+                PluginLogger.info("[AutoSave] Saved: ${file.name} (${file.length() / 1024}KB)")
+
+                // Cleanup old auto-saves
+                val maxSessions = sessionSettings.state.maxAutoSavedSessions
+                val autoSaves = manager.listSessions()
+                    .filter { it.name.startsWith("autosave") }
+                    .sortedByDescending { it.file.lastModified() }
+                if (autoSaves.size > maxSessions) {
+                    autoSaves.drop(maxSessions).forEach { manager.deleteSession(it.file) }
+                }
+            } catch (e: Exception) {
+                PluginLogger.warn("[AutoSave] Failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun tryAutoRestoreOnStartup() {
+        if (!sessionSettings.state.autoRestoreOnStartup) return
+
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                // Don't restore if a live trace server is already up
+                val pythonUp = isPortListening("127.0.0.1", defaultTracePort)
+                val javaUp = isPortListening("127.0.0.1", javaTracePort)
+                if (pythonUp || javaUp) {
+                    PluginLogger.info("[AutoRestore] Skipping — live trace server detected")
+                    return@executeOnPooledThread
+                }
+
+                val manager = TraceSessionManager(project)
+                val sessions = manager.listSessions()
+                if (sessions.isEmpty()) return@executeOnPooledThread
+
+                // Prefer manual sessions over autosaves
+                val session = sessions.firstOrNull { !it.name.startsWith("autosave") } ?: sessions.first()
+                val state = manager.restoreSession(session.file)
+                restoreTraceState(state)
+                PluginLogger.info("[AutoRestore] Restored: ${session.name} (${session.timestamp})")
+            } catch (e: Exception) {
+                PluginLogger.warn("[AutoRestore] Failed: ${e.message}")
+            }
+        }
+    }
+
     // === Server Auto-Detection ===
 
     private fun startServerDetection() {
@@ -2972,6 +3358,18 @@ private val missesToReset = 3
         val aiPort = 8080
         val aiAvailable = isPortListening("127.0.0.1", aiPort)
 
+        // Auto-reconnect/restart hub when trace server is active
+        val traceConnected = (currentTraceMode == TraceMode.SOCKET_REALTIME && traceSocketClient?.isConnected() == true)
+        if (!hubConnected) {
+            if (hubPortUp) {
+                // Hub port is up but WebSocket dropped - just reconnect (debounced)
+                tryEnsureHubRunning("Hub port up but WebSocket disconnected")
+            } else if (traceConnected) {
+                // Hub is completely down but trace server is active - restart hub (debounced)
+                tryEnsureHubRunning("Hub down but trace server active")
+            }
+        }
+
         SwingUtilities.invokeLater {
             when {
                 hubConnected && aiAvailable -> {
@@ -2987,7 +3385,7 @@ private val missesToReset = 3
                 hubPortUp && !hubConnected -> {
                     mcpStatusLabel.text = "MCP: ◐  AI: ${if (aiAvailable) "●" else "○"}"
                     mcpStatusLabel.foreground = JBColor(0xDAA520, 0xFFD700)  // Amber
-                    mcpStatusLabel.toolTipText = "MCP Hub running but not connected (ws://127.0.0.1:5680)"
+                    mcpStatusLabel.toolTipText = "MCP Hub running but not connected (ws://127.0.0.1:5680) - reconnecting..."
                 }
                 !hubConnected && aiAvailable -> {
                     mcpStatusLabel.text = "MCP: ○  AI: ●"
@@ -3008,8 +3406,15 @@ private val missesToReset = 3
             return
         }
 
-        val port = defaultTracePort
-        val isAvailable = isPortListening("127.0.0.1", port)
+        // Check both Python (5678) and Java (5679) trace ports
+        val pythonAvailable = isPortListening("127.0.0.1", defaultTracePort)
+        val javaAvailable = if (!pythonAvailable) isPortListening("127.0.0.1", javaTracePort) else false
+        val port = when {
+            pythonAvailable -> defaultTracePort
+            javaAvailable -> javaTracePort
+            else -> defaultTracePort
+        }
+        val isAvailable = pythonAvailable || javaAvailable
 
         // Check if we should pulse the Auto-Integrate button
         // Conditions: Python/Java app running WITHOUT tracing AND not integrated yet AND panel visible
@@ -4409,10 +4814,629 @@ private val missesToReset = 3
         }
     }
 
+    private fun showSaveSessionDialog() {
+        val hasData = socketTraceCalls.isNotEmpty() || socketAllDefinedFunctions.isNotEmpty()
+        if (!hasData) {
+            JOptionPane.showMessageDialog(mainPanel, "No trace data to save. Run your application with tracing first.",
+                "Save Session", JOptionPane.WARNING_MESSAGE)
+            return
+        }
+
+        val defaultName = project.name.replace(Regex("[^a-zA-Z0-9_\\-]"), "_")
+        val name = JOptionPane.showInputDialog(mainPanel, "Session name:", "Save Trace Session",
+            JOptionPane.PLAIN_MESSAGE, null, null, defaultName) as? String ?: return
+
+        if (name.isBlank()) return
+
+        Thread {
+            try {
+                val manager = TraceSessionManager(project)
+                val state = getTraceStateForSave()
+                val file = manager.saveSession(name.trim(), state)
+                SwingUtilities.invokeLater {
+                    currentSessionLabel.text = "Session: ${name.trim()} (saved)"
+                    NotificationGroupManager.getInstance()
+                        .getNotificationGroup("TrueFlow Notifications")
+                        .createNotification("Session saved: ${file.name} (${file.length() / 1024} KB)",
+                            NotificationType.INFORMATION)
+                        .notify(project)
+                }
+            } catch (e: Exception) {
+                PluginLogger.error("[ToolWindow] Failed to save session: ${e.message}", e)
+                SwingUtilities.invokeLater {
+                    JOptionPane.showMessageDialog(mainPanel, "Failed to save session: ${e.message}",
+                        "Save Error", JOptionPane.ERROR_MESSAGE)
+                }
+            }
+        }.start()
+    }
+
+    private fun showRestoreSessionDialog() {
+        val manager = TraceSessionManager(project)
+        val sessions = manager.listSessions()
+
+        if (sessions.isEmpty()) {
+            JOptionPane.showMessageDialog(mainPanel, "No saved sessions found.\nSave a session first using 'Save Session'.",
+                "Restore Session", JOptionPane.INFORMATION_MESSAGE)
+            return
+        }
+
+        // Build a selection list
+        val sessionNames = sessions.map { "${it.name}  |  ${it.timestamp}  |  ${String.format("%.1f", it.sizeMb)} MB" }.toTypedArray()
+        val selected = JOptionPane.showInputDialog(mainPanel, "Select a session to restore:",
+            "Restore Trace Session", JOptionPane.PLAIN_MESSAGE, null, sessionNames, sessionNames[0]) as? String ?: return
+
+        val idx = sessionNames.indexOf(selected)
+        if (idx < 0) return
+        val session = sessions[idx]
+
+        Thread {
+            try {
+                val state = manager.restoreSession(session.file)
+                restoreTraceState(state)
+                SwingUtilities.invokeLater {
+                    NotificationGroupManager.getInstance()
+                        .getNotificationGroup("TrueFlow Notifications")
+                        .createNotification("Restored session: ${session.name} (${session.timestamp})",
+                            NotificationType.INFORMATION)
+                        .notify(project)
+                }
+            } catch (e: Exception) {
+                PluginLogger.error("[ToolWindow] Failed to restore session: ${e.message}", e)
+                SwingUtilities.invokeLater {
+                    JOptionPane.showMessageDialog(mainPanel, "Failed to restore session: ${e.message}",
+                        "Restore Error", JOptionPane.ERROR_MESSAGE)
+                }
+            }
+        }.start()
+    }
+
     fun getContent(): JComponent = mainPanel
+
+    // ==================== Session Save/Restore ====================
+
+    /**
+     * Collect all 18 trace data structures into a JSON object for session save.
+     */
+    fun getTraceStateForSave(): JsonObject {
+        val state = JsonObject()
+
+        // 1. socketTraceCalls - Map<String, Int>
+        val callsObj = JsonObject()
+        socketTraceCalls.forEach { (k, v) -> callsObj.addProperty(k, v) }
+        state.add("socketTraceCalls", callsObj)
+
+        // 2. socketAllDefinedFunctions - Set<String>
+        val definedArr = JsonArray()
+        socketAllDefinedFunctions.forEach { definedArr.add(it) }
+        state.add("socketAllDefinedFunctions", definedArr)
+
+        // 3. socketFunctionDefinitions - Map<String, Pair<String, Int>>
+        state.add("socketFunctionDefinitions", TraceSessionManager.pairMapToJson(socketFunctionDefinitions))
+
+        // 4. socketTraceAllFunctions - Set<String>
+        val allFuncsArr = JsonArray()
+        socketTraceAllFunctions.forEach { allFuncsArr.add(it) }
+        state.add("socketTraceAllFunctions", allFuncsArr)
+
+        // 5. socketTraceFileLineMap - Map<String, Pair<String, Int>>
+        state.add("socketTraceFileLineMap", TraceSessionManager.pairMapToJson(socketTraceFileLineMap))
+
+        // 6. socketFunctionDurations - Map<String, List<Double>>
+        val durObj = JsonObject()
+        socketFunctionDurations.forEach { (k, v) ->
+            val arr = JsonArray()
+            v.forEach { arr.add(it) }
+            durObj.add(k, arr)
+        }
+        state.add("socketFunctionDurations", durObj)
+
+        // 7. socketTotalDurationMs
+        state.addProperty("socketTotalDurationMs", socketTotalDurationMs)
+
+        // 8. socketCompletedCalls
+        state.addProperty("socketCompletedCalls", socketCompletedCalls)
+
+        // 9. socketCallSites - List<CallSiteInfo>
+        val callSitesArr = JsonArray()
+        socketCallSites.forEach { cs ->
+            val obj = JsonObject()
+            obj.addProperty("callee", cs.callee)
+            obj.addProperty("caller", cs.caller)
+            obj.addProperty("callerModule", cs.callerModule)
+            obj.addProperty("file", cs.file)
+            obj.addProperty("line", cs.line)
+            if (cs.inBranch != null) {
+                val br = JsonObject()
+                br.addProperty("branchType", cs.inBranch.branchType)
+                br.addProperty("condition", cs.inBranch.condition)
+                br.addProperty("line", cs.inBranch.line)
+                br.addProperty("endLine", cs.inBranch.endLine)
+                obj.add("inBranch", br)
+            }
+            callSitesArr.add(obj)
+        }
+        state.add("socketCallSites", callSitesArr)
+
+        // 10. socketFunctionBranches - Map<String, List<Map<String, Any>>>
+        val branchesObj = JsonObject()
+        socketFunctionBranches.forEach { (k, branches) ->
+            val arr = JsonArray()
+            branches.forEach { branchMap ->
+                val bObj = JsonObject()
+                branchMap.forEach { (bk, bv) ->
+                    when (bv) {
+                        is String -> bObj.addProperty(bk, bv)
+                        is Number -> bObj.addProperty(bk, bv)
+                        is Boolean -> bObj.addProperty(bk, bv)
+                        else -> bObj.addProperty(bk, bv.toString())
+                    }
+                }
+                arr.add(bObj)
+            }
+            branchesObj.add(k, arr)
+        }
+        state.add("socketFunctionBranches", branchesObj)
+
+        // 11. socketResolvedCallGraph - Map<String, List<String>>
+        val graphObj = JsonObject()
+        socketResolvedCallGraph.forEach { (k, v) ->
+            val arr = JsonArray()
+            v.forEach { arr.add(it) }
+            graphObj.add(k, arr)
+        }
+        state.add("socketResolvedCallGraph", graphObj)
+
+        // 12. classFirstInitTimestamp - Map<String, Double>
+        val classInitObj = JsonObject()
+        classFirstInitTimestamp.forEach { (k, v) -> classInitObj.addProperty(k, v) }
+        state.add("classFirstInitTimestamp", classInitObj)
+
+        // 13. functionFirstCalledTimestamp - Map<String, Double>
+        val funcCalledObj = JsonObject()
+        functionFirstCalledTimestamp.forEach { (k, v) -> funcCalledObj.addProperty(k, v) }
+        state.add("functionFirstCalledTimestamp", funcCalledObj)
+
+        // 14. socketTraceParticipants - Set<String>
+        val participantsArr = JsonArray()
+        socketTraceParticipants.forEach { participantsArr.add(it) }
+        state.add("socketTraceParticipants", participantsArr)
+
+        // 15. socketRootCalls - List<CallTraceNode> (recursive tree)
+        val rootCallsArr = JsonArray()
+        socketRootCalls.forEach { rootCallsArr.add(callTraceNodeToJson(it)) }
+        state.add("socketRootCalls", rootCallsArr)
+
+        // 16. socketDistributedEvents - List<TraceEvent>
+        val distArr = JsonArray()
+        socketDistributedEvents.forEach { ev ->
+            val obj = JsonObject()
+            obj.addProperty("type", ev.type)
+            obj.addProperty("timestamp", ev.timestamp)
+            obj.addProperty("callId", ev.callId)
+            obj.addProperty("module", ev.module)
+            obj.addProperty("function", ev.function)
+            obj.addProperty("file", ev.file)
+            obj.addProperty("line", ev.line)
+            obj.addProperty("depth", ev.depth)
+            obj.addProperty("parentId", ev.parentId ?: "")
+            obj.addProperty("processId", ev.processId)
+            obj.addProperty("sessionId", ev.sessionId)
+            obj.addProperty("correlationId", ev.correlationId ?: "")
+            obj.addProperty("learningPhase", ev.learningPhase ?: "")
+            distArr.add(obj)
+        }
+        state.add("socketDistributedEvents", distArr)
+
+        // 17. socketTraceBuffer - CircularBuffer contents
+        val bufferArr = JsonArray()
+        socketTraceBuffer.lines().forEach { bufferArr.add(it) }
+        state.add("socketTraceBuffer", bufferArr)
+
+        // 18. traceEventCount
+        state.addProperty("traceEventCount", traceEventCount)
+
+        return state
+    }
+
+    private fun callTraceNodeToJson(node: CallTraceNode): JsonObject {
+        val obj = JsonObject()
+        obj.addProperty("callId", node.callId)
+        obj.addProperty("module", node.module)
+        obj.addProperty("function", node.function)
+        obj.addProperty("file", node.file)
+        obj.addProperty("line", node.line)
+        obj.addProperty("timestamp", node.timestamp)
+        node.duration?.let { obj.addProperty("duration", it) }
+        val childArr = JsonArray()
+        node.children.forEach { childArr.add(callTraceNodeToJson(it)) }
+        obj.add("children", childArr)
+        return obj
+    }
+
+    /**
+     * Restore all trace data from a saved session JSON, then refresh all tabs.
+     */
+    fun restoreTraceState(state: JsonObject) {
+        // Clear existing data first
+        socketTraceCalls.clear()
+        socketAllDefinedFunctions.clear()
+        socketFunctionDefinitions.clear()
+        socketTraceAllFunctions.clear()
+        socketTraceFileLineMap.clear()
+        socketFunctionDurations.clear()
+        socketTotalDurationMs = 0.0
+        socketCompletedCalls = 0
+        socketCallSites.clear()
+        socketFunctionBranches.clear()
+        socketResolvedCallGraph.clear()
+        classFirstInitTimestamp.clear()
+        functionFirstCalledTimestamp.clear()
+        socketTraceParticipants.clear()
+        socketRootCalls.clear()
+        socketCallNodes.clear()
+        socketCallStacks.clear()
+        socketDistributedEvents.clear()
+        socketTraceBuffer.clear()
+        traceEventCount = 0
+
+        // 1. socketTraceCalls
+        state.getAsJsonObject("socketTraceCalls")?.entrySet()?.forEach { (k, v) ->
+            socketTraceCalls[k] = v.asInt
+        }
+
+        // 2. socketAllDefinedFunctions
+        state.getAsJsonArray("socketAllDefinedFunctions")?.forEach { socketAllDefinedFunctions.add(it.asString) }
+
+        // 3. socketFunctionDefinitions
+        state.getAsJsonArray("socketFunctionDefinitions")?.let {
+            socketFunctionDefinitions.putAll(TraceSessionManager.pairListFromJson(it))
+        }
+
+        // 4. socketTraceAllFunctions
+        state.getAsJsonArray("socketTraceAllFunctions")?.forEach { socketTraceAllFunctions.add(it.asString) }
+
+        // 5. socketTraceFileLineMap
+        state.getAsJsonArray("socketTraceFileLineMap")?.let {
+            socketTraceFileLineMap.putAll(TraceSessionManager.pairListFromJson(it))
+        }
+
+        // 6. socketFunctionDurations
+        state.getAsJsonObject("socketFunctionDurations")?.entrySet()?.forEach { (k, v) ->
+            val list = mutableListOf<Double>()
+            v.asJsonArray.forEach { list.add(it.asDouble) }
+            socketFunctionDurations[k] = list
+        }
+
+        // 7. socketTotalDurationMs
+        socketTotalDurationMs = state.get("socketTotalDurationMs")?.asDouble ?: 0.0
+
+        // 8. socketCompletedCalls
+        socketCompletedCalls = state.get("socketCompletedCalls")?.asInt ?: 0
+
+        // 9. socketCallSites
+        state.getAsJsonArray("socketCallSites")?.forEach { elem ->
+            val obj = elem.asJsonObject
+            val branchObj = obj.getAsJsonObject("inBranch")
+            val branch = if (branchObj != null) {
+                CallSiteBranchInfo(
+                    branchType = branchObj.get("branchType").asString,
+                    condition = branchObj.get("condition").asString,
+                    line = branchObj.get("line").asInt,
+                    endLine = branchObj.get("endLine").asInt
+                )
+            } else null
+            socketCallSites.add(CallSiteInfo(
+                callee = obj.get("callee").asString,
+                caller = obj.get("caller").asString,
+                callerModule = obj.get("callerModule").asString,
+                file = obj.get("file").asString,
+                line = obj.get("line").asInt,
+                inBranch = branch
+            ))
+        }
+
+        // 10. socketFunctionBranches
+        state.getAsJsonObject("socketFunctionBranches")?.entrySet()?.forEach { (k, v) ->
+            val branches = mutableListOf<Map<String, Any>>()
+            v.asJsonArray.forEach { elem ->
+                val map = mutableMapOf<String, Any>()
+                elem.asJsonObject.entrySet().forEach { (bk, bv) ->
+                    map[bk] = when {
+                        bv.isJsonPrimitive && bv.asJsonPrimitive.isNumber -> bv.asNumber
+                        bv.isJsonPrimitive && bv.asJsonPrimitive.isBoolean -> bv.asBoolean
+                        else -> bv.asString
+                    }
+                }
+                branches.add(map)
+            }
+            socketFunctionBranches[k] = branches
+        }
+
+        // 11. socketResolvedCallGraph
+        state.getAsJsonObject("socketResolvedCallGraph")?.entrySet()?.forEach { (k, v) ->
+            val callees = mutableListOf<String>()
+            v.asJsonArray.forEach { callees.add(it.asString) }
+            socketResolvedCallGraph[k] = callees
+        }
+
+        // 12. classFirstInitTimestamp
+        state.getAsJsonObject("classFirstInitTimestamp")?.entrySet()?.forEach { (k, v) ->
+            classFirstInitTimestamp[k] = v.asDouble
+        }
+
+        // 13. functionFirstCalledTimestamp
+        state.getAsJsonObject("functionFirstCalledTimestamp")?.entrySet()?.forEach { (k, v) ->
+            functionFirstCalledTimestamp[k] = v.asDouble
+        }
+
+        // 14. socketTraceParticipants
+        state.getAsJsonArray("socketTraceParticipants")?.forEach { socketTraceParticipants.add(it.asString) }
+
+        // 15. socketRootCalls (recursive)
+        state.getAsJsonArray("socketRootCalls")?.forEach { elem ->
+            socketRootCalls.add(jsonToCallTraceNode(elem.asJsonObject))
+        }
+
+        // 16. socketDistributedEvents
+        state.getAsJsonArray("socketDistributedEvents")?.forEach { elem ->
+            val obj = elem.asJsonObject
+            socketDistributedEvents.add(TraceEvent(
+                type = obj.get("type").asString,
+                timestamp = obj.get("timestamp").asDouble,
+                callId = obj.get("callId").asString,
+                module = obj.get("module").asString,
+                function = obj.get("function").asString,
+                file = obj.get("file").asString,
+                line = obj.get("line").asInt,
+                depth = obj.get("depth")?.asInt ?: 0,
+                parentId = obj.get("parentId")?.asString?.ifEmpty { null },
+                processId = obj.get("processId")?.asInt ?: 0,
+                sessionId = obj.get("sessionId")?.asString ?: "",
+                correlationId = obj.get("correlationId")?.asString?.ifEmpty { null },
+                learningPhase = obj.get("learningPhase")?.asString?.ifEmpty { null }
+            ))
+        }
+
+        // 17. socketTraceBuffer
+        state.getAsJsonArray("socketTraceBuffer")?.forEach { socketTraceBuffer.add(it.asString) }
+
+        // 18. traceEventCount
+        traceEventCount = state.get("traceEventCount")?.asInt ?: 0
+
+        // Set mode to FILE_BASED (restored session — not live)
+        currentTraceMode = TraceMode.FILE_BASED
+
+        // Refresh all tabs on EDT
+        SwingUtilities.invokeLater {
+            // Update stats labels
+            totalCallsLabel.text = "Total Calls: $traceEventCount"
+            if (socketCompletedCalls > 0) {
+                totalTimeLabel.text = "Total Time: ${String.format("%.1f", socketTotalDurationMs)}ms"
+                avgTimeLabel.text = "Avg Time: ${String.format("%.2f", socketTotalDurationMs / socketCompletedCalls)}ms"
+            }
+            if (socketTraceAllFunctions.isNotEmpty()) {
+                val calledCount = socketTraceCalls.size
+                val totalCount = socketTraceAllFunctions.size
+                val deadCodePercent = ((totalCount - calledCount).toDouble() / totalCount) * 100.0
+                deadCodePercentLabel.text = "Dead Code: ${String.format("%.1f", deadCodePercent)}%"
+            }
+            val sessionName = state.get("_session_name")?.asString ?: "restored"
+            currentSessionLabel.text = "Session: $sessionName (restored)"
+            traceModeLabel.text = "Mode: Restored session"
+
+            // Rebuild performance table
+            performanceTableModel.rowCount = 0
+            for ((funcKey, durations) in socketFunctionDurations) {
+                if (durations.isEmpty()) continue
+                val parts = funcKey.split(".")
+                val moduleName = if (parts.size > 1) parts.dropLast(1).joinToString(".") else ""
+                val funcName = parts.lastOrNull() ?: funcKey
+                val (file, line) = socketTraceFileLineMap[funcKey] ?: Pair("-", 0)
+                val calls = socketTraceCalls[funcKey] ?: durations.size
+                val total = durations.sum()
+                val avg = durations.average()
+                val min = durations.min()
+                val max = durations.max()
+                performanceTableModel.addRow(arrayOf(moduleName, funcName, calls, String.format("%.2f", total),
+                    String.format("%.2f", avg), String.format("%.2f", min), String.format("%.2f", max), "-", "-", file, line))
+            }
+
+            // Rebuild dead code table
+            updateDeadCodeFromSocketTrace()
+
+            // Rebuild flamegraph
+            updateFlamegraphFromSocketTrace()
+
+            // Rebuild live metrics
+            updateLiveMetricsFromSocketTrace()
+
+            // Rebuild call trace tree
+            rebuildCallTraceTreeFromRootCalls()
+
+            // Rebuild diagram from buffer
+            updateDiagramFromBuffer()
+
+            // Refresh interactive explorer
+            refreshInteractiveVisualizationWithFilters()
+
+            // Update AI explanation panel
+            updateAIExplanationPanel()
+
+            PluginLogger.info("[ToolWindow] Restored session '$sessionName' — all tabs refreshed")
+        }
+    }
+
+    private fun jsonToCallTraceNode(obj: JsonObject): CallTraceNode {
+        val node = CallTraceNode(
+            callId = obj.get("callId").asString,
+            module = obj.get("module").asString,
+            function = obj.get("function").asString,
+            file = obj.get("file")?.asString ?: "",
+            line = obj.get("line")?.asInt ?: 0,
+            timestamp = obj.get("timestamp")?.asDouble ?: 0.0,
+            duration = if (obj.has("duration") && !obj.get("duration").isJsonNull) obj.get("duration").asDouble else null
+        )
+        obj.getAsJsonArray("children")?.forEach { child ->
+            node.children.add(jsonToCallTraceNode(child.asJsonObject))
+        }
+        // Also index in socketCallNodes for lookups
+        socketCallNodes[node.callId] = node
+        return node
+    }
+
+    private fun rebuildCallTraceTreeFromRootCalls() {
+        val rootNode = javax.swing.tree.DefaultMutableTreeNode("Call Trace (${socketRootCalls.size} root calls)")
+        fun addNodeToTree(traceNode: CallTraceNode, parentTreeNode: javax.swing.tree.DefaultMutableTreeNode) {
+            val durationStr = traceNode.duration?.let { " (${String.format("%.2f", it)}ms)" } ?: ""
+            val label = "${traceNode.module}.${traceNode.function}$durationStr [${traceNode.file}:${traceNode.line}]"
+            val treeNode = javax.swing.tree.DefaultMutableTreeNode(label)
+            parentTreeNode.add(treeNode)
+            traceNode.children.forEach { child -> addNodeToTree(child, treeNode) }
+        }
+        socketRootCalls.forEach { addNodeToTree(it, rootNode) }
+        callTraceTree.model = javax.swing.tree.DefaultTreeModel(rootNode)
+    }
+
+    private fun updateDiagramFromBuffer() {
+        val lines = socketTraceBuffer.lines()
+        if (lines.isEmpty()) return
+        val participants = socketTraceParticipants.toList()
+        val sb = StringBuilder()
+        sb.appendLine("@startuml")
+        participants.forEach { sb.appendLine("participant \"$it\" as $it") }
+        lines.takeLast(200).forEach { sb.appendLine(it) }
+        sb.appendLine("@enduml")
+        diagramTextArea.text = sb.toString()
+    }
 
     // ==================== RPC Data Accessors for MCP Hub ====================
     // These methods return JsonObject data for RPC responses
+
+    /**
+     * Check if we have any trace data in memory.
+     */
+    fun hasTraceData(): Boolean = socketTraceCalls.isNotEmpty() || socketAllDefinedFunctions.isNotEmpty()
+
+    /**
+     * Build dead code analysis from live in-memory data.
+     * Used by RPC when cached AIExplanationPanel data is null.
+     */
+    fun getRpcDeadCode(): JsonObject {
+        val result = JsonObject()
+        PluginLogger.info("[getRpcDeadCode] socketTraceCalls=${socketTraceCalls.size}, socketAllDefinedFunctions=${socketAllDefinedFunctions.size}, hasTraceData=${hasTraceData()}")
+        if (!hasTraceData()) {
+            result.addProperty("error", "No trace data loaded. Run your application first.")
+            return result
+        }
+
+        // Reuse the same logic as updateDeadCodeFromSocketTrace but return the JSON directly
+        val normalizedTraceCalls = socketTraceCalls.toMap()
+        val filteredDefinedFunctions = socketAllDefinedFunctions.filter { funcKey ->
+            val filePath = socketFunctionDefinitions[funcKey]?.first ?: ""
+            !traceFilter.shouldExclude(filePath)
+        }.toSet()
+
+        // Dead = defined but never called
+        val deadFunctionKeys = filteredDefinedFunctions.filter { it !in normalizedTraceCalls }
+        val registryMatchedCalls = normalizedTraceCalls.filter { it.key in filteredDefinedFunctions }
+
+        // Dead functions array
+        val deadArray = JsonArray()
+        for (funcKey in deadFunctionKeys.sorted()) {
+            val parts = funcKey.split(".")
+            val module = parts.dropLast(1).joinToString(".")
+            val function = parts.lastOrNull() ?: funcKey
+            val (file, line) = socketFunctionDefinitions[funcKey] ?: Pair("-", 0)
+            val obj = JsonObject()
+            obj.addProperty("key", funcKey)
+            obj.addProperty("status", "DEAD")
+            obj.addProperty("module", module.ifEmpty { "__main__" })
+            obj.addProperty("function", function)
+            obj.addProperty("file", file)
+            obj.addProperty("line", line)
+            obj.addProperty("call_count", 0)
+            deadArray.add(obj)
+        }
+        result.add("dead_functions", deadArray)
+
+        // Alive functions array
+        val aliveArray = JsonArray()
+        for ((funcKey, count) in registryMatchedCalls.entries.sortedByDescending { it.value }) {
+            val parts = funcKey.split(".")
+            val module = parts.dropLast(1).joinToString(".")
+            val function = parts.lastOrNull() ?: funcKey
+            val (file, line) = socketFunctionDefinitions[funcKey] ?: socketTraceFileLineMap[funcKey] ?: Pair("-", 0)
+            val obj = JsonObject()
+            obj.addProperty("key", funcKey)
+            obj.addProperty("status", "ALIVE")
+            obj.addProperty("module", module.ifEmpty { "__main__" })
+            obj.addProperty("function", function)
+            obj.addProperty("file", file)
+            obj.addProperty("line", line)
+            obj.addProperty("call_count", count)
+            aliveArray.add(obj)
+        }
+        result.add("alive_functions", aliveArray)
+
+        // Summary stats
+        val totalDefined = filteredDefinedFunctions.size
+        val calledCount = registryMatchedCalls.size
+        val deadCount = deadFunctionKeys.size
+        val deadPercent = if (totalDefined > 0) (deadCount.toDouble() / totalDefined) * 100.0 else 0.0
+        result.addProperty("total_functions", totalDefined)
+        result.addProperty("total_dead", deadCount)
+        result.addProperty("total_called", calledCount)
+        result.addProperty("dead_percent", String.format("%.1f", deadPercent).toDouble())
+
+        // Called functions list
+        val calledArray = JsonArray()
+        normalizedTraceCalls.keys.forEach { calledArray.add(it) }
+        result.add("called_functions", calledArray)
+
+        return result
+    }
+
+    /**
+     * Build performance data from live in-memory data.
+     * Used by RPC when cached AIExplanationPanel data is null.
+     */
+    fun getRpcPerformanceData(): JsonObject {
+        val result = JsonObject()
+        if (socketFunctionDurations.isEmpty()) {
+            result.addProperty("error", "No performance data available.")
+            return result
+        }
+
+        val hotspots = JsonArray()
+        val sorted = socketFunctionDurations.entries
+            .filter { it.value.isNotEmpty() }
+            .sortedByDescending { it.value.sum() }
+            .take(50)
+
+        for ((funcKey, durations) in sorted) {
+            val parts = funcKey.split(".")
+            val module = parts.dropLast(1).joinToString(".")
+            val function = parts.lastOrNull() ?: funcKey
+            val (file, line) = socketTraceFileLineMap[funcKey] ?: Pair("-", 0)
+            val obj = JsonObject()
+            obj.addProperty("function", function)
+            obj.addProperty("module", module)
+            obj.addProperty("file", file)
+            obj.addProperty("line", line)
+            obj.addProperty("calls", socketTraceCalls[funcKey] ?: durations.size)
+            obj.addProperty("total_ms", String.format("%.2f", durations.sum()).toDouble())
+            obj.addProperty("avg_ms", String.format("%.2f", durations.average()).toDouble())
+            obj.addProperty("min_ms", String.format("%.2f", durations.min()).toDouble())
+            obj.addProperty("max_ms", String.format("%.2f", durations.max()).toDouble())
+            hotspots.add(obj)
+        }
+        result.add("hotspots", hotspots)
+        result.addProperty("total_time_ms", socketTotalDurationMs)
+        result.addProperty("completed_calls", socketCompletedCalls)
+
+        return result
+    }
 
     /**
      * Get call graph data for RPC.
@@ -4819,6 +5843,7 @@ private val missesToReset = 3
     fun dispose() {
         // Stop timers
         stopAutoRefresh()
+        stopAutoSaveTimer()
         stopServerDetection()
         stopButtonPulse()
         stopIntegratePulse()

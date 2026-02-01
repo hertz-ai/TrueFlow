@@ -170,6 +170,7 @@ export class TraceSocketClient extends EventEmitter {
     private functionRegistry: Map<string, { file: string; line: number }> = new Map();
     private callSites: CallSiteInfo[] = [];
     private functionBranches: Map<string, any[]> = new Map();
+    private resolvedCallGraph: Record<string, string[]> = {};
 
     /**
      * Handle a single trace event
@@ -268,7 +269,10 @@ export class TraceSocketClient extends EventEmitter {
             this.functionBranches.set(funcKey, data.branches || []);
         }
 
-        console.log(`[TraceSocketClient] Received branch registry: ${this.callSites.length} call sites, ${this.functionBranches.size} functions`);
+        // Store resolved call graph
+        this.resolvedCallGraph = event.trace_data.resolved_call_graph || {};
+
+        console.log(`[TraceSocketClient] Received branch registry: ${this.callSites.length} call sites, ${this.functionBranches.size} functions, ${Object.keys(this.resolvedCallGraph).length} call graph entries`);
     }
 
     /**
@@ -290,6 +294,20 @@ export class TraceSocketClient extends EventEmitter {
      */
     getFunctionBranches(): Map<string, any[]> {
         return this.functionBranches;
+    }
+
+    /**
+     * Get resolved static call graph (caller -> callees)
+     */
+    getResolvedCallGraph(): Record<string, string[]> {
+        return this.resolvedCallGraph;
+    }
+
+    /**
+     * Get raw call stats (funcKey -> {count, total, min, max})
+     */
+    getCallStats(): Map<string, { count: number; total: number; min: number; max: number }> {
+        return this.callStats;
     }
 
     /**
@@ -353,6 +371,13 @@ export class TraceSocketClient extends EventEmitter {
         this.callStack.clear();
         this.eventBuffer = [];
         this.eventCounter = 0;
+    }
+
+    /**
+     * Get full event buffer
+     */
+    getEventBuffer(): TraceEvent[] {
+        return this.eventBuffer;
     }
 
     /**

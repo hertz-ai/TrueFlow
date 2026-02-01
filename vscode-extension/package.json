@@ -2,7 +2,7 @@
   "name": "trueflow",
   "displayName": "TrueFlow - Deterministic Code Visualizer",
   "description": "Unblackbox LLM code with deterministic truth. Zero-code Python runtime instrumentation with 3D animated execution videos.",
-  "version": "0.1.491",
+  "version": "0.1.560",
   "publisher": "hevolve-ai",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -171,6 +171,30 @@
           "type": "boolean",
           "default": false,
           "description": "Enable GPU acceleration for llama.cpp (requires compatible GPU)"
+        },
+        "trueflow.autoSaveEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically save trace sessions at regular intervals"
+        },
+        "trueflow.autoSaveIntervalMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 60,
+          "description": "Auto-save interval in minutes (1-60)"
+        },
+        "trueflow.autoRestoreOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Restore most recent trace session on startup (skipped if live server detected)"
+        },
+        "trueflow.maxAutoSavedSessions": {
+          "type": "number",
+          "default": 10,
+          "minimum": 5,
+          "maximum": 50,
+          "description": "Maximum number of auto-saved sessions to keep (oldest are deleted)"
         }
       }
     },

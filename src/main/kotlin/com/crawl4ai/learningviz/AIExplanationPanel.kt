@@ -851,24 +851,52 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
             when (command) {
                 "get_trace_data" -> {
-                    // Safe read-only access to cached data
-                    callTraceData?.let { responseData.add("calls", it.getAsJsonArray("calls")) }
-                    responseData.addProperty("total_calls", callTraceData?.get("total_calls")?.asInt ?: 0)
+                    // Try cached data first, then fall back to live ToolWindow data
+                    val data = callTraceData
+                    if (data != null) {
+                        data.getAsJsonArray("calls")?.let { responseData.add("calls", it) }
+                        responseData.addProperty("total_calls", data.get("total_calls")?.asInt ?: 0)
+                    } else if (toolWindow?.hasTraceData() == true) {
+                        // Build basic trace data from ToolWindow live data
+                        val liveData = toolWindow?.getRpcDeadCode()
+                        liveData?.getAsJsonArray("called_functions")?.let { responseData.add("calls", it) }
+                        responseData.addProperty("total_calls", liveData?.get("total_called")?.asInt ?: 0)
+                    } else {
+                        responseData.addProperty("error", "No trace data loaded.")
+                    }
                     hubClient.sendRpcResponse(requestId, responseData)
                 }
 
                 "get_dead_code" -> {
-                    deadCodeData?.let {
-                        responseData.add("dead_functions", it.getAsJsonArray("dead_functions"))
-                        responseData.add("called_functions", it.getAsJsonArray("called_functions"))
+                    // Try cached data first, then fall back to live ToolWindow data
+                    val tw = toolWindow
+                    PluginLogger.info("[RPC get_dead_code] deadCodeData=${deadCodeData != null}, toolWindow=${tw != null}, hasTraceData=${tw?.hasTraceData()}")
+                    val data = deadCodeData ?: tw?.getRpcDeadCode()
+                    if (data != null) {
+                        if (data.has("dead_functions")) responseData.add("dead_functions", data.getAsJsonArray("dead_functions"))
+                        if (data.has("alive_functions")) responseData.add("alive_functions", data.getAsJsonArray("alive_functions"))
+                        if (data.has("external_functions")) responseData.add("external_functions", data.getAsJsonArray("external_functions"))
+                        if (data.has("called_functions")) responseData.add("called_functions", data.getAsJsonArray("called_functions"))
+                        if (data.has("total_functions")) responseData.addProperty("total_functions", data.get("total_functions").asInt)
+                        if (data.has("total_dead")) responseData.addProperty("total_dead", data.get("total_dead").asInt)
+                        if (data.has("total_called")) responseData.addProperty("total_called", data.get("total_called").asInt)
+                        if (data.has("total_external")) responseData.addProperty("total_external", data.get("total_external").asInt)
+                        if (data.has("dead_percent")) responseData.addProperty("dead_percent", data.get("dead_percent").asDouble)
+                        if (data.has("module_breakdown")) responseData.add("module_breakdown", data.getAsJsonObject("module_breakdown"))
+                        if (data.has("error")) responseData.addProperty("error", data.get("error").asString)
+                    } else {
+                        responseData.addProperty("error", "No trace data loaded. Run your application first.")
                     }
                     hubClient.sendRpcResponse(requestId, responseData)
                 }
 
                 "get_performance_data" -> {
-                    performanceData?.let {
-                        responseData.add("hotspots", it.getAsJsonArray("hotspots"))
-                        responseData.addProperty("total_time_ms", it.get("total_time_ms")?.asDouble ?: 0.0)
+                    // Try cached data first, then fall back to live ToolWindow data
+                    val data = performanceData ?: toolWindow?.getRpcPerformanceData()
+                    if (data != null) {
+                        if (data.has("hotspots")) responseData.add("hotspots", data.getAsJsonArray("hotspots"))
+                        responseData.addProperty("total_time_ms", data.get("total_time_ms")?.asDouble ?: 0.0)
+                        if (data.has("completed_calls")) responseData.addProperty("completed_calls", data.get("completed_calls").asInt)
                     }
                     hubClient.sendRpcResponse(requestId, responseData)
                 }
@@ -1031,6 +1059,81 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
                         responseData.addProperty("error", "Tool window not available")
                         hubClient.sendRpcResponse(requestId, responseData)
                     }
+                }
+
+                // === Session Save/Restore RPC handlers ===
+
+                "save_session" -> {
+                    val sessionName = args.get("name")?.asString ?: "unnamed"
+                    val tw = toolWindow
+                    if (tw != null) {
+                        try {
+                            val manager = TraceSessionManager(project)
+                            val state = tw.getTraceStateForSave()
+                            val file = manager.saveSession(sessionName, state)
+                            responseData.addProperty("status", "saved")
+                            responseData.addProperty("file", file.name)
+                            responseData.addProperty("size_kb", file.length() / 1024)
+                        } catch (e: Exception) {
+                            responseData.addProperty("error", "Failed to save: ${e.message}")
+                        }
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                    }
+                    hubClient.sendRpcResponse(requestId, responseData)
+                }
+
+                "list_sessions" -> {
+                    try {
+                        val manager = TraceSessionManager(project)
+                        val sessions = manager.listSessions()
+                        val arr = JsonArray()
+                        sessions.forEach { s ->
+                            val obj = JsonObject()
+                            obj.addProperty("name", s.name)
+                            obj.addProperty("timestamp", s.timestamp)
+                            obj.addProperty("file", s.file.name)
+                            obj.addProperty("size_mb", String.format("%.2f", s.sizeMb))
+                            arr.add(obj)
+                        }
+                        responseData.add("sessions", arr)
+                        responseData.addProperty("count", sessions.size)
+                    } catch (e: Exception) {
+                        responseData.addProperty("error", "Failed to list sessions: ${e.message}")
+                    }
+                    hubClient.sendRpcResponse(requestId, responseData)
+                }
+
+                "restore_session" -> {
+                    val sessionName = args.get("name")?.asString
+                    val tw = toolWindow
+                    if (tw != null) {
+                        try {
+                            val manager = TraceSessionManager(project)
+                            val sessions = manager.listSessions()
+                            val match = if (sessionName != null) {
+                                sessions.find { it.name.equals(sessionName, ignoreCase = true) || it.file.name.contains(sessionName) }
+                            } else {
+                                sessions.firstOrNull() // Most recent
+                            }
+                            if (match != null) {
+                                val state = manager.restoreSession(match.file)
+                                tw.restoreTraceState(state)
+                                responseData.addProperty("status", "restored")
+                                responseData.addProperty("name", match.name)
+                                responseData.addProperty("timestamp", match.timestamp)
+                            } else {
+                                responseData.addProperty("error", "Session not found: $sessionName")
+                                val available = sessions.joinToString(", ") { it.name }
+                                responseData.addProperty("available_sessions", available)
+                            }
+                        } catch (e: Exception) {
+                            responseData.addProperty("error", "Failed to restore: ${e.message}")
+                        }
+                    } else {
+                        responseData.addProperty("error", "Tool window not available")
+                    }
+                    hubClient.sendRpcResponse(requestId, responseData)
                 }
 
                 else -> {
@@ -4029,11 +4132,29 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     private fun findPython(): String {
-        val paths = listOf("python", "python3", "C:/Python310/python.exe", "C:/Python311/python.exe", "C:/Python312/python.exe")
-        for (path in paths) {
+        val homeDir = System.getProperty("user.home")
+        val isWindows = System.getProperty("os.name").lowercase().contains("win")
+        val candidates = mutableListOf<String>()
+
+        // Conda/miniconda
+        if (isWindows) {
+            candidates.add("$homeDir/miniconda3/python.exe")
+            candidates.add("$homeDir/anaconda3/python.exe")
+            candidates.add("$homeDir/miniconda3/Scripts/python.exe")
+            candidates.add("$homeDir/anaconda3/Scripts/python.exe")
+        } else {
+            candidates.add("$homeDir/miniconda3/bin/python")
+            candidates.add("$homeDir/anaconda3/bin/python")
+        }
+        candidates.add("python")
+        candidates.add("python3")
+
+        for (path in candidates) {
             try {
+                val file = java.io.File(path)
+                if (path.contains("/") && !file.exists()) continue
                 if (ProcessBuilder(path, "--version").start().waitFor() == 0) return path
-            } catch (e: Exception) { }
+            } catch (_: Exception) { }
         }
         return "python"
     }

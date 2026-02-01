@@ -2,9 +2,9 @@
 """
 TrueFlow MCP Hub - Thin Routing Layer to IDE
 
-This MCP server delegates analysis to the connected IDE (PyCharm/VS Code).
+This MCP server delegates analysis to the connected IDE (PyCharm/IntelliJ IDEA/VS Code).
 The IDE has the superior implementation with:
-- Pre-parsed function registry from Python instrumentor
+- Pre-parsed function registry from runtime instrumentor (Python or Java)
 - Class inference for accurate dead code detection
 - Branch tracking for "why not covered" analysis
 - Real-time trace data
@@ -156,8 +156,8 @@ async def rpc_to_ide(command: str, args: dict = None, timeout: float = RPC_TIMEO
 def require_ide(tool_name: str) -> str:
     """Return error message when IDE is required but not connected."""
     return json.dumps({
-        "error": f"No IDE connected. {tool_name} requires PyCharm or VS Code with TrueFlow plugin.",
-        "hint": "Open your project in PyCharm/VS Code with TrueFlow plugin installed and running.",
+        "error": f"No IDE connected. {tool_name} requires PyCharm, IntelliJ IDEA, or VS Code with TrueFlow plugin.",
+        "hint": "Open your project in PyCharm/IntelliJ IDEA/VS Code with TrueFlow plugin installed and running.",
         "connected_ides": len(state.projects)
     }, indent=2)
 
@@ -238,7 +238,7 @@ async def run_websocket_server():
     """Run WebSocket server for IDE connections."""
     if not HAS_WEBSOCKETS:
         return
-    async with ws_serve(handle_ws_client, "127.0.0.1", 5680):
+    async with ws_serve(handle_ws_client, "127.0.0.1", 5680, max_size=10 * 1024 * 1024):
         logger.info("Hub WebSocket server on ws://127.0.0.1:5680")
         await asyncio.Future()
 
@@ -279,6 +279,11 @@ if HAS_MCP:
             # Manim tools (delegate to IDE)
             Tool(name="manim_generate_video", description="Generate Manim video (requires IDE)", inputSchema={"type": "object", "properties": {"trace_file": {"type": "string"}, "quality": {"type": "string", "default": "low_quality"}}, "required": []}),
             Tool(name="manim_list_videos", description="List generated videos (requires IDE)", inputSchema={"type": "object", "properties": {}, "required": []}),
+
+            # Session save/restore tools (delegate to IDE)
+            Tool(name="save_trace_session", description="Save current runtime trace data to a named session file", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Session name (e.g. 'debug_auth_flow')"}}, "required": ["name"]}),
+            Tool(name="list_trace_sessions", description="List saved trace sessions", inputSchema={"type": "object", "properties": {}, "required": []}),
+            Tool(name="restore_trace_session", description="Restore a previously saved trace session by name", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Session name to restore (partial match supported)"}}, "required": []}),
 
             # AI server tools (hub manages, IDE can start)
             Tool(name="ai_server_start", description="Start llama.cpp server", inputSchema={"type": "object", "properties": {"model_path": {"type": "string"}, "port": {"type": "integer", "default": 8080}}, "required": []}),
@@ -337,10 +342,11 @@ async def _route_tool(name: str, args: dict) -> str:
                 "explorer": {"tools": ["explorer_get_callers", "explorer_get_callees", "explorer_search", "explorer_get_call_chain", "explorer_find_path"], "requires_ide": True},
                 "export": {"tools": ["export_diagram", "export_flamegraph"], "requires_ide": True},
                 "video": {"tools": ["manim_generate_video", "manim_list_videos"], "requires_ide": True},
+                "sessions": {"tools": ["save_trace_session", "list_trace_sessions", "restore_trace_session"], "requires_ide": True},
                 "ai": {"tools": ["ai_server_start", "ai_server_stop", "ai_server_status"], "requires_ide": False},
                 "hub": {"tools": ["list_projects", "get_project_info"], "requires_ide": False}
             },
-            "note": "Most tools require an IDE (PyCharm/VS Code) with TrueFlow plugin connected."
+            "note": "Most tools require an IDE (PyCharm/IntelliJ IDEA/VS Code) with TrueFlow plugin connected."
         }, indent=2)
 
     if name == "smart_query":
@@ -375,6 +381,9 @@ async def _route_tool(name: str, args: dict) -> str:
         "export_flamegraph": "export_flamegraph",
         "manim_generate_video": "generate_manim",
         "manim_list_videos": "list_videos",
+        "save_trace_session": "save_session",
+        "list_trace_sessions": "list_sessions",
+        "restore_trace_session": "restore_session",
     }
 
     rpc_command = rpc_commands.get(name)

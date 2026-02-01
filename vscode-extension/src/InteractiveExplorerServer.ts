@@ -2,6 +2,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as fs from 'fs';
 import * as path from 'path';
+import { ExplanationCacheManager, CachedExplanation, VisualizationData } from './ExplanationCacheManager';
 
 /**
  * HTTP Server that serves the Interactive Explorer with real-time updates via SSE.
@@ -19,6 +20,7 @@ export class InteractiveExplorerServer {
     private port: number;
     private resourcesPath: string;
     private llmEndpoint: string;  // llama.cpp server (OpenAI-compatible)
+    private explanationCache: ExplanationCacheManager | null = null;
 
     constructor(
         port: number = 8765,
@@ -31,6 +33,40 @@ export class InteractiveExplorerServer {
         this.port = port;
         this.resourcesPath = resourcesPath;
         this.llmEndpoint = llmEndpoint;
+    }
+
+    /**
+     * Initialize the explanation cache manager.
+     * Call after construction with the project's cache directory.
+     */
+    initCache(cacheDir: string): void {
+        this.explanationCache = new ExplanationCacheManager(
+            cacheDir,
+            this.llmEndpoint,
+            // Notify SSE clients when a cached explanation is ready
+            (explanation: CachedExplanation) => {
+                this.pushCachedExplanation(explanation);
+            },
+            // Check if AI server is available
+            () => this.isAIAvailable
+        );
+        console.log('[ExplorerServer] Explanation cache initialized');
+    }
+
+    private isAIAvailable = false;
+
+    /**
+     * Update AI server availability status.
+     */
+    setAIAvailable(available: boolean): void {
+        this.isAIAvailable = available;
+    }
+
+    /**
+     * Get the explanation cache manager (for external access).
+     */
+    getCache(): ExplanationCacheManager | null {
+        return this.explanationCache;
     }
 
     start(): boolean {
@@ -64,6 +100,9 @@ export class InteractiveExplorerServer {
     }
 
     stop(): void {
+        // Shutdown explanation cache
+        this.explanationCache?.shutdown();
+
         // Close all SSE connections
         this.sseClients.forEach(client => {
             try {
@@ -95,6 +134,11 @@ export class InteractiveExplorerServer {
      */
     pushTraceData(data: any): void {
         this.currentTraceData = data;
+
+        // Update explanation cache with new visualization data
+        if (this.explanationCache && data.functions) {
+            this.explanationCache.updateVisualizationData(data as VisualizationData);
+        }
 
         const jsonData = JSON.stringify(data);
         const sseMessage = `event: traceUpdate\ndata: ${jsonData}\n\n`;
@@ -140,6 +184,10 @@ export class InteractiveExplorerServer {
             this.handleAIStatus(req, res);
         } else if (url === '/api/ai/explain') {
             this.handleAIExplain(req, res);
+        } else if (url === '/api/ai/prioritize') {
+            this.handleAIPrioritize(req, res);
+        } else if (url === '/api/ai/cache-stats') {
+            this.handleCacheStats(req, res);
         } else {
             res.writeHead(404);
             res.end('Not Found');
@@ -249,7 +297,7 @@ export class InteractiveExplorerServer {
     }
 
     /**
-     * Handle AI explanation request - proxies to llama.cpp server.
+     * Handle AI explanation request - checks cache first, then proxies to llama.cpp server.
      */
     private async handleAIExplain(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
         if (req.method !== 'POST') {
@@ -258,10 +306,14 @@ export class InteractiveExplorerServer {
             return;
         }
 
+        // Mark user activity for idle detection
+        this.explanationCache?.markUserActivity();
+
         try {
             // Read request body
             const body = await this.readRequestBody(req);
-            const { prompt } = JSON.parse(body);
+            const parsed = JSON.parse(body);
+            const { prompt, function: funcName, file: filePath } = parsed;
 
             if (!prompt) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -269,17 +321,47 @@ export class InteractiveExplorerServer {
                 return;
             }
 
+            // Check cache first (if function name and file provided)
+            if (funcName && filePath && this.explanationCache) {
+                const cached = this.explanationCache.getExplanation(funcName, filePath);
+                if (cached) {
+                    console.log(`[ExplorerServer] Cache hit for: ${funcName}`);
+                    res.writeHead(200, {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    });
+                    res.end(JSON.stringify({ success: true, explanation: cached.explanation, cached: true }));
+                    return;
+                }
+            }
+
             console.log('[ExplorerServer] AI explain request, prompt length:', prompt.length);
 
             // Call llama.cpp server
             const response = await this.callLLM(prompt);
+
+            // Store in cache if function info provided
+            if (funcName && filePath && this.explanationCache) {
+                const data = this.currentTraceData;
+                const whyInfo = data?.why_not_covered?.[funcName];
+                this.explanationCache.storeExplanation({
+                    functionName: funcName,
+                    filePath,
+                    line: data?.functions?.[funcName]?.line || 0,
+                    contentHash: 'user_request', // Will be properly computed on next data update
+                    whyNotCovered: whyInfo?.root_cause || 'unknown',
+                    explanation: response,
+                    timestamp: Date.now(),
+                    modelUsed: 'user_request'
+                });
+            }
 
             res.writeHead(200, {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*'
             });
             // Match Kotlin format: { success, explanation }
-            res.end(JSON.stringify({ success: true, explanation: response }));
+            res.end(JSON.stringify({ success: true, explanation: response, cached: false }));
 
         } catch (error) {
             console.error('[ExplorerServer] Error handling AI explain:', error);
@@ -290,6 +372,88 @@ export class InteractiveExplorerServer {
             // Match Kotlin format: { success, error }
             res.end(JSON.stringify({ success: false, error: String(error) }));
         }
+    }
+
+    /**
+     * Handle AI prioritize request - for preemptive caching based on user searches/focus.
+     * Matches PyCharm's /api/ai/prioritize endpoint.
+     */
+    private async handleAIPrioritize(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+        if (req.method !== 'POST') {
+            res.writeHead(405, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Method not allowed' }));
+            return;
+        }
+
+        try {
+            const body = await this.readRequestBody(req);
+            const request = JSON.parse(body);
+
+            const reason = request.reason || 'user_interaction';
+            const funcNames: string[] = [];
+
+            // Support both single function and array of functions
+            if (request.function) {
+                funcNames.push(request.function);
+            }
+            if (request.functions && Array.isArray(request.functions)) {
+                funcNames.push(...request.functions);
+            }
+
+            if (funcNames.length === 0) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'No functions specified' }));
+                return;
+            }
+
+            if (this.explanationCache) {
+                this.explanationCache.prioritizeFunctions(funcNames, reason);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true, prioritized: funcNames.length, reason }));
+            } else {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, message: 'Cache not initialized' }));
+            }
+        } catch (error) {
+            console.error('[ExplorerServer] Error handling AI prioritize:', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal Server Error' }));
+        }
+    }
+
+    /**
+     * Handle cache stats request.
+     */
+    private handleCacheStats(req: http.IncomingMessage, res: http.ServerResponse): void {
+        const stats = this.explanationCache?.getCacheStats() || {
+            totalCached: 0, pendingQueue: 0, isProcessing: false, isIdle: true
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+    }
+
+    /**
+     * Push a cached explanation to all connected SSE clients.
+     */
+    private pushCachedExplanation(explanation: CachedExplanation): void {
+        const message = JSON.stringify({
+            type: 'cached_explanation',
+            function: explanation.functionName,
+            explanation: explanation.explanation,
+            whyNotCovered: explanation.whyNotCovered,
+            cached: true
+        });
+
+        const sseMessage = `event: cachedExplanation\ndata: ${message}\n\n`;
+
+        this.sseClients = this.sseClients.filter(client => {
+            try {
+                client.write(sseMessage);
+                return true;
+            } catch (e) {
+                return false; // Remove dead client
+            }
+        });
     }
 
     /**
@@ -524,6 +688,18 @@ export class InteractiveExplorerServer {
                 showConnectionStatus('connected', 'Updated ' + new Date().toLocaleTimeString());
             } catch (err) {
                 console.error('[TrueFlow] Error processing update:', err);
+            }
+        });
+
+        eventSource.addEventListener('cachedExplanation', function(e) {
+            try {
+                const data = JSON.parse(e.data);
+                console.log('[TrueFlow] Cached explanation received for:', data.function);
+                if (typeof handleCachedExplanation === 'function') {
+                    handleCachedExplanation(data);
+                }
+            } catch (err) {
+                console.error('[TrueFlow] Error processing cached explanation:', err);
             }
         });
 
