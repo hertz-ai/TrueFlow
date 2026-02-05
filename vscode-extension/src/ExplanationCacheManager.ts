@@ -62,17 +62,20 @@ export class ExplanationCacheManager {
     // Callbacks
     private onCachedExplanation?: (explanation: CachedExplanation) => void;
     private onAIStatusCheck?: () => boolean; // Returns true if AI server is available
+    private onAutoExplainStatus?: (active: boolean, funcName: string | null, cached: number, total: number) => void;
 
     constructor(
         cacheDir: string,
         llmEndpoint: string = 'http://127.0.0.1:8080/v1',
         onCachedExplanation?: (explanation: CachedExplanation) => void,
-        onAIStatusCheck?: () => boolean
+        onAIStatusCheck?: () => boolean,
+        onAutoExplainStatus?: (active: boolean, funcName: string | null, cached: number, total: number) => void
     ) {
         this.cacheFilePath = path.join(cacheDir, 'explanation_cache.json');
         this.llmEndpoint = llmEndpoint;
         this.onCachedExplanation = onCachedExplanation;
         this.onAIStatusCheck = onAIStatusCheck;
+        this.onAutoExplainStatus = onAutoExplainStatus;
 
         // Ensure cache directory exists
         const dir = path.dirname(this.cacheFilePath);
@@ -299,12 +302,16 @@ export class ExplanationCacheManager {
         this.priorityFunctions.delete(funcName);
         console.log(`[AutoExplain] Processing${isPriority ? ' (PRIORITY)' : ''}: ${funcName} (remaining: ${this.pendingQueue.length})`);
 
+        const totalDead = this.visualizationData?.dead_functions?.length || 0;
+        this.onAutoExplainStatus?.(true, funcName, this.cache.size, totalDead);
+
         try {
             await this.processAutoExplain(funcName);
         } catch (e) {
             console.error(`[AutoExplain] Error processing ${funcName}:`, e);
         } finally {
             this.isProcessing = false;
+            this.onAutoExplainStatus?.(false, null, this.cache.size, totalDead);
         }
     }
 
@@ -327,11 +334,25 @@ export class ExplanationCacheManager {
             return;
         }
 
-        // Build minimal context for auto-explain
+        // Build rich context for auto-explain with call chain and root cause branch
         const sourceCode = this.readFunctionSource(filePath, line);
         const rootCause = whyInfo.root_cause;
         const callerInfo = whyInfo.root_cause_detail;
-        const prompt = this.buildAutoExplainPrompt(funcName, rootCause, sourceCode, callerInfo);
+        const reasons = whyInfo.reasons || [];
+
+        // Trace call chain from root caller to dead function
+        const callChain = this.traceCallChainToFunction(funcName, data);
+
+        // Read root caller source (where the branch decision happens)
+        let rootCallerSource = '';
+        if (callerInfo?.caller) {
+            const callerFunc = data.functions[callerInfo.caller];
+            if (callerFunc?.file) {
+                rootCallerSource = this.readFunctionSource(callerFunc.file, callerFunc.line);
+            }
+        }
+
+        const prompt = this.buildAutoExplainPrompt(funcName, rootCause, sourceCode, callerInfo, callChain, rootCallerSource, reasons);
 
         try {
             const response = await this.callLLM(prompt);
@@ -365,22 +386,87 @@ export class ExplanationCacheManager {
         }
     }
 
+    /**
+     * Trace the call chain from root caller down to a dead function using the call graph.
+     */
+    private traceCallChainToFunction(funcName: string, data: any): string[] {
+        const chain: string[] = [funcName];
+        const visited = new Set<string>();
+
+        // Build reverse graph (callee -> callers)
+        const reverseGraph: Record<string, string[]> = {};
+        for (const [caller, callees] of Object.entries(data.call_graph || {})) {
+            for (const callee of (callees as string[])) {
+                if (!reverseGraph[callee]) { reverseGraph[callee] = []; }
+                reverseGraph[callee].push(caller);
+            }
+        }
+        for (const [caller, callees] of Object.entries(data.resolved_call_graph || {})) {
+            for (const callee of (callees as string[])) {
+                if (!reverseGraph[callee]) { reverseGraph[callee] = []; }
+                reverseGraph[callee].push(caller);
+            }
+        }
+
+        // Walk up to root (max 20 levels)
+        let current = funcName;
+        const coveredSet = new Set(data.covered_functions || []);
+        for (let i = 0; i < 20; i++) {
+            if (visited.has(current)) { break; }
+            visited.add(current);
+            const callers = reverseGraph[current];
+            if (!callers || callers.length === 0) { break; }
+            const nextCaller = callers.find(c => coveredSet.has(c)) || callers[0];
+            chain.unshift(nextCaller);
+            current = nextCaller;
+        }
+        return chain;
+    }
+
     private buildAutoExplainPrompt(
         funcName: string,
         rootCause: string,
         sourceCode: string,
-        callerInfo?: { type: string; caller: string; line: number } | null
+        callerInfo?: { type: string; caller: string; line: number; branch_type?: string; branch_condition?: string; branch_line?: number } | null,
+        callChain: string[] = [],
+        rootCallerSource: string = '',
+        reasons: Array<{ explanation?: string }> = []
     ): string {
-        let prompt = `Briefly explain why this function is not executed (1-2 sentences):\n\n`;
+        let prompt = `Explain why this function is not executed:\n\n`;
         prompt += `Function: ${funcName}\n`;
-        prompt += `Reason: ${rootCause}\n`;
-        if (callerInfo?.caller) {
-            prompt += `Caller: ${callerInfo.caller}\n`;
+        prompt += `Root cause: ${rootCause}\n`;
+
+        if (callerInfo) {
+            if (callerInfo.caller) {
+                prompt += `\nRoot caller (where the decision happens): ${callerInfo.caller}\n`;
+            }
+            if (callerInfo.branch_condition) {
+                prompt += `Branch not taken: ${callerInfo.branch_type || 'if'} ${callerInfo.branch_condition}`;
+                if (callerInfo.branch_line) { prompt += ` (line ${callerInfo.branch_line})`; }
+                prompt += '\n';
+            }
         }
+
+        if (callChain.length > 1) {
+            prompt += `\nCall chain (root → dead):\n  ${callChain.join(' → ')}\n`;
+        }
+
+        for (const reason of reasons) {
+            if (reason.explanation && reason.explanation.includes('Chain:')) {
+                prompt += `\n${reason.explanation}\n`;
+                break;
+            }
+        }
+
+        if (rootCallerSource) {
+            prompt += `\nRoot caller source:\n\`\`\`python\n${rootCallerSource}\n\`\`\`\n`;
+        }
+
         if (sourceCode) {
-            prompt += `\nCode:\n\`\`\`python\n${sourceCode}\n\`\`\`\n`;
+            prompt += `\nDead function source:\n\`\`\`python\n${sourceCode}\n\`\`\`\n`;
         }
-        prompt += `\nProvide a concise explanation suitable for display as a tooltip.`;
+
+        prompt += `\nProvide a concise 2-3 sentence explanation of why this function is dead and what condition would need to change to make it execute.`;
         return prompt;
     }
 

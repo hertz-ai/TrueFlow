@@ -208,6 +208,7 @@ public class MethodCall {
         json.addProperty("session_id", sessionId);
         json.addProperty("process_id", ProcessHandle.current().pid());
         json.addProperty("language", "java");
+        json.addProperty("language", "java");
 
         if (exception != null) {
             json.addProperty("exception", exception);

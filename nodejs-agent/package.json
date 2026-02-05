@@ -1,0 +1,47 @@
+{
+  "name": "@trueflow/nodejs-agent",
+  "version": "0.1.0",
+  "description": "TrueFlow runtime instrumentor for Node.js/TypeScript applications",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "trueflow",
+    "tracing",
+    "instrumentation",
+    "debugging",
+    "profiling",
+    "express",
+    "nestjs",
+    "fastify"
+  ],
+  "author": "TrueFlow",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0",
+    "@types/jest": "^29.5.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "eslint": "^8.55.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0"
+  },
+  "peerDependencies": {},
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "dist/**/*"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/trueflow/trueflow"
+  }
+}

@@ -2603,6 +2603,20 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         image: String? = null,
         callback: (String) -> Unit
     ) {
+        askQuestion(question, context, image, silent = false, callback)
+    }
+
+    /**
+     * Ask a question to the LLM (visible in chat panel).
+     * @param silent If true, do not show the prompt/response in the chat panel (used for background auto-explain).
+     */
+    fun askQuestion(
+        question: String,
+        context: String = "",
+        image: String? = null,
+        silent: Boolean = false,
+        callback: (String) -> Unit
+    ) {
         // Check if server is running (either our local process or external server)
         val serverRunning = (serverProcess != null && serverProcess!!.isAlive) || checkServerHealth()
         if (!serverRunning) {
@@ -2612,11 +2626,19 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
         CompletableFuture.runAsync {
             try {
-                val response = callLLM(question, context, image)
+                // Use history-free call for silent/background requests to avoid
+                // polluting conversation history and conflicting with user chat
+                val response = if (silent) {
+                    callLLMWithoutHistory(question, null)
+                } else {
+                    callLLM(question, context, image)
+                }
                 SwingUtilities.invokeLater {
-                    // Also add to visible chat
-                    webChatPanel?.addUserMessage(question, image)
-                    webChatPanel?.addAssistantMessage(response)
+                    if (!silent) {
+                        // Only add to visible chat for user-initiated requests
+                        webChatPanel?.addUserMessage(question, image)
+                        webChatPanel?.addAssistantMessage(response)
+                    }
                     callback(response)
                 }
             } catch (e: Exception) {

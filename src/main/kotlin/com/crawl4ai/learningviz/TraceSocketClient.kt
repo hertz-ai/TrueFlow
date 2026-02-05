@@ -95,7 +95,8 @@ class TraceSocketClient(
             correlationId = if (data.get("correlation_id")?.isJsonNull == true) null else data.get("correlation_id")?.asString,
             learningPhase = if (data.get("learning_phase")?.isJsonNull == true) null else data.get("learning_phase")?.asString,
             // Handle JsonNull: GSON returns JsonNull for JSON null values, not Kotlin null
-            traceData = data.get("trace_data")?.let { if (it.isJsonNull) null else it.asJsonObject }
+            traceData = data.get("trace_data")?.let { if (it.isJsonNull) null else it.asJsonObject },
+            language = data.get("language")?.asString ?: "python"
         )
     }
 
@@ -130,33 +131,52 @@ data class TraceEvent(
     val sessionId: String,      // Session ID
     val correlationId: String?, // Learning cycle correlation ID
     val learningPhase: String?, // Learning phase (perception, reasoning, etc.)
-    val traceData: com.google.gson.JsonObject? = null  // Complete trace data for cycle_complete events
+    val traceData: com.google.gson.JsonObject? = null,  // Complete trace data for cycle_complete events
+    val language: String = "python"  // Source language: python, java, javascript, rust
 ) {
     /**
-     * Format as PlantUML sequence diagram arrow.
+     * Get minimalistic language tag: py, js, java, rs (empty for python default)
+     */
+    fun getLangTag(): String = when (language) {
+        "python" -> ""  // Default, no tag needed
+        "javascript" -> "js:"
+        "java" -> "java:"
+        "rust" -> "rs:"
+        "nodejs" -> "js:"
+        else -> "${language.take(2)}:"
+    }
+
+    /**
+     * Format as PlantUML sequence diagram arrow with language prefix.
      */
     fun toPlantUML(): String {
-        // Use parent for proper call hierarchy
+        val langTag = getLangTag()
         val caller = if (parentId != null && module != "__main__") {
             module.split(".").lastOrNull() ?: module
         } else {
             module.split(".").lastOrNull() ?: module
         }
         val callee = module.split(".").lastOrNull() ?: module
-        return "$caller -> $callee: $function()"
+        // Add language prefix to non-python calls
+        val calleeWithLang = if (langTag.isNotEmpty()) "$langTag$callee" else callee
+        return "$caller -> $calleeWithLang: $function()"
     }
 
     /**
-     * Get short module name for participant.
+     * Get short module name for participant with optional language prefix.
      */
     fun getParticipantId(): String {
-        return module.split(".").lastOrNull() ?: module
+        val base = module.split(".").lastOrNull() ?: module
+        val langTag = getLangTag()
+        return if (langTag.isNotEmpty()) "$langTag$base" else base
     }
 
     /**
-     * Format as readable string.
+     * Format as readable string with language.
      */
     override fun toString(): String {
-        return "$module.$function() at $file:$line [depth=$depth]"
+        val langTag = getLangTag()
+        val prefix = if (langTag.isNotEmpty()) "[$langTag] " else ""
+        return "$prefix$module.$function() at $file:$line [depth=$depth]"
     }
 }

@@ -371,11 +371,15 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             priorityFunctions.remove(funcName)  // Clear priority after selection
             PluginLogger.info("[AutoExplain] Processing${if (isPriority) " (PRIORITY)" else ""}: $funcName (remaining: ${pendingQueue.size})")
 
+            // Notify explorer that auto-explain is active
+            notifyAutoExplainStatus(funcName, active = true)
+
             try {
                 processAutoExplain(funcName, aiPanel)
             } catch (e: Exception) {
                 PluginLogger.error("[AutoExplain] Error processing $funcName", e)
                 isProcessing = false
+                notifyAutoExplainStatus(null, active = false)
             }
         }
 
@@ -404,17 +408,29 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                 return
             }
 
-            // Build minimal context for auto-explain (less verbose than user-triggered)
+            // Build rich context for auto-explain with call chain and root cause branch
             val sourceCode = readFunctionSource(filePath, line)
             val rootCause = whyInfo.rootCause
             val callerInfo = whyInfo.rootCauseDetail
+            val reasons = whyInfo.reasons
 
-            val prompt = buildAutoExplainPrompt(funcName, rootCause, sourceCode, callerInfo)
+            // Trace call chain from root caller to this dead function
+            val callChain = traceCallChainToFunction(funcName, data)
+
+            // Read root caller source (where the branch decision happens)
+            val rootCallerSource = if (callerInfo?.caller != null) {
+                val callerFunc = data.functions[callerInfo.caller]
+                if (callerFunc?.file != null) {
+                    readFunctionSource(callerFunc.file, callerFunc.line)
+                } else ""
+            } else ""
+
+            val prompt = buildAutoExplainPrompt(funcName, rootCause, sourceCode, callerInfo, callChain, rootCallerSource, reasons)
 
             // Call AI asynchronously
             java.util.concurrent.CompletableFuture.runAsync {
                 try {
-                    aiPanel.askQuestion(prompt, sourceCode, null) { response ->
+                    aiPanel.askQuestion(prompt, sourceCode, null, silent = true) { response ->
                         // Store in cache
                         val explanation = CachedExplanation(
                             functionName = funcName,
@@ -429,12 +445,34 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                         storeExplanation(explanation)
                         PluginLogger.info("[AutoExplain] Cached explanation for: $funcName")
                         isProcessing = false
+                        notifyAutoExplainStatus(null, active = false)
                     }
                 } catch (e: Exception) {
                     PluginLogger.error("[AutoExplain] Failed to get explanation for $funcName", e)
                     isProcessing = false
+                    notifyAutoExplainStatus(null, active = false)
                 }
             }
+        }
+
+        private fun notifyAutoExplainStatus(funcName: String?, active: Boolean) {
+            val totalDead = visualizationData?.deadFunctions?.size ?: 0
+            val cachedCount = cache.size
+            val js = """
+                if (typeof handleAutoExplainStatus === 'function') {
+                    handleAutoExplainStatus({
+                        active: $active,
+                        function: "${funcName?.replace("\"", "\\\"") ?: ""}",
+                        cached: $cachedCount,
+                        total: $totalDead
+                    });
+                }
+            """.trimIndent()
+            ApplicationManager.getApplication().invokeLater {
+                interactiveBrowser?.cefBrowser?.executeJavaScript(js, "", 0)
+            }
+            // Also push to SSE for browser mode
+            explorerServer?.pushAutoExplainStatus(active, funcName, cachedCount, totalDead)
         }
 
         private fun readFunctionSource(filePath: String, line: Int): String {
@@ -451,23 +489,98 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             }
         }
 
+        /**
+         * Trace the call chain from root caller down to a dead function using the call graph.
+         * Returns a list like: [root_entry_point, intermediate_caller, ..., dead_function]
+         */
+        private fun traceCallChainToFunction(funcName: String, data: InteractiveVisualizationData): List<String> {
+            val chain = mutableListOf<String>()
+            val visited = mutableSetOf<String>()
+            var current = funcName
+            chain.add(current)
+
+            // Walk upward through the call graph (find callers)
+            val reverseGraph = mutableMapOf<String, MutableList<String>>()
+            for ((caller, callees) in data.callGraph) {
+                for (callee in callees) {
+                    reverseGraph.getOrPut(callee) { mutableListOf() }.add(caller)
+                }
+            }
+            // Also check resolved call graph
+            for ((caller, callees) in data.resolvedCallGraph) {
+                for (callee in callees) {
+                    reverseGraph.getOrPut(callee) { mutableListOf() }.add(caller)
+                }
+            }
+
+            // Walk up to root (max 20 levels to avoid cycles)
+            for (i in 0 until 20) {
+                if (visited.contains(current)) break
+                visited.add(current)
+                val callers = reverseGraph[current] ?: break
+                if (callers.isEmpty()) break
+                // Pick first caller (prefer covered callers for branch-not-taken cases)
+                val coveredSet = data.coveredFunctions.toSet()
+                val nextCaller = callers.firstOrNull { coveredSet.contains(it) } ?: callers.first()
+                chain.add(0, nextCaller)
+                current = nextCaller
+            }
+            return chain
+        }
+
         private fun buildAutoExplainPrompt(
             funcName: String,
             rootCause: String,
             sourceCode: String,
-            callerInfo: WhyNotCoveredDetail?
+            callerInfo: WhyNotCoveredDetail?,
+            callChain: List<String> = emptyList(),
+            rootCallerSource: String = "",
+            reasons: List<WhyNotCoveredReason> = emptyList()
         ): String {
             return buildString {
-                append("Briefly explain why this function is not executed (1-2 sentences):\n\n")
+                append("Explain why this function is not executed:\n\n")
                 append("Function: $funcName\n")
-                append("Reason: $rootCause\n")
-                if (callerInfo?.caller != null) {
-                    append("Caller: ${callerInfo.caller}\n")
+                append("Root cause: $rootCause\n")
+
+                // Branch info from root cause
+                if (callerInfo != null) {
+                    if (callerInfo.caller != null) {
+                        append("\nRoot caller (where the decision happens): ${callerInfo.caller}\n")
+                    }
+                    if (callerInfo.branchCondition != null) {
+                        append("Branch not taken: ${callerInfo.branchType ?: "if"} ${callerInfo.branchCondition}")
+                        if (callerInfo.branchLine != null) {
+                            append(" (line ${callerInfo.branchLine})")
+                        }
+                        append("\n")
+                    }
                 }
+
+                // Call chain from root to dead function
+                if (callChain.size > 1) {
+                    append("\nCall chain (root → dead):\n")
+                    append("  ${callChain.joinToString(" → ")}\n")
+                }
+
+                // Chain explanation from reasons (may contain "Chain: A → B → C")
+                for (reason in reasons) {
+                    if (reason.explanation != null && reason.explanation.contains("Chain:")) {
+                        append("\n${reason.explanation}\n")
+                        break
+                    }
+                }
+
+                // Root caller source (where the branch decision is made)
+                if (rootCallerSource.isNotEmpty()) {
+                    append("\nRoot caller source:\n```python\n$rootCallerSource\n```\n")
+                }
+
+                // Dead function source
                 if (sourceCode.isNotEmpty()) {
-                    append("\nCode:\n```python\n$sourceCode\n```\n")
+                    append("\nDead function source:\n```python\n$sourceCode\n```\n")
                 }
-                append("\nProvide a concise explanation suitable for display as a tooltip.")
+
+                append("\nProvide a concise 2-3 sentence explanation of why this function is dead and what condition would need to change to make it execute.")
             }
         }
 
@@ -1191,8 +1304,8 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     }
                 }
 
-                // Call AI
-                aiPanel.askQuestion(prompt, sourceCode, null) { response ->
+                // Call AI (silent — result goes to explorer panel, not chat)
+                aiPanel.askQuestion(prompt, sourceCode, null, silent = true) { response ->
                     // Cache the result for dead functions
                     if (isDead && filePath.isNotEmpty() && whyNotCovered != null) {
                         try {
@@ -1535,17 +1648,24 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         val toolWindowManager = com.intellij.openapi.wm.ToolWindowManager.getInstance(project)
         val toolWindow = toolWindowManager.getToolWindow("TrueFlow") ?: return null
 
-        // The AIExplanationPanel is in the AI Explainer tab
+        // Recursively search the component tree for AIExplanationPanel
         val content = toolWindow.contentManager.contents
         for (c in content) {
-            val component = c.component
-            if (component is javax.swing.JTabbedPane) {
-                for (i in 0 until component.tabCount) {
-                    val tabComponent = component.getComponentAt(i)
-                    if (tabComponent is AIExplanationPanel) {
-                        return tabComponent
-                    }
-                }
+            val found = findComponentOfType(c.component, AIExplanationPanel::class.java)
+            if (found != null) return found
+        }
+        return null
+    }
+
+    private fun <T> findComponentOfType(root: java.awt.Component, type: Class<T>): T? {
+        if (type.isInstance(root)) {
+            @Suppress("UNCHECKED_CAST")
+            return root as T
+        }
+        if (root is java.awt.Container) {
+            for (child in root.components) {
+                val found = findComponentOfType(child, type)
+                if (found != null) return found
             }
         }
         return null
@@ -1916,8 +2036,8 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     }
                 }
 
-                // Call the LLM via AIExplanationPanel's askQuestion method
-                aiPanel.askQuestion(prompt, sourceCode, null) { response ->
+                // Call the LLM (silent — result goes to explorer panel, not chat)
+                aiPanel.askQuestion(prompt, sourceCode, null, silent = true) { response ->
                     // Cache the explanation for dead functions
                     if (isDead && funcFile != null && whyNotCovered != null) {
                         try {
@@ -1993,9 +2113,9 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
     private fun injectCefQuery() {
         if (jsQuery == null || interactiveBrowser == null) return
 
-        val jsCode = jsQuery!!.inject("request",
-            "window.cefQueryCallback",
-            "(function(error_code, error_message) { console.error('cefQuery failed:', error_code, error_message); })"
+        val jsCode = jsQuery!!.inject("params.request",
+            "params.onSuccess || function(){}",
+            "(params.onFailure || function(error_code, error_message) { console.error('cefQuery failed:', error_code, error_message); })"
         )
 
         // Wrap to create window.cefQuery function

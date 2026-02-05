@@ -334,9 +334,11 @@ class DistributedArchitecturePanel(private val project: Project) : JPanel(Border
         val eventData = "${event.module}.${event.function}() at ${event.file}:${event.line}"
 
         // Add to appropriate table based on detected type
+        val langPrefix = if (event.language != "python") "[${event.language}] " else ""
+
         if (isWebSocket) {
             websocketModel.addRow(arrayOf(
-                event.module,
+                langPrefix + event.module,
                 event.function,
                 "call", // Type (we only have call events from socket)
                 truncate(eventData, 100),
@@ -346,7 +348,7 @@ class DistributedArchitecturePanel(private val project: Project) : JPanel(Border
 
         if (isWebRTC) {
             webrtcModel.addRow(arrayOf(
-                event.module,
+                langPrefix + event.module,
                 event.function,
                 "call",
                 truncate(eventData, 100),
@@ -356,7 +358,7 @@ class DistributedArchitecturePanel(private val project: Project) : JPanel(Border
 
         if (isMCP) {
             mcpModel.addRow(arrayOf(
-                event.module,
+                langPrefix + event.module,
                 event.function,
                 "unknown", // Protocol (not available from basic trace)
                 truncate(eventData, 100),
@@ -366,7 +368,7 @@ class DistributedArchitecturePanel(private val project: Project) : JPanel(Border
 
         if (isAgent) {
             agentModel.addRow(arrayOf(
-                event.module,
+                langPrefix + event.module,
                 event.function,
                 "detected", // Framework
                 "call",
@@ -377,11 +379,11 @@ class DistributedArchitecturePanel(private val project: Project) : JPanel(Border
 
         if (isProcess) {
             processModel.addRow(arrayOf(
-                event.module,
+                langPrefix + event.module,
                 event.function,
                 "spawn/fork",
                 event.processId,
-                event.sessionId,
+                event.sessionId + " [" + event.language + "]",
                 timestamp
             ))
         }

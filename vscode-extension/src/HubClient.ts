@@ -452,6 +452,41 @@ export class HubClient {
         }
     }
 
+    /**
+     * Stop hub process by reading PID from status file (parity with PyCharm HubClient.stopHub).
+     */
+    public stopHub(): void {
+        this.disconnect();
+        try {
+            if (!fs.existsSync(this.STATUS_FILE)) { return; }
+            const content = fs.readFileSync(this.STATUS_FILE, 'utf-8');
+            const status = JSON.parse(content);
+            const pid = status.pid;
+            if (!pid) { return; }
+
+            try {
+                process.kill(pid, 'SIGTERM');
+                console.log(`[TrueFlow Hub] Stopped hub process (PID: ${pid})`);
+            } catch (_) {
+                // Process already dead
+            }
+            fs.unlinkSync(this.STATUS_FILE);
+        } catch (e) {
+            console.warn('[TrueFlow Hub] Failed to stop hub:', e);
+        }
+    }
+
+    /**
+     * Restart hub (kill old process + reconnect). Used after extension/plugin version change.
+     */
+    public async restartHub(): Promise<boolean> {
+        console.log('[TrueFlow Hub] Restarting hub (extension updated)...');
+        this.stopHub();
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        this.reconnectAttempts = 0;
+        return this.connect();
+    }
+
     // ==================== Convenience Methods ====================
 
     public notifyAIServerStarted(port: number, model: string): void {

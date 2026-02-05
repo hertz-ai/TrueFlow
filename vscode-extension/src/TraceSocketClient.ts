@@ -25,6 +25,7 @@ export interface TraceEvent {
     exception?: string;
     duration_ms?: number;
     trace_data?: any;  // For registry events
+    language?: string;  // Source language: python, java, javascript, rust
 }
 
 // Branch info for "Why Not Covered" analysis

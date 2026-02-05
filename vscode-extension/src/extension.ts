@@ -91,6 +91,20 @@ export function getGlobalTraceSocketClient(): TraceSocketClient | undefined {
     return traceSocketClient;
 }
 
+/**
+ * Push restored session data to the trace viewer webview (called after session restore).
+ */
+export function pushRestoredSessionToViewer(diagramCode?: string, deadCodeData?: any, performanceData?: any): void {
+    if (!traceViewerPanel) { return; }
+
+    if (diagramCode) {
+        traceViewerPanel.webview.postMessage({ type: 'updateDiagram', code: diagramCode });
+    }
+    if (performanceData) {
+        traceViewerPanel.webview.postMessage({ type: 'updatePerformance', data: performanceData });
+    }
+}
+
 // Track active processes started by this VS Code instance (without tracing)
 let activeProcessesWithoutTracing = new Set<string>();
 let statusBarPulseInterval: NodeJS.Timeout | undefined;
@@ -854,6 +868,33 @@ async function copyRuntimeInjector(extensionPath: string, destPath: string): Pro
                 fs.copyFileSync(srcFile, destFile);
             }
         }
+
+        // Version-aware deployment: track extension version and restart hub if changed
+        const versionFile = path.join(destPath, '.extension_version');
+        const pkgPath = path.join(extensionPath, 'package.json');
+        let currentVersion = 'unknown';
+        try {
+            if (fs.existsSync(pkgPath)) {
+                currentVersion = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version || 'unknown';
+            }
+        } catch (_) { /* ignore */ }
+
+        let versionChanged = true;
+        if (fs.existsSync(versionFile)) {
+            const deployedVersion = fs.readFileSync(versionFile, 'utf-8').trim();
+            versionChanged = deployedVersion !== currentVersion;
+        }
+        fs.writeFileSync(versionFile, currentVersion);
+
+        if (versionChanged) {
+            console.log(`[TrueFlow] Extension version changed to ${currentVersion}, restarting hub...`);
+            try {
+                await HubClient.getInstance().restartHub();
+            } catch (e) {
+                console.warn('[TrueFlow] Hub restart after version change failed:', e);
+            }
+        }
+
         console.log('[TrueFlow] Runtime injector copied successfully');
     } else {
         // Create a minimal runtime injector stub

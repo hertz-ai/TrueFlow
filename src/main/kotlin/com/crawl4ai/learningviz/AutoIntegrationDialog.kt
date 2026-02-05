@@ -33,12 +33,14 @@ import javax.swing.*
 class AutoIntegrationDialog(private val project: Project) : DialogWrapper(project) {
 
     // Project type detection
-    private enum class ProjectType { PYTHON, JAVA, MIXED, UNKNOWN }
+    private enum class ProjectType { PYTHON, JAVA, NODEJS, RUST, MIXED, UNKNOWN }
     private var detectedProjectType: ProjectType = ProjectType.UNKNOWN
 
     private val projectTypeCombo = JComboBox(arrayOf(
         "Python (sitecustomize.py injection)",
-        "Java (javaagent injection)"
+        "Java (javaagent injection)",
+        "Node.js/TypeScript (--require hook)",
+        "Rust (proc macro)"
     ))
 
     private val entryPointField = JBTextField(40)
@@ -71,15 +73,16 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
         // Detect project type automatically
         detectedProjectType = detectProjectType()
         when (detectedProjectType) {
-            ProjectType.JAVA -> projectTypeCombo.selectedIndex = 1
             ProjectType.PYTHON -> projectTypeCombo.selectedIndex = 0
+            ProjectType.JAVA -> projectTypeCombo.selectedIndex = 1
+            ProjectType.NODEJS -> projectTypeCombo.selectedIndex = 2
+            ProjectType.RUST -> projectTypeCombo.selectedIndex = 3
             ProjectType.MIXED -> projectTypeCombo.selectedIndex = 0  // Default to Python for mixed
             ProjectType.UNKNOWN -> projectTypeCombo.selectedIndex = 0
         }
 
-        // Only show project type selector for mixed projects
-        // For pure Python or pure Java projects, auto-detect and hide the combo
-        projectTypeCombo.isVisible = (detectedProjectType == ProjectType.MIXED)
+        // Only show project type selector for mixed/unknown projects
+        projectTypeCombo.isVisible = (detectedProjectType == ProjectType.MIXED || detectedProjectType == ProjectType.UNKNOWN)
 
         entryPointButton.addActionListener {
             selectEntryPoint()
@@ -108,28 +111,51 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
                 File(baseDir, "pom.xml").exists() ||
                 File(baseDir, "build.gradle").exists() ||
                 File(baseDir, "build.gradle.kts").exists()
+        val hasNodeJS = File(baseDir, "package.json").exists() ||
+                baseDir.walkTopDown().maxDepth(3).any { it.extension in listOf("ts", "tsx", "mjs") }
+        val hasRust = File(baseDir, "Cargo.toml").exists() ||
+                baseDir.walkTopDown().maxDepth(3).any { it.extension == "rs" }
 
+        // Priority: Rust > Node.js > Java > Python (more specific first)
         return when {
+            hasRust -> ProjectType.RUST
+            hasNodeJS && !hasPython && !hasJava -> ProjectType.NODEJS
             hasPython && hasJava -> ProjectType.MIXED
             hasJava -> ProjectType.JAVA
+            hasNodeJS -> ProjectType.NODEJS
             hasPython -> ProjectType.PYTHON
             else -> ProjectType.UNKNOWN
         }
     }
 
     private fun updateUIForProjectType() {
-        val isJava = projectTypeCombo.selectedIndex == 1
+        val selectedIndex = projectTypeCombo.selectedIndex
         // Update field labels and defaults based on project type
-        if (isJava) {
-            modulesToTraceField.toolTipText = "Java packages to trace (e.g., com.myapp,com.mylib). Leave empty to trace all."
-            excludeModulesField.text = "org.springframework,org.hibernate"
-            excludeModulesField.toolTipText = "Packages to exclude from tracing"
-            entryPointField.toolTipText = "Main class with main() method, or any .java file"
-        } else {
-            modulesToTraceField.toolTipText = "Comma-separated list (e.g., myapp,mylib). Leave empty to trace all."
-            excludeModulesField.text = "test,tests,pytest,unittest"
-            excludeModulesField.toolTipText = "Comma-separated list of modules to exclude"
-            entryPointField.toolTipText = "Entry point: .py, .bat, .sh, .ps1, docker-compose.yml, Dockerfile"
+        when (selectedIndex) {
+            0 -> { // Python
+                modulesToTraceField.toolTipText = "Comma-separated list (e.g., myapp,mylib). Leave empty to trace all."
+                excludeModulesField.text = "test,tests,pytest,unittest"
+                excludeModulesField.toolTipText = "Comma-separated list of modules to exclude"
+                entryPointField.toolTipText = "Entry point: .py, .bat, .sh, .ps1, docker-compose.yml, Dockerfile"
+            }
+            1 -> { // Java
+                modulesToTraceField.toolTipText = "Java packages to trace (e.g., com.myapp,com.mylib). Leave empty to trace all."
+                excludeModulesField.text = "org.springframework,org.hibernate"
+                excludeModulesField.toolTipText = "Packages to exclude from tracing"
+                entryPointField.toolTipText = "Main class with main() method, or any .java file"
+            }
+            2 -> { // Node.js
+                modulesToTraceField.toolTipText = "Paths to trace (e.g., src,lib). Leave empty to trace all."
+                excludeModulesField.text = "node_modules,dist,.git"
+                excludeModulesField.toolTipText = "Paths to exclude from tracing"
+                entryPointField.toolTipText = "Entry point: .js, .ts, .mjs file or package.json"
+            }
+            3 -> { // Rust
+                modulesToTraceField.toolTipText = "Crate modules to trace. Leave empty to trace all."
+                excludeModulesField.text = "std,core,alloc"
+                excludeModulesField.toolTipText = "Modules to exclude from tracing"
+                entryPointField.toolTipText = "Entry point: Cargo.toml or src/main.rs"
+            }
         }
     }
 
@@ -143,10 +169,12 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
 
         // Title - customize based on detected project type
         val projectTypeDisplay = when (detectedProjectType) {
-            ProjectType.JAVA -> "Java/Kotlin"
             ProjectType.PYTHON -> "Python"
-            ProjectType.MIXED -> "Python or Java/Kotlin"
-            ProjectType.UNKNOWN -> "Python or Java/Kotlin"
+            ProjectType.JAVA -> "Java/Kotlin"
+            ProjectType.NODEJS -> "Node.js/TypeScript"
+            ProjectType.RUST -> "Rust"
+            ProjectType.MIXED -> "Multi-language"
+            ProjectType.UNKNOWN -> "Unknown"
         }
         val titleLabel = JBLabel("<html><h2>Auto-Integrate Tracing</h2><p>Detected: <b>$projectTypeDisplay</b> project - Select entry point to configure tracing</p></html>")
         gbc.gridwidth = 3
@@ -288,8 +316,13 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
     }
 
     override fun doOKAction() {
-        val isJava = projectTypeCombo.selectedIndex == 1
-        val entryType = if (isJava) "Java/Kotlin" else "Python"
+        val entryType = when (projectTypeCombo.selectedIndex) {
+            0 -> "Python"
+            1 -> "Java/Kotlin"
+            2 -> "Node.js/TypeScript"
+            3 -> "Rust"
+            else -> "Unknown"
+        }
 
         if (selectedEntryPoint == null) {
             Messages.showErrorDialog(project, "Please select a $entryType entry point", "Error")
@@ -310,7 +343,7 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
         val integrationMethod = integrationMethodCombo.selectedIndex
         val modulesToTrace = modulesToTraceField.text.split(",").map { it.trim() }.filter { it.isNotEmpty() }
         val excludeModules = excludeModulesField.text.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-        val isJava = projectTypeCombo.selectedIndex == 1
+        val selectedType = projectTypeCombo.selectedIndex
 
         // Create trace directory
         val traceDirFile = File(traceDir)
@@ -318,19 +351,25 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
             traceDirFile.mkdirs()
         }
 
-        if (isJava) {
-            // Java/Kotlin integration
-            performJavaIntegration(entryPoint, traceDir, modulesToTrace, excludeModules)
-        } else {
-            // Python integration
-            // IMPORTANT: NEVER modify user code - always use environment variables!
-            when (integrationMethod) {
-                0 -> integrateViaRunConfiguration(entryPoint, traceDir, modulesToTrace, excludeModules)
-                1 -> integrateViaEnvFile(entryPoint, traceDir, modulesToTrace, excludeModules)
+        when (selectedType) {
+            0 -> { // Python
+                // IMPORTANT: NEVER modify user code - always use environment variables!
+                when (integrationMethod) {
+                    0 -> integrateViaRunConfiguration(entryPoint, traceDir, modulesToTrace, excludeModules)
+                    1 -> integrateViaEnvFile(entryPoint, traceDir, modulesToTrace, excludeModules)
+                }
+                // Create run configuration (always - this is the main integration method)
+                createRunConfiguration(entryPoint, traceDir, modulesToTrace, excludeModules)
             }
-
-            // Create run configuration (always - this is the main integration method)
-            createRunConfiguration(entryPoint, traceDir, modulesToTrace, excludeModules)
+            1 -> { // Java/Kotlin
+                performJavaIntegration(entryPoint, traceDir, modulesToTrace, excludeModules)
+            }
+            2 -> { // Node.js/TypeScript
+                performNodeJSIntegration(entryPoint, traceDir, modulesToTrace, excludeModules)
+            }
+            3 -> { // Rust
+                performRustIntegration(entryPoint, traceDir, modulesToTrace, excludeModules)
+            }
         }
 
         // Open trace directory if requested
@@ -340,9 +379,20 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
         }
 
         // Show success message
-        val language = if (isJava) "Java/Kotlin" else "Python"
-        val method = if (isJava) "-javaagent VM option" else
-            (if (integrationMethod == 0) "IDE Run Configuration" else "Environment File (.env)")
+        val language = when (selectedType) {
+            0 -> "Python"
+            1 -> "Java/Kotlin"
+            2 -> "Node.js/TypeScript"
+            3 -> "Rust"
+            else -> "Unknown"
+        }
+        val method = when (selectedType) {
+            0 -> if (integrationMethod == 0) "IDE Run Configuration" else "Environment File (.env)"
+            1 -> "-javaagent VM option"
+            2 -> "node --require hook"
+            3 -> "proc macro + tracing subscriber"
+            else -> "Unknown"
+        }
         val message = """
             $language Integration complete! NO CODE CHANGES MADE.
 
@@ -630,6 +680,94 @@ class AutoIntegrationDialog(private val project: Project) : DialogWrapper(projec
         } catch (e: Exception) {
             null
         }
+    }
+
+    /**
+     * Perform Node.js/TypeScript integration:
+     * Shows instructions for using node --require with the TrueFlow agent
+     */
+    private fun performNodeJSIntegration(
+        entryPoint: VirtualFile,
+        traceDir: String,
+        pathsToTrace: List<String>,
+        excludePaths: List<String>
+    ) {
+        val includesArg = if (pathsToTrace.isNotEmpty()) pathsToTrace.joinToString(",") else ""
+        val excludesArg = if (excludePaths.isNotEmpty()) excludePaths.joinToString(",") else "node_modules,dist"
+
+        // Show instructions for Node.js
+        val instructions = """
+            <html>
+            <h3>Node.js/TypeScript Integration</h3>
+            <p>Install the TrueFlow Node.js agent and run your app with tracing:</p>
+
+            <h4>1. Install the agent:</h4>
+            <pre>npm install @trueflow/nodejs-agent</pre>
+
+            <h4>2. Run with tracing enabled:</h4>
+            <pre>TRUEFLOW_ENABLED=1 \\
+TRUEFLOW_INCLUDES=$includesArg \\
+TRUEFLOW_EXCLUDES=$excludesArg \\
+TRUEFLOW_TRACE_DIR=$traceDir \\
+node --require @trueflow/nodejs-agent ${entryPoint.name}</pre>
+
+            <h4>3. Or add to package.json scripts:</h4>
+            <pre>"scripts": {
+  "start:trace": "TRUEFLOW_ENABLED=1 node --require @trueflow/nodejs-agent dist/main.js"
+}</pre>
+
+            <p><b>Port:</b> TrueFlow will listen on port <b>5680</b> for Node.js traces.</p>
+            </html>
+        """.trimIndent()
+
+        Messages.showInfoMessage(project, instructions, "Node.js Integration Instructions")
+    }
+
+    /**
+     * Perform Rust integration:
+     * Shows instructions for adding TrueFlow macros and tracing subscriber
+     */
+    private fun performRustIntegration(
+        entryPoint: VirtualFile,
+        traceDir: String,
+        modulesToTrace: List<String>,
+        excludeModules: List<String>
+    ) {
+        // Show instructions for Rust
+        val instructions = """
+            <html>
+            <h3>Rust Integration</h3>
+            <p>Add TrueFlow to your Cargo.toml and annotate functions:</p>
+
+            <h4>1. Add dependencies to Cargo.toml:</h4>
+            <pre>[dependencies]
+trueflow-runtime = "0.1"
+trueflow-macros = "0.1"</pre>
+
+            <h4>2. Initialize TrueFlow in main():</h4>
+            <pre>fn main() {
+    trueflow_runtime::init();  // Connects to IDE on port 5681
+
+    // Your app code...
+}</pre>
+
+            <h4>3. Annotate functions to trace:</h4>
+            <pre>use trueflow_macros::trace;
+
+#[trace]
+fn handle_request(req: Request) -> Response {
+    process(req)
+}</pre>
+
+            <h4>4. Run with tracing:</h4>
+            <pre>TRUEFLOW_ENABLED=1 cargo run</pre>
+
+            <p><b>Port:</b> TrueFlow will listen on port <b>5681</b> for Rust traces.</p>
+            <p><i>Note: Rust agent is coming soon. For now, you can use the tracing crate with a custom subscriber.</i></p>
+            </html>
+        """.trimIndent()
+
+        Messages.showInfoMessage(project, instructions, "Rust Integration Instructions")
     }
 
     private fun integrateViaRunConfiguration(

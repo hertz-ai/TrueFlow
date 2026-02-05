@@ -952,6 +952,7 @@
                 </button>
                 <span class="stat-separator"></span>
                 <span class="stat">Coverage: <span class="stat-value highlight" id="stat-coverage">0%</span></span>
+                <span id="auto-explain-status" style="display:none; margin-left:12px; font-size:10px; color:#60a5fa; opacity:0.8;"></span>
             </div>
 
             <!-- Search Box -->
@@ -5165,6 +5166,28 @@ ${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
             }
         };
 
+        // Handle auto-explain status updates (minimalistic stats bar indicator)
+        window.handleAutoExplainStatus = function(statusData) {
+            try {
+                const data = typeof statusData === 'string' ? JSON.parse(statusData) : statusData;
+                const el = document.getElementById('auto-explain-status');
+                if (!el) return;
+                if (data.active) {
+                    const shortName = (data.function || '').split('.').pop() || '';
+                    el.textContent = `⚡ AI: ${shortName}… (${data.cached}/${data.total})`;
+                    el.title = `Auto-explaining: ${data.function}\nCached: ${data.cached} of ${data.total} dead functions`;
+                    el.style.display = '';
+                } else if (data.cached > 0) {
+                    el.textContent = `✓ AI: ${data.cached}/${data.total} explained`;
+                    el.title = `${data.cached} of ${data.total} dead functions have cached AI explanations`;
+                    el.style.display = '';
+                    el.style.color = '#4ade80';
+                } else {
+                    el.style.display = 'none';
+                }
+            } catch (e) { /* ignore */ }
+        };
+
         // Handle LLM response from Kotlin
         window.handleLLMResponse = function(responseData) {
             try {
@@ -5307,6 +5330,19 @@ ${isDead && rootCause ? 'Why not covered: ' + rootCause : ''}`;
             window.explorerData = data;
             originalLoadData(data);
         };
+
+        // Browser mode: connect to SSE for auto-explain status updates
+        if (!document.hidden) {
+            try {
+                const evtSource = new EventSource('/events');
+                evtSource.addEventListener('autoExplainStatus', function(e) {
+                    if (typeof handleAutoExplainStatus === 'function') {
+                        handleAutoExplainStatus(JSON.parse(e.data));
+                    }
+                });
+                evtSource.onerror = function() { evtSource.close(); };
+            } catch (_) { /* JCEF mode — no SSE needed */ }
+        }
 
         // Demo data for testing with class-qualified names
         const demoData = {

@@ -204,8 +204,9 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private val plantUMLParser = PlantUMLParser()
     private var rawPlantUMLContent: String = "" // Store raw PlantUML for conversion
 
-    // Socket trace client for real-time tracing
-    private var traceSocketClient: TraceSocketClient? = null
+    // Socket trace clients for real-time tracing (supports multi-language distributed tracing)
+    private var traceSocketClient: TraceSocketClient? = null  // Primary client (for backward compat)
+    private val traceSocketClients = mutableMapOf<String, TraceSocketClient>()  // language -> client
     private val socketTraceBuffer = CircularBuffer(10000) // Max 10,000 events
     private var traceEventCount = 0
     private var qualNameDebugCount = 0  // Debug counter for co_qualname logging
@@ -308,6 +309,16 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private val serverNotificationShown = AtomicBoolean(false)
     private val defaultTracePort = 5678
     private val javaTracePort = 5679
+    private val nodejsTracePort = 5680
+    private val rustTracePort = 5681
+
+    // All trace ports to check for active instrumentors
+    private val allTracePorts = listOf(
+        "python" to 5678,
+        "java" to 5679,
+        "nodejs" to 5680,
+        "rust" to 5681
+    )
 // Debounce / anti-spam for server detection notifications
 private val serverNotificationCooldownMs = 60_000L // 1 minute
 private val lastServerNotificationAt = AtomicLong(0)
@@ -459,9 +470,9 @@ private val missesToReset = 3
         attachButton = JButton("Attach to Server")
         attachButton.toolTipText = "Connect to running Python process via socket (real-time tracing)"
         attachButton.addActionListener {
-            if (currentTraceMode == TraceMode.SOCKET_REALTIME && traceSocketClient?.isConnected() == true) {
+            if (currentTraceMode == TraceMode.SOCKET_REALTIME && isAnyTraceClientConnected()) {
                 // Currently connected, so detach
-                disconnectSocketTrace()
+                disconnectAllTraceClients()
                 updateAttachButtonState(false)
             } else {
                 // Not connected, so attach
@@ -480,6 +491,25 @@ private val missesToReset = 3
         attachButton.background = java.awt.Color(33, 150, 243) // Blue highlight
         attachButton.foreground = java.awt.Color.WHITE
         toolbar.add(attachButton)
+
+        // Distributed Tracing button - connects to all active language ports
+        val distributedButton = JButton("Distributed")
+        distributedButton.toolTipText = "Connect to ALL active trace servers (Python, Java, Node.js, Rust) for end-to-end distributed tracing"
+        distributedButton.addActionListener {
+            if (currentTraceMode == TraceMode.SOCKET_REALTIME && traceSocketClients.isNotEmpty()) {
+                // Currently in distributed mode, disconnect all
+                disconnectAllTraceClients()
+                updateAttachButtonState(false)
+            } else {
+                // Connect to all available ports
+                connectToAllTracePorts()
+            }
+        }
+        distributedButton.isOpaque = true
+        distributedButton.isContentAreaFilled = false
+        distributedButton.background = java.awt.Color(76, 175, 80) // Green for distributed
+        distributedButton.foreground = java.awt.Color.WHITE
+        toolbar.add(distributedButton)
 
         toolbar.addSeparator()
 
@@ -1511,6 +1541,116 @@ private val missesToReset = 3
         traceSocketClient?.connect()
     }
 
+    /**
+     * Connect to all active trace ports for multi-language distributed tracing.
+     * This enables end-to-end tracing across Python, Java, Node.js, and Rust services.
+     */
+    private fun connectToAllTracePorts() {
+        // Disconnect any existing connections
+        disconnectAllTraceClients()
+
+        // Reset trace data
+        socketTraceBuffer.clear()
+        traceEventCount = 0
+        socketTraceParticipants.clear()
+        socketTraceCalls.clear()
+        socketTraceAllFunctions.clear()
+        socketDistributedEvents.clear()
+        socketTraceFileLineMap.clear()
+        socketCallTimestamps.clear()
+        socketFunctionDurations.clear()
+        classFirstInitTimestamp.clear()
+        functionFirstCalledTimestamp.clear()
+        socketTotalDurationMs = 0.0
+        socketCompletedCalls = 0
+
+        // Switch to socket mode
+        currentTraceMode = TraceMode.SOCKET_REALTIME
+        updateTraceModeLabel()
+        updateFileBasedControls()
+
+        val connectedLanguages = mutableListOf<String>()
+
+        // Check each port and connect if available
+        for ((language, port) in allTracePorts) {
+            if (isPortListening("127.0.0.1", port)) {
+                val client = TraceSocketClient(
+                    host = "127.0.0.1",
+                    port = port,
+                    onTraceReceived = { traceEvent ->
+                        javax.swing.SwingUtilities.invokeLater {
+                            // Set language from port if not in event
+                            val eventWithLanguage = if (traceEvent.language == "python" && language != "python") {
+                                traceEvent.copy(language = language)
+                            } else {
+                                traceEvent
+                            }
+                            handleTraceEvent(eventWithLanguage)
+                        }
+                    },
+                    onConnected = {
+                        javax.swing.SwingUtilities.invokeLater {
+                            connectedLanguages.add(language)
+                            currentSessionLabel.text = "Distributed: ${connectedLanguages.joinToString(", ")}"
+                            PluginLogger.info("[ToolWindow] Connected to $language trace server on port $port")
+                        }
+                    },
+                    onDisconnected = { error ->
+                        javax.swing.SwingUtilities.invokeLater {
+                            connectedLanguages.remove(language)
+                            if (connectedLanguages.isEmpty()) {
+                                currentSessionLabel.text = "All connections closed"
+                                updateAttachButtonState(false)
+                            } else {
+                                currentSessionLabel.text = "Distributed: ${connectedLanguages.joinToString(", ")}"
+                            }
+                            PluginLogger.info("[ToolWindow] Disconnected from $language: ${error ?: "graceful"}")
+                        }
+                    },
+                    onError = { exception ->
+                        PluginLogger.warn("[ToolWindow] $language connection error: ${exception.message}")
+                    }
+                )
+
+                traceSocketClients[language] = client
+                client.connect()
+            }
+        }
+
+        if (traceSocketClients.isNotEmpty()) {
+            updateAttachButtonState(true)
+            processInfoLabel.text = "Distributed tracing active: ${traceSocketClients.keys.joinToString(", ")}"
+        } else {
+            currentSessionLabel.text = "No active trace servers found"
+            processInfoLabel.text = "Start your instrumented application first"
+        }
+    }
+
+    /**
+     * Disconnect all trace socket clients.
+     */
+    private fun disconnectAllTraceClients() {
+        traceSocketClient?.disconnect()
+        traceSocketClient = null
+
+        for ((language, client) in traceSocketClients) {
+            try {
+                client.disconnect()
+            } catch (e: Exception) {
+                PluginLogger.warn("[ToolWindow] Error disconnecting $language client: ${e.message}")
+            }
+        }
+        traceSocketClients.clear()
+    }
+
+    /**
+     * Check if any trace client is connected.
+     */
+    private fun isAnyTraceClientConnected(): Boolean {
+        return traceSocketClient?.isConnected() == true ||
+               traceSocketClients.values.any { it.isConnected() }
+    }
+
     private fun handleTraceEvent(event: TraceEvent) {
         traceEventCount++
 
@@ -1726,10 +1866,11 @@ private val missesToReset = 3
         }
 
         // Build PlantUML diagram with proper participant declarations and dead code coloring
+        val connectedLangs = traceSocketClients.keys.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: event.language
         val plantUMLDiagram = buildString {
             appendLine("@startuml")
             appendLine("' Real-time trace from ${escapePlantUML(event.sessionId)}")
-            appendLine("' Process ID: ${event.processId}")
+            appendLine("' Process ID: ${event.processId} | Language(s): $connectedLangs")
             appendLine()
 
             // Styling for live vs dead code
@@ -3261,7 +3402,7 @@ private val missesToReset = 3
 
         val intervalMs = settings.autoSaveIntervalMinutes * 60 * 1000
         autoSaveTimer = javax.swing.Timer(intervalMs) {
-            if (hasTraceData()) {
+            if (hasTraceData() && currentTraceMode == TraceMode.SOCKET_REALTIME) {
                 performAutoSave()
             }
         }
@@ -3406,15 +3547,20 @@ private val missesToReset = 3
             return
         }
 
-        // Check both Python (5678) and Java (5679) trace ports
-        val pythonAvailable = isPortListening("127.0.0.1", defaultTracePort)
-        val javaAvailable = if (!pythonAvailable) isPortListening("127.0.0.1", javaTracePort) else false
-        val port = when {
-            pythonAvailable -> defaultTracePort
-            javaAvailable -> javaTracePort
-            else -> defaultTracePort
+        // Check all trace ports: Python (5678), Java (5679), Node.js (5680), Rust (5681)
+        var detectedPort = defaultTracePort
+        var detectedLanguage = "python"
+        var isAvailable = false
+
+        for ((lang, portNum) in allTracePorts) {
+            if (isPortListening("127.0.0.1", portNum)) {
+                detectedPort = portNum
+                detectedLanguage = lang
+                isAvailable = true
+                break
+            }
         }
-        val isAvailable = pythonAvailable || javaAvailable
+        val port = detectedPort
 
         // Check if we should pulse the Auto-Integrate button
         // Conditions: Python/Java app running WITHOUT tracing AND not integrated yet AND panel visible

@@ -3810,8 +3810,74 @@ Command: ${llamaServer} ${args.join(' ')}
         // If no cached data, build from restored state
         if (!this.deadCodeData) { this.deadCodeData = this.buildDeadCodeFromLiveData(); }
         if (!this.performanceData) { this.performanceData = this.buildPerformanceFromLiveData(); }
+        if (!this.diagramData) { this.diagramData = this.buildDiagramFromCallGraph(); }
 
         console.log(`[TraceSessionManager] Restored session: ${this.allDefinedFunctions.size} defined, ${this.coveredFunctions.size} covered`);
+
+        // Push diagram to trace viewer if open
+        this.pushRestoredDataToTraceViewer();
+    }
+
+    /**
+     * Build a Mermaid sequence diagram from restored call graph data.
+     */
+    private buildDiagramFromCallGraph(): string {
+        if (!this.callGraphData || Object.keys(this.callGraphData).length === 0) { return ''; }
+
+        const coveredSet = this.coveredFunctions;
+        let diagram = 'sequenceDiagram\n';
+
+        // Collect participants from call graph (only covered callers for cleaner diagram)
+        const participants = new Set<string>();
+        const calls: Array<{from: string; to: string}> = [];
+
+        for (const [caller, callees] of Object.entries(this.callGraphData)) {
+            if (!coveredSet.has(caller)) { continue; }
+            const callerModule = caller.split('.').slice(0, -1).join('.') || caller;
+            participants.add(callerModule);
+            for (const callee of (callees as string[])) {
+                const calleeModule = callee.split('.').slice(0, -1).join('.') || callee;
+                participants.add(calleeModule);
+                calls.push({ from: callerModule, to: calleeModule });
+            }
+        }
+
+        // Limit participants for readability
+        const sortedParticipants = [...participants].slice(0, 20);
+        const participantSet = new Set(sortedParticipants);
+        for (const p of sortedParticipants) {
+            const safeName = p.replace(/[^a-zA-Z0-9_]/g, '_');
+            diagram += `    participant ${safeName} as ${p.split('.').pop()}\n`;
+        }
+
+        // Add calls (deduplicated, limited)
+        const seen = new Set<string>();
+        let callCount = 0;
+        for (const { from, to } of calls) {
+            if (!participantSet.has(from) || !participantSet.has(to)) { continue; }
+            const key = `${from}->${to}`;
+            if (seen.has(key)) { continue; }
+            seen.add(key);
+            const safeFrom = from.replace(/[^a-zA-Z0-9_]/g, '_');
+            const safeTo = to.replace(/[^a-zA-Z0-9_]/g, '_');
+            if (safeFrom !== safeTo) {
+                diagram += `    ${safeFrom}->>${safeTo}: calls\n`;
+            }
+            if (++callCount >= 50) { break; }
+        }
+
+        return diagram;
+    }
+
+    /**
+     * Push restored session data to the trace viewer webview if it's open.
+     */
+    private pushRestoredDataToTraceViewer(): void {
+        // Import at call time to avoid circular dependency
+        const { pushRestoredSessionToViewer } = require('./extension');
+        if (typeof pushRestoredSessionToViewer === 'function') {
+            pushRestoredSessionToViewer(this.diagramData, this.deadCodeData, this.performanceData);
+        }
     }
 
     /**
@@ -3897,7 +3963,9 @@ Command: ${llamaServer} ${args.join(' ')}
         const intervalMs = minutes * 60 * 1000;
 
         this.autoSaveInterval = setInterval(() => {
-            if (this.hasTraceData()) {
+            // Only auto-save when a live trace process is connected (parity with PyCharm)
+            const socketClient = getGlobalTraceSocketClient();
+            if (this.hasTraceData() && socketClient?.isConnected()) {
                 this.performAutoSave();
             }
         }, intervalMs);
@@ -3936,19 +4004,39 @@ Command: ${llamaServer} ${args.join(' ')}
         const config = vscode.workspace.getConfiguration('trueflow');
         if (!config.get<boolean>('autoRestoreOnStartup', true)) { return; }
 
-        try {
-            if (!this.sessionManager) { this.sessionManager = new TraceSessionManager(); }
-            const sessions = this.sessionManager.listSessions();
-            if (sessions.length === 0) { return; }
+        // Skip restore if a live trace server is already running (parity with PyCharm)
+        const net = require('net');
+        const checkPort = (port: number): Promise<boolean> => {
+            return new Promise((resolve) => {
+                const sock = new net.Socket();
+                sock.setTimeout(500);
+                sock.on('connect', () => { sock.destroy(); resolve(true); });
+                sock.on('error', () => { sock.destroy(); resolve(false); });
+                sock.on('timeout', () => { sock.destroy(); resolve(false); });
+                sock.connect(port, '127.0.0.1');
+            });
+        };
 
-            // Prefer manual sessions over autosaves
-            const session = sessions.find(s => !s.name.startsWith('autosave')) || sessions[0];
-            const state = this.sessionManager.restoreSession(session.file);
-            this.restoreFullSessionState(state);
-            console.log(`[AutoRestore] Restored: ${session.name}`);
-        } catch (e) {
-            console.warn('[AutoRestore] Failed:', e);
-        }
+        Promise.all([checkPort(5678), checkPort(5679)]).then(([pythonUp, javaUp]) => {
+            if (pythonUp || javaUp) {
+                console.log('[AutoRestore] Skipping — live trace server detected');
+                return;
+            }
+
+            try {
+                if (!this.sessionManager) { this.sessionManager = new TraceSessionManager(); }
+                const sessions = this.sessionManager.listSessions();
+                if (sessions.length === 0) { return; }
+
+                // Prefer manual sessions over autosaves
+                const session = sessions.find(s => !s.name.startsWith('autosave')) || sessions[0];
+                const state = this.sessionManager.restoreSession(session.file);
+                this.restoreFullSessionState(state);
+                console.log(`[AutoRestore] Restored: ${session.name}`);
+            } catch (e) {
+                console.warn('[AutoRestore] Failed:', e);
+            }
+        });
     }
 
     /**

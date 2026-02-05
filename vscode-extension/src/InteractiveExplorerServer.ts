@@ -48,7 +48,11 @@ export class InteractiveExplorerServer {
                 this.pushCachedExplanation(explanation);
             },
             // Check if AI server is available
-            () => this.isAIAvailable
+            () => this.isAIAvailable,
+            // Notify SSE clients of auto-explain progress
+            (active: boolean, funcName: string | null, cached: number, total: number) => {
+                this.pushAutoExplainStatus(active, funcName, cached, total);
+            }
         );
         console.log('[ExplorerServer] Explanation cache initialized');
     }
@@ -452,6 +456,27 @@ export class InteractiveExplorerServer {
                 return true;
             } catch (e) {
                 return false; // Remove dead client
+            }
+        });
+    }
+
+    private pushAutoExplainStatus(active: boolean, funcName: string | null, cached: number, total: number): void {
+        const message = JSON.stringify({
+            type: 'auto_explain_status',
+            active,
+            funcName,
+            cached,
+            total
+        });
+
+        const sseMessage = `event: autoExplainStatus\ndata: ${message}\n\n`;
+
+        this.sseClients = this.sseClients.filter(client => {
+            try {
+                client.write(sseMessage);
+                return true;
+            } catch (e) {
+                return false;
             }
         });
     }

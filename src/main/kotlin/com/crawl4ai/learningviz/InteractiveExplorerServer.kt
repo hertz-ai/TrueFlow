@@ -167,6 +167,31 @@ class InteractiveExplorerServer(
     }
 
     /**
+     * Push auto-explain status to browser clients via SSE.
+     */
+    fun pushAutoExplainStatus(active: Boolean, funcName: String?, cached: Int, total: Int) {
+        val data = mapOf(
+            "active" to active,
+            "function" to (funcName ?: ""),
+            "cached" to cached,
+            "total" to total
+        )
+        val jsonData = gson.toJson(data)
+        val sseMessage = "event: autoExplainStatus\ndata: $jsonData\n\n"
+
+        val deadClients = mutableListOf<HttpExchange>()
+        for (client in sseClients) {
+            try {
+                client.responseBody.write(sseMessage.toByteArray())
+                client.responseBody.flush()
+            } catch (e: Exception) {
+                deadClients.add(client)
+            }
+        }
+        sseClients.removeAll(deadClients)
+    }
+
+    /**
      * Serve the main HTML page with embedded SSE client.
      */
     private fun handleMainPage(exchange: HttpExchange) {
