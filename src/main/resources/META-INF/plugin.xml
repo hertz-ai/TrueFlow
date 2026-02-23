@@ -139,6 +139,14 @@
             <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift I"/>
         </action>
 
+        <action id="TrueFlow.ExposeAsMCPTool"
+                class="com.crawl4ai.learningviz.actions.ExposeAsMCPToolAction"
+                text="Expose as MCP Tool"
+                description="Generate a standalone MCP server wrapping this function"
+                icon="AllIcons.Nodes.Plugin">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+
         <!-- Main Menu -->
         <group id="TrueFlow.Menu"
                text="TrueFlow"
@@ -150,6 +158,8 @@
             <reference ref="TrueFlow.RefreshAction"/>
             <reference ref="TrueFlow.ExportAction"/>
             <reference ref="TrueFlow.SelectDirectoryAction"/>
+            <separator/>
+            <reference ref="TrueFlow.ExposeAsMCPTool"/>
         </group>
     </actions>
 

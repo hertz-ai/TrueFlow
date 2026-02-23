@@ -11,7 +11,7 @@ import { EventEmitter } from 'events';
  *  "file":"/path","line":10,"depth":2,"correlation_id":"cycle_001"}
  */
 export interface TraceEvent {
-    type: 'call' | 'return' | 'exception' | 'function_registry' | 'branch_registry';
+    type: 'call' | 'return' | 'exception' | 'function_registry' | 'branch_registry' | 'cycle_complete';
     timestamp: number;
     call_id: string;
     module: string;
@@ -20,12 +20,23 @@ export interface TraceEvent {
     line: number;
     depth: number;
     correlation_id?: string;
+    parent_id?: string;           // Parent call ID (for hierarchy)
+    process_id?: number;          // OS process ID
+    session_id?: string;          // Session ID
+    learning_phase?: string;      // Learning phase (perception, reasoning, etc.)
     args?: any;
     return_value?: any;
     exception?: string;
     duration_ms?: number;
-    trace_data?: any;  // For registry events
-    language?: string;  // Source language: python, java, javascript, rust
+    trace_data?: any;             // For registry events
+    language?: string;            // Source language: python, java, javascript, rust
+    // Extended fields for protocol detection (from return events)
+    params?: Record<string, any>;            // Function parameters
+    data_source?: string;                    // "video", "api", "screen", "audio"
+    protocol_summary?: Record<string, number>;  // Protocol counts: {sql: 2, ws: 1, ...}
+    protocol_details?: Record<string, string>;  // First item per protocol (truncated)
+    framework?: string;                      // Detected framework (e.g. "flask", "django")
+    is_ai_agent?: boolean;                   // Is this an AI agent call
 }
 
 // Branch info for "Why Not Covered" analysis

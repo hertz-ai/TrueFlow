@@ -222,6 +222,11 @@ class EnhancedLearningFlowToolWindow(private val project: Project) {
     private var socketTotalDurationMs = 0.0
     private var socketCompletedCalls = 0
 
+    // Per-function protocol accumulation for Interactive Explorer
+    private val socketFunctionProtocols = mutableMapOf<String, MutableMap<String, Int>>() // funcKey -> {proto -> count}
+    private val socketFunctionFrameworks = mutableMapOf<String, String>() // funcKey -> framework name
+    private val socketFunctionAiAgents = mutableSetOf<String>() // funcKeys that are AI agents
+
     // Call trace tree tracking (for Call Trace tab)
     private data class CallTraceNode(
         val callId: String,
@@ -560,6 +565,37 @@ private val missesToReset = 3
             toggleAutoTracing(autoTraceCheckbox.isSelected)
         }
         toolbar.add(autoTraceCheckbox)
+
+        toolbar.addSeparator()
+
+        // Lightweight mode toggle - reduces CPU overhead for running processes
+        val sessionSettings = SessionSettings.getInstance(project)
+        val lightweightCheckbox = JCheckBox("Lightweight", sessionSettings.state.lightweightMode)
+        lightweightCheckbox.toolTipText =
+            "<html>Reduce tracing CPU overhead (live toggle).<br>" +
+            "Skips parameter extraction and protocol detection.<br>" +
+            "Dead code, call graphs, performance metrics are preserved.</html>"
+        lightweightCheckbox.addActionListener {
+            val enabled = lightweightCheckbox.isSelected
+            // Persist in settings
+            val settings = SessionSettings.getInstance(project)
+            val currentState = settings.state
+            settings.loadState(SessionSettings.State(
+                autoSaveEnabled = currentState.autoSaveEnabled,
+                autoSaveIntervalMinutes = currentState.autoSaveIntervalMinutes,
+                autoRestoreOnStartup = currentState.autoRestoreOnStartup,
+                maxAutoSavedSessions = currentState.maxAutoSavedSessions,
+                lightweightMode = enabled
+            ))
+            // Write config file for live pickup by running Python processes
+            try {
+                val configDir = java.io.File("${project.basePath}/.trueflow")
+                configDir.mkdirs()
+                java.io.File(configDir, "performance_config.json")
+                    .writeText("""{"lightweight_mode": $enabled}""")
+            } catch (_: Exception) {}
+        }
+        toolbar.add(lightweightCheckbox)
 
         // Export button moved to stats panel row 3
 
@@ -1091,6 +1127,24 @@ private val missesToReset = 3
         }
         popupMenu.add(addToExclusionMenuItem)
 
+        popupMenu.addSeparator()
+        val exposeAsMCPItem = JMenuItem("Expose as MCP Tool")
+        exposeAsMCPItem.addActionListener {
+            val selectedRow = deadCodeTable.selectedRow
+            if (selectedRow >= 0) {
+                val modelRow = deadCodeTable.convertRowIndexToModel(selectedRow)
+                val module = deadCodeTableModel.getValueAt(modelRow, 1) as? String ?: return@addActionListener
+                val function = deadCodeTableModel.getValueAt(modelRow, 2) as? String ?: return@addActionListener
+                val fileLineStr = deadCodeTableModel.getValueAt(modelRow, 3) as? String ?: return@addActionListener
+                // Parse "file.py:42" into file and line
+                val colonIdx = fileLineStr.lastIndexOf(':')
+                val file = if (colonIdx > 0) fileLineStr.substring(0, colonIdx) else fileLineStr
+                val line = if (colonIdx > 0) fileLineStr.substring(colonIdx + 1).toIntOrNull() ?: 0 else 0
+                exposeAsMCPTool(module, function, file, line)
+            }
+        }
+        popupMenu.add(exposeAsMCPItem)
+
         deadCodeTable.componentPopupMenu = popupMenu
 
         // Color-code dead functions and add clickable navigate link
@@ -1346,6 +1400,89 @@ private val missesToReset = 3
         } catch (e: Exception) {
             PluginLogger.warn("Failed to extract folder from path: $filePath - ${e.message}")
             return null
+        }
+    }
+
+    private fun exposeAsMCPTool(module: String, function: String, file: String, line: Int) {
+        // Call Hub HTTP endpoint in background thread
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            try {
+                val hubPort = 5681  // Hub SSE/HTTP port
+                val url = java.net.URL("http://127.0.0.1:$hubPort/expose_tool")
+                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.doOutput = true
+                conn.connectTimeout = 10000
+                conn.readTimeout = 30000
+
+                val payload = com.google.gson.JsonObject().apply {
+                    addProperty("function_name", function)
+                    addProperty("module", module)
+                    addProperty("file", file)
+                    addProperty("line", line)
+                }
+
+                conn.outputStream.use { os ->
+                    os.write(payload.toString().toByteArray())
+                }
+
+                val responseCode = conn.responseCode
+                val responseBody = if (responseCode in 200..299) {
+                    conn.inputStream.bufferedReader().readText()
+                } else {
+                    conn.errorStream?.bufferedReader()?.readText() ?: "HTTP $responseCode"
+                }
+                conn.disconnect()
+
+                val result = com.google.gson.JsonParser.parseString(responseBody).asJsonObject
+
+                com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                    if (result.has("error")) {
+                        javax.swing.JOptionPane.showMessageDialog(
+                            null,
+                            result.get("error").asString,
+                            "MCP Tool Generation Failed",
+                            javax.swing.JOptionPane.ERROR_MESSAGE
+                        )
+                    } else {
+                        val toolName = result.get("tool_name")?.asString ?: function
+                        val serverPath = result.get("server_path")?.asString ?: ""
+                        val configSnippet = "\"$toolName\": {\n  \"command\": \"python\",\n  \"args\": [\"$serverPath\"]\n}"
+
+                        val message = "MCP Tool Created: $toolName\n\nServer: $serverPath\n\nAdd to Claude Desktop config (mcpServers):\n$configSnippet"
+                        val options = arrayOf("Copy Config", "OK")
+                        val choice = javax.swing.JOptionPane.showOptionDialog(
+                            null, message, "MCP Tool Generated",
+                            javax.swing.JOptionPane.DEFAULT_OPTION,
+                            javax.swing.JOptionPane.INFORMATION_MESSAGE,
+                            null, options, options[0]
+                        )
+                        if (choice == 0) {
+                            val clipboard = java.awt.Toolkit.getDefaultToolkit().systemClipboard
+                            clipboard.setContents(java.awt.datatransfer.StringSelection(configSnippet), null)
+                        }
+                        PluginLogger.info("[MCP Tool] Generated: $toolName -> $serverPath")
+                    }
+                }
+            } catch (e: java.net.ConnectException) {
+                com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                    javax.swing.JOptionPane.showMessageDialog(
+                        null,
+                        "Cannot connect to TrueFlow Hub (port 5681).\nEnsure the Hub is running.",
+                        "Hub Not Running",
+                        javax.swing.JOptionPane.WARNING_MESSAGE
+                    )
+                }
+            } catch (e: Exception) {
+                PluginLogger.warn("[MCP Tool] Failed to generate: ${e.message}")
+                com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                    javax.swing.JOptionPane.showMessageDialog(
+                        null, "Error: ${e.message}", "MCP Tool Generation Failed",
+                        javax.swing.JOptionPane.ERROR_MESSAGE
+                    )
+                }
+            }
         }
     }
 
@@ -1746,6 +1883,13 @@ private val missesToReset = 3
             "call" -> {
                 // Record call timestamp
                 socketCallTimestamps[event.callId] = event.timestamp
+                // Accumulate framework/agent metadata for Interactive Explorer
+                if (event.framework != null) {
+                    socketFunctionFrameworks[functionKey] = event.framework
+                }
+                if (event.isAiAgent) {
+                    socketFunctionAiAgents.add(functionKey)
+                }
             }
             "return" -> {
                 // Calculate duration if we have the matching call
@@ -1761,6 +1905,23 @@ private val missesToReset = 3
                     // Log timing for first few completed calls
                     if (socketCompletedCalls <= 5) {
                         PluginLogger.debug("[ToolWindow] Completed call #$socketCompletedCalls: $functionKey took ${String.format("%.2f", durationMs)}ms")
+                    }
+                }
+
+                // Dispatch protocol detections from return events (runs for all received events,
+                // NOT gated by UI sampling - protocol data is rare and must not be dropped)
+                if (event.protocolSummary != null) {
+                    // Live SQL tracking
+                    if (event.protocolSummary.has("sql")) {
+                        sqlAnalyzerPanel.updateFromSocketTrace(event)
+                    }
+                    // Enhanced distributed detection using actual protocol data
+                    updateDistributedFromProtocolData(event)
+
+                    // Accumulate per-function protocol data for Interactive Explorer
+                    event.protocolSummary.entrySet().forEach { entry ->
+                        socketFunctionProtocols.getOrPut(functionKey) { mutableMapOf() }
+                            .merge(entry.key, entry.value.asInt) { a, b -> a + b }
                     }
                 }
             }
@@ -2920,7 +3081,10 @@ private val missesToReset = 3
             whyNotCovered = whyNotCovered,
             resolvedCallGraph = filteredResolvedCallGraph,
             classInstantiationOrder = classFirstInitTimestamp,
-            functionFirstCalledTimestamp = functionFirstCalledTimestamp
+            functionFirstCalledTimestamp = functionFirstCalledTimestamp,
+            functionProtocols = socketFunctionProtocols,
+            functionFrameworks = socketFunctionFrameworks,
+            functionAiAgents = socketFunctionAiAgents
         )
     }
 
@@ -3026,7 +3190,10 @@ private val missesToReset = 3
             whyNotCovered = filteredWhyNotCovered,
             resolvedCallGraph = filteredResolvedCallGraph,
             classInstantiationOrder = classFirstInitTimestamp,
-            functionFirstCalledTimestamp = functionFirstCalledTimestamp
+            functionFirstCalledTimestamp = functionFirstCalledTimestamp,
+            functionProtocols = socketFunctionProtocols,
+            functionFrameworks = socketFunctionFrameworks,
+            functionAiAgents = socketFunctionAiAgents
         )
 
         PluginLogger.info("[ToolWindow] Refreshed Interactive Explorer with ${filteredFunctions.size} filtered functions")
@@ -3124,6 +3291,39 @@ private val missesToReset = 3
             socketDistributedEvents.add(event)
 
             // Update the distributed panel
+            distributedPanel.updateFromSocketTrace(
+                event = event,
+                isWebSocket = isWebSocket,
+                isWebRTC = isWebRTC,
+                isMCP = isMCP,
+                isAgent = isAgent,
+                isProcess = isProcess
+            )
+        }
+    }
+
+    /**
+     * Enhanced distributed detection using actual protocol data from return events.
+     * Uses protocol_summary/protocol_details instead of module/function name guessing.
+     */
+    private fun updateDistributedFromProtocolData(event: TraceEvent) {
+        val summary = event.protocolSummary ?: return
+
+        // Map protocol types to distributed panel categories
+        val isWebSocket = summary.has("websocket")
+        val isWebRTC = summary.has("webrtc")
+        val isMCP = summary.has("mcp")
+        val isAgent = summary.has("agent")
+        val isProcess = summary.has("process")
+        // Also consider other network protocols as distributed
+        val isOtherDistributed = summary.has("grpc") || summary.has("graphql") ||
+            summary.has("mqtt") || summary.has("amqp") || summary.has("kafka") ||
+            summary.has("redis") || summary.has("elasticsearch") || summary.has("sse") ||
+            summary.has("http2") || summary.has("thrift") || summary.has("zeromq") ||
+            summary.has("nats") || summary.has("memcached")
+
+        if (isWebSocket || isWebRTC || isMCP || isAgent || isProcess || isOtherDistributed) {
+            socketDistributedEvents.add(event)
             distributedPanel.updateFromSocketTrace(
                 event = event,
                 isWebSocket = isWebSocket,
@@ -3277,21 +3477,39 @@ private val missesToReset = 3
         // Build flamegraph frames from socket trace data
         val frames = mutableListOf<FlamegraphFrame>()
 
+        // Build depth/parent info from socketCallNodes (populated by updateCallTraceFromSocketTrace)
+        // Map funcKey -> (maxDepth, lastParentId, lastCallId) for hierarchy
+        val funcKeyMeta = mutableMapOf<String, Triple<Int, String?, String>>()
+        for ((callId, node) in socketCallNodes) {
+            val key = "${node.module}.${node.function}"
+            val existing = funcKeyMeta[key]
+            // Keep the deepest depth and most recent parent for this function
+            if (existing == null || node.children.size > 0) {
+                funcKeyMeta[key] = Triple(
+                    // Use depth from TraceEvent stored on node, or infer from tree position
+                    node.children.size,  // Approximate: nodes with children are higher in stack
+                    null,  // Parent determined below
+                    callId
+                )
+            }
+        }
+
         // Convert socket trace calls to flamegraph frames
         for ((funcKey, durations) in socketFunctionDurations.entries) {
             if (durations.isEmpty()) continue
 
             val (file, line) = socketTraceFileLineMap[funcKey] ?: Pair("-", 0)
             val totalDuration = durations.sum()
+            val meta = funcKeyMeta[funcKey]
 
             frames.add(FlamegraphFrame(
                 name = funcKey,
                 value = totalDuration,
                 file = file,
                 line = line,
-                parentId = null, // TODO: Track parent-child relationships from call stack
-                callId = funcKey, // Use funcKey as callId for now
-                depth = 0, // TODO: Track actual depth from call stack
+                parentId = meta?.second,
+                callId = meta?.third ?: funcKey,
+                depth = meta?.first ?: 0,
                 framework = detectFramework(funcKey),
                 isAiAgent = funcKey.contains("agent") || funcKey.contains("embodied")
             ))

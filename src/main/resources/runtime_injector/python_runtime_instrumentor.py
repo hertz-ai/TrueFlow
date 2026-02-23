@@ -278,9 +278,49 @@ class RuntimeInstrumentor(object):
         self.call_stack = []  # Track call hierarchy for flamegraph
         self.active_calls = {}  # Track in-flight calls by frame id
 
+        # Dynamic function exposure: inject /_trueflow/invoke into running server
+        self._trueflow_endpoint_injected = False
+        self._detected_app_object = None
+        self._detected_server_port = None
+        self._callable_registry = {}  # {qualified_name: callable_ref}
+
+        # Lightweight mode: minimal overhead tracing (skip pattern detection, parameter extraction)
+        # When enabled, the trace_function hot path skips:
+        #   - _detect_patterns_in_frame() (iterates ALL f_locals checking 15+ pattern lists)
+        #   - _extract_function_parameters() for socket streaming
+        #   - _classify_data_source() and _classify_data_types()
+        #   - _get_param_info() for return values
+        # These are only used by Watch Architecture tab which is rarely viewed during normal operation.
+        # Cycle execution trees (for Manim videos) still get full parameter data when lightweight=False.
+        self.lightweight_mode = os.getenv('PYCHARM_PLUGIN_LIGHTWEIGHT_MODE', '0') == '1'
+
+        # Pre-computed frozensets for O(1) prefix matching in trace_function hot path
+        # Previously these were recreated as lists on every single traced call
+        self._bootstrap_modules = frozenset([
+            'importlib', 'enum', 'signal', 'types', 'encodings', 'zipimport',
+            'site', 'abc', 'functools', 'collections', 'reprlib', 'weakref',
+            'operator', 'keyword', 're', 'sre_', 'copyreg', 'locale', 'codecs',
+            'io', 'posixpath', 'ntpath', 'genericpath', 'stat', 'os.path',
+            'nt', 'posix', '_collections_abc', '_weakrefset', '_bootlocale',
+            'json.encoder', 'json.decoder', 'json.scanner', 'decimal', 'heapq',
+            'bisect', 'threading', 'traceback', 'linecache', 'tokenize', 'token',
+            'warnings', 'string', 'copy', 'pickle', 'struct', 'socket', 'select',
+            'selectors', 'ssl', 'hashlib', 'random', 'datetime', 'calendar'
+        ])
+
+        self._performance_sensitive_modules = frozenset([
+            'torch', 'transformers', 'numpy', 'pandas',
+            'cv2', 'PIL', 'sklearn', 'scipy'
+        ])
+
+        self._db_modules = frozenset([
+            'sqlite3', 'psycopg2', 'pymysql', 'mysql', 'sqlalchemy', 'django.db'
+        ])
+
         # Safety limits to prevent memory exhaustion
         self.max_calls = int(os.getenv('PYCHARM_PLUGIN_MAX_CALLS', '10000'))  # Max calls to track (reduced for performance)
-        self.call_rate_window = []  # Track recent call timestamps for rate limiting
+        self._call_rate_count = 0  # Counter-based rate limiting (O(1) vs list-rebuild-per-call)
+        self._call_rate_window_start = time.time()
         self.max_calls_per_second = int(os.getenv('PYCHARM_PLUGIN_MAX_CALLS_PER_SEC', '10000'))  # Auto-disable if exceeding this rate
         self.max_call_depth = int(os.getenv('PYCHARM_PLUGIN_MAX_DEPTH', '1000'))  # Max call stack depth
         self.auto_finalize_threshold = int(os.getenv('PYCHARM_PLUGIN_AUTO_FINALIZE', '50000'))  # Auto-finalize at N calls
@@ -539,9 +579,77 @@ class RuntimeInstrumentor(object):
         scan_thread = threading.Thread(target=scan_in_background, daemon=True)
         scan_thread.start()
 
-        self.logger.info("RuntimeInstrumentor initialized (session: {0}, pid: {1})".format(
-            self.session_id, self.process_id))
-        self.logger.warning("Tracing adds overhead. For performance-critical code, disable tracing or use sampling.")
+        self.logger.info("RuntimeInstrumentor initialized (session: {0}, pid: {1}, lightweight: {2})".format(
+            self.session_id, self.process_id, self.lightweight_mode))
+        if not self.lightweight_mode:
+            self.logger.warning("Tracing adds overhead. Set PYCHARM_PLUGIN_LIGHTWEIGHT_MODE=1 for minimal overhead.")
+
+        # Pair-aware socket sampling: track which call_ids were sampled in
+        # so their matching return events are also streamed (prevents call stack corruption in plugin)
+        self._sampled_call_ids = set()
+
+        # Auto-cleanup old log files on startup to prevent disk bloat
+        self._cleanup_old_logs()
+
+    def _cleanup_old_logs(self, max_age_days=7):
+        """Remove log files older than max_age_days to prevent unbounded disk usage."""
+        try:
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+            if not os.path.isdir(log_dir):
+                return
+
+            now = time.time()
+            max_age_secs = max_age_days * 86400
+            removed_count = 0
+            removed_bytes = 0
+
+            for fname in os.listdir(log_dir):
+                if not fname.endswith('.log'):
+                    continue
+                fpath = os.path.join(log_dir, fname)
+                try:
+                    mtime = os.path.getmtime(fpath)
+                    if now - mtime > max_age_secs:
+                        fsize = os.path.getsize(fpath)
+                        os.remove(fpath)
+                        removed_count += 1
+                        removed_bytes += fsize
+                except Exception:
+                    pass
+
+            if removed_count > 0:
+                self.logger.info("Log cleanup: removed {0} old files ({1:.1f} MB)".format(
+                    removed_count, removed_bytes / (1024 * 1024)))
+        except Exception:
+            pass  # Non-critical
+
+    def _check_live_config(self):
+        """Check .trueflow/performance_config.json for live config updates from plugin UI.
+        Called periodically from the periodic flush check (every flush_interval seconds).
+        This allows the toolbar Lightweight toggle to affect running processes."""
+        try:
+            config_path = os.path.join(os.getcwd(), '.trueflow', 'performance_config.json')
+            if not os.path.exists(config_path):
+                return
+
+            mtime = os.path.getmtime(config_path)
+            if not hasattr(self, '_last_config_mtime'):
+                self._last_config_mtime = 0
+
+            if mtime <= self._last_config_mtime:
+                return  # No change since last check
+
+            self._last_config_mtime = mtime
+
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+
+            new_lightweight = config.get('lightweight_mode', self.lightweight_mode)
+            if new_lightweight != self.lightweight_mode:
+                self.lightweight_mode = new_lightweight
+                self.logger.info("Live config update: lightweight_mode={0}".format(new_lightweight))
+        except Exception:
+            pass  # Non-critical
 
     def _on_client_connected(self):
         """Called when a new client connects to trace server."""
@@ -798,23 +906,11 @@ class RuntimeInstrumentor(object):
                 return
 
             # Skip internal Python modules (but allow __main__ for testing and database libraries)
-            # Allow database libraries even if in site-packages
-            db_modules = ['sqlite3', 'psycopg2', 'pymysql', 'mysql', 'sqlalchemy', 'django.db']
-            is_db_module = any(module.startswith(db_mod) for db_mod in db_modules)
+            # Uses pre-computed frozensets from __init__ (O(1) lookup vs list rebuild per call)
+            is_db_module = any(module.startswith(db_mod) for db_mod in self._db_modules)
 
             # Filter out Python bootstrap and standard library noise
-            bootstrap_modules = [
-                'importlib', 'enum', 'signal', 'types', 'encodings', 'zipimport',
-                'site', 'abc', 'functools', 'collections', 'reprlib', 'weakref',
-                'operator', 'keyword', 're', 'sre_', 'copyreg', 'locale', 'codecs',
-                'io', 'posixpath', 'ntpath', 'genericpath', 'stat', 'os.path',
-                'nt', 'posix', '_collections_abc', '_weakrefset', '_bootlocale',
-                'json.encoder', 'json.decoder', 'json.scanner', 'decimal', 'heapq',
-                'bisect', 'threading', 'traceback', 'linecache', 'tokenize', 'token',
-                'warnings', 'string', 'copy', 'pickle', 'struct', 'socket', 'select',
-                'selectors', 'ssl', 'hashlib', 'random', 'datetime', 'calendar'
-            ]
-            is_bootstrap = any(module.startswith(bs_mod) for bs_mod in bootstrap_modules)
+            is_bootstrap = any(module.startswith(bs_mod) for bs_mod in self._bootstrap_modules)
 
             # Intelligent filtering using project scanner
             filename = code.co_filename
@@ -828,11 +924,7 @@ class RuntimeInstrumentor(object):
 
                 # Skip performance-critical library internals (PyTorch, transformers, etc.)
                 # These add massive overhead and aren't useful for debugging user code
-                performance_sensitive_modules = [
-                    'torch', 'transformers', 'numpy', 'pandas',
-                    'cv2', 'PIL', 'sklearn', 'scipy'
-                ]
-                if any(module.startswith(mod) for mod in performance_sensitive_modules):
+                if any(module.startswith(mod) for mod in self._performance_sensitive_modules):
                     # Allow top-level user calls INTO these libraries, but not their internals
                     if not self.project_scanner.is_project_file(filename):
                         return
@@ -885,11 +977,13 @@ class RuntimeInstrumentor(object):
                 current_time = time.time()
 
                 # Rate limiting: Auto-disable if call rate too high (prevents infinite loops/ML overhead)
-                self.call_rate_window.append(current_time)
-                # Keep only last second of timestamps
-                self.call_rate_window = [t for t in self.call_rate_window if current_time - t < 1.0]
+                # Counter-based: O(1) per call vs O(n) list comprehension rebuild
+                self._call_rate_count += 1
+                if current_time - self._call_rate_window_start >= 1.0:
+                    self._call_rate_count = 1
+                    self._call_rate_window_start = current_time
 
-                if len(self.call_rate_window) > self.max_calls_per_second:
+                if self._call_rate_count > self.max_calls_per_second:
                     if self.enabled:
                         self.logger.warning("Call rate exceeds {0}/sec, disabling tracing to prevent performance degradation".format(self.max_calls_per_second))
                         self.enabled = False
@@ -903,6 +997,8 @@ class RuntimeInstrumentor(object):
                         self.finalize()
                         self.last_flush_time = current_time
                         self.logger.debug("Periodic flush completed ({0} calls tracked)".format(len(self.calls)))
+                        # Check for live config updates from plugin UI (lightweight toggle)
+                        self._check_live_config()
                     except Exception as e:
                         self.logger.error("Periodic flush failed: {0}".format(str(e)), exc_info=True)
                     finally:
@@ -934,19 +1030,19 @@ class RuntimeInstrumentor(object):
                     return
 
                 # Path coverage optimization: skip already-covered execution paths
-                # Only emit trace events when code execution branches to a new line
-                # This reduces file-based traces and provides baseline filtering for socket streaming
-                # IMPORTANT: Socket streaming needs ALL events, not just unique paths
-                # So we skip path coverage check when socket client is connected
-                if self.enable_path_coverage and not (self.trace_server and self.trace_server.clients):
+                # Applied universally (including socket clients) to reduce event volume.
+                # Socket clients get unique-path events which is sufficient for:
+                #   - Dead code detection (needs function-level coverage, not call counts)
+                #   - Call graph visualization (needs edges, not frequencies)
+                #   - Performance metrics (plugin has its own sampling gate)
+                # The plugin's socketTraceCalls counter runs on every received event,
+                # so unique-path filtering here won't affect call counting accuracy
+                # for the set of paths that ARE covered.
+                if self.enable_path_coverage:
                     path_key = (filename, code.co_firstlineno)
                     if path_key in self.covered_paths:
-                        # This exact code path was already executed
-                        # Skip recording to avoid redundant visualization
-                        return  # Skip for file-based traces only
-                    else:
-                        # Mark this path as covered (only on first occurrence)
-                        self.covered_paths.add(path_key)
+                        return  # Already covered
+                    self.covered_paths.add(path_key)
 
                 # Record call
                 call_id = "call_{0}".format(self.call_counter)
@@ -991,11 +1087,27 @@ class RuntimeInstrumentor(object):
                 self.call_stack.append(call_id)
                 self.active_calls[frame_id] = call_record
 
-                # Add to cycle execution tree if we're in a learning cycle
-                if self.current_correlation_id and self.current_correlation_id in self.cycle_execution_trees:
-                    # Extract parameters with type and shape info
-                    parameters = self._extract_function_parameters(frame, code)
+                # Register callable for dynamic invocation via /_trueflow/invoke
+                self._register_callable(frame, func_name, module)
 
+                # Detect and inject /_trueflow/invoke endpoint (once, fast no-op after)
+                if not self._trueflow_endpoint_injected and call_record.framework in ('fastapi', 'flask'):
+                    self._try_inject_endpoint(frame, call_record.framework)
+
+                # Extract parameters ONCE, shared by cycle tree and socket streaming
+                # In lightweight mode, skip entirely (these fields aren't consumed by
+                # the plugin's Kotlin socket path - verified: TraceEvent data class
+                # doesn't parse params/data_source/data_types/return_value)
+                params_info = None
+                in_cycle = self.current_correlation_id and self.current_correlation_id in self.cycle_execution_trees
+                has_socket = self.trace_server and self.trace_server.clients
+                if not self.lightweight_mode and (in_cycle or has_socket):
+                    params_info = self._extract_function_parameters(frame, code)
+
+                # Add to cycle execution tree if we're in a learning cycle
+                # Cycle trees are used by Manim video generation (cycle_complete events)
+                # which contain the FULL trace - these are NOT affected by socket sampling
+                if in_cycle:
                     call_dict = {
                         'call_id': call_id,
                         'function_name': func_name,
@@ -1012,61 +1124,71 @@ class RuntimeInstrumentor(object):
                         'thread_id': str(threading.current_thread().ident),
                         'framework': call_record.framework,
                         'invocation_type': call_record.invocation_type,
-                        'parameters': parameters  # Exact params with type/shape
+                        'parameters': params_info
                     }
                     self.cycle_execution_trees[self.current_correlation_id].append(call_dict)
 
-                # Stream to PyCharm if connected
-                # IMPORTANT: Don't sample - send ALL events to maintain call/return coherence
-                # The plugin needs matching pairs for proper visualization
-                # Socket will handle backpressure via TCP flow control
-                if self.trace_server and self.trace_server.clients:
-                    # Extract parameters for Watch Architecture visualization
-                    params_info = self._extract_function_parameters(frame, code)
+                # Stream to PyCharm plugin if connected (with pair-aware sampling)
+                # Sampling: stream 1 in N events to prevent socket buffer overflow.
+                # Pair-aware: when a 'call' is sampled in, its call_id is tracked so
+                # the matching 'return' is also streamed. This prevents call stack
+                # corruption in the plugin's updateCallTraceFromSocketTrace().
+                if has_socket:
+                    self.socket_event_counter += 1
+                    should_stream = (self.socket_event_counter % self.socket_sample_rate == 0)
+                    if should_stream:
+                        # Track this call_id so its return event is also streamed
+                        self._sampled_call_ids.add(call_id)
 
-                    # Classify data source (video, api, screen, audio)
-                    data_source = self._classify_data_source(func_name, module, params_info)
+                        # Classify only for sampled events, skip in lightweight mode
+                        # (plugin doesn't parse these fields from socket events anyway)
+                        data_source = None
+                        data_types = None
+                        if not self.lightweight_mode and params_info:
+                            data_source = self._classify_data_source(func_name, module, params_info)
+                            data_types = self._classify_data_types(params_info)
 
-                    # Classify data types being processed
-                    data_types = self._classify_data_types(params_info)
-
-                    trace_event = {
-                        'type': 'call',
-                        'timestamp': call_record.start_time,
-                        'call_id': call_id,
-                        'module': module,
-                        'function': func_name,
-                        'file': code.co_filename,
-                        'line': code.co_firstlineno,
-                        'depth': depth,
-                        'parent_id': parent_id,
-                        'process_id': self.process_id,
-                        'session_id': self.session_id,
-                        'correlation_id': self.current_correlation_id,
-                        'learning_phase': phase if phase else None,
-                        # Enhanced data for Watch Architecture
-                        'params': params_info,
-                        'data_source': data_source,
-                        'data_types': data_types
-                    }
-                    # Stream all call events to maintain coherence
-                    self.trace_server.stream_trace(trace_event)
+                        trace_event = {
+                            'type': 'call',
+                            'timestamp': call_record.start_time,
+                            'call_id': call_id,
+                            'module': module,
+                            'function': func_name,
+                            'file': code.co_filename,
+                            'line': code.co_firstlineno,
+                            'depth': depth,
+                            'parent_id': parent_id,
+                            'process_id': self.process_id,
+                            'session_id': self.session_id,
+                            'correlation_id': self.current_correlation_id,
+                            'learning_phase': phase if phase else None,
+                            'params': params_info,
+                            'data_source': data_source,
+                            'data_types': data_types
+                        }
+                        # Add framework/agent info (available at call creation, no extra cost)
+                        if call_record.framework:
+                            trace_event['framework'] = call_record.framework
+                        if call_record.is_ai_agent:
+                            trace_event['is_ai_agent'] = True
+                        self.trace_server.stream_trace(trace_event)
 
                 # Auto-finalize if threshold reached (prevent memory growth)
                 if len(self.calls) >= self.auto_finalize_threshold and len(self.calls) % 1000 == 0:
                     try:
                         self.logger.debug("Auto-finalizing at {0} calls to prevent memory growth".format(len(self.calls)))
-                        # Don't call full finalize, just clear old data
                         self._cleanup_old_calls()
                     except Exception:
                         pass
 
-                # Detect various patterns in local variables
-                try:
-                    self._detect_patterns_in_frame(frame, call_record)
-                except Exception:
-                    # Pattern detection failed, continue without it
-                    pass
+                # Detect SQL, WebSocket, gRPC, MCP, etc. patterns in local variables
+                # This is expensive: iterates ALL f_locals and checks 15+ pattern lists
+                # In lightweight mode, skip to minimize trace_function overhead
+                if not self.lightweight_mode:
+                    try:
+                        self._detect_patterns_in_frame(frame, call_record)
+                    except Exception:
+                        pass
 
             elif event == 'return':
                 # Mark call as complete
@@ -1097,37 +1219,79 @@ class RuntimeInstrumentor(object):
                     self._detect_learning_cycle_end(call_record.function_name)
 
                     # Detect patterns again on return (all variables are now available)
-                    try:
-                        self._detect_patterns_in_frame(frame, call_record)
-                    except Exception:
-                        # Pattern detection failed, continue without it
-                        pass
+                    if not self.lightweight_mode:
+                        try:
+                            self._detect_patterns_in_frame(frame, call_record)
+                        except Exception:
+                            pass
 
                     # Stream return event to PyCharm if connected
-                    # Send ALL return events to match with call events
+                    # Pair-aware: only stream if the matching call was sampled in
                     if self.trace_server and self.trace_server.clients:
-                        # Extract return value info for Watch Architecture
-                        return_info = self._get_param_info(arg) if arg is not None else None
+                        if call_record.call_id in self._sampled_call_ids:
+                            # Remove from tracking set (matched pair complete)
+                            self._sampled_call_ids.discard(call_record.call_id)
 
-                        trace_event = {
-                            'type': 'return',
-                            'timestamp': call_record.end_time,
-                            'call_id': call_record.call_id,
-                            'duration_ms': call_record.duration_ms,
-                            # Copy context from call_record so return events have full information
-                            'module': call_record.module,
-                            'function': call_record.function_name,
-                            'file': call_record.file_path,
-                            'line': call_record.line_number,
-                            'depth': call_record.depth,
-                            'parent_id': call_record.parent_id,
-                            'process_id': self.process_id,
-                            'session_id': self.session_id,
-                            'correlation_id': self.current_correlation_id,
-                            # Enhanced data for Watch Architecture
-                            'return_value': return_info
-                        }
-                        self.trace_server.stream_trace(trace_event)
+                            # Extract return value info (skip in lightweight mode)
+                            return_info = None
+                            if not self.lightweight_mode and arg is not None:
+                                return_info = self._get_param_info(arg)
+
+                            trace_event = {
+                                'type': 'return',
+                                'timestamp': call_record.end_time,
+                                'call_id': call_record.call_id,
+                                'duration_ms': call_record.duration_ms,
+                                'module': call_record.module,
+                                'function': call_record.function_name,
+                                'file': call_record.file_path,
+                                'line': call_record.line_number,
+                                'depth': call_record.depth,
+                                'parent_id': call_record.parent_id,
+                                'process_id': self.process_id,
+                                'session_id': self.session_id,
+                                'correlation_id': self.current_correlation_id,
+                                'return_value': return_info
+                            }
+
+                            # Add protocol detections accumulated by _detect_patterns_in_frame()
+                            # Only when not in lightweight mode (pattern detection was skipped)
+                            if not self.lightweight_mode:
+                                protocol_summary = {}
+                                protocol_details = {}
+                                for proto_name, proto_field in [
+                                    ('sql', 'sql_queries'),
+                                    ('websocket', 'websocket_events'),
+                                    ('webrtc', 'webrtc_events'),
+                                    ('mcp', 'mcp_calls'),
+                                    ('agent', 'agent_communications'),
+                                    ('process', 'process_spawns'),
+                                    ('grpc', 'grpc_calls'),
+                                    ('graphql', 'graphql_queries'),
+                                    ('mqtt', 'mqtt_messages'),
+                                    ('amqp', 'amqp_messages'),
+                                    ('kafka', 'kafka_events'),
+                                    ('redis', 'redis_commands'),
+                                    ('memcached', 'memcached_ops'),
+                                    ('elasticsearch', 'elasticsearch_queries'),
+                                    ('sse', 'sse_events'),
+                                    ('http2', 'http2_frames'),
+                                    ('thrift', 'thrift_calls'),
+                                    ('zeromq', 'zeromq_messages'),
+                                    ('nats', 'nats_messages'),
+                                ]:
+                                    items = getattr(call_record, proto_field, [])
+                                    if items:
+                                        protocol_summary[proto_name] = len(items)
+                                        # Send first item truncated for UI display
+                                        first_item = str(items[0])
+                                        if len(first_item) > 200:
+                                            first_item = first_item[:200]
+                                        protocol_details[proto_name] = first_item
+                                if protocol_summary:
+                                    trace_event['protocol_summary'] = protocol_summary
+                                    trace_event['protocol_details'] = protocol_details
+                            self.trace_server.stream_trace(trace_event)
 
                     try:
                         del self.active_calls[frame_id]
@@ -1853,6 +2017,277 @@ class RuntimeInstrumentor(object):
         """Detect if AI agent function."""
         ai_keywords = ['learn', 'train', 'infer', 'reason', 'plan']
         return any(kw in func_name.lower() or kw in module.lower() for kw in ai_keywords)
+
+    # ── Dynamic Function Exposure: /_trueflow/invoke injection ──
+
+    def _register_callable(self, frame, func_name, module):
+        """Register a callable reference from a traced frame for dynamic invocation."""
+        try:
+            qualified = "{0}.{1}".format(module, func_name) if module else func_name
+            if qualified in self._callable_registry:
+                return
+            code = frame.f_code
+            # For methods: get unbound function from the class
+            f_locals = frame.f_locals
+            if 'self' in f_locals:
+                try:
+                    method = getattr(type(f_locals['self']), code.co_name, None)
+                    if method:
+                        self._callable_registry[qualified] = method
+                        return
+                except Exception:
+                    pass
+            # For module-level functions: look in f_globals
+            func = frame.f_globals.get(code.co_name)
+            if callable(func) and getattr(func, '__code__', None) is code:
+                self._callable_registry[qualified] = func
+        except Exception:
+            pass
+
+    def _resolve_function(self, qualified_name):
+        """Dynamically resolve a function by qualified name (importlib fallback)."""
+        if qualified_name in self._callable_registry:
+            return self._callable_registry[qualified_name]
+        # Try module.attr resolution
+        parts = qualified_name.split('.')
+        for i in range(len(parts) - 1, 0, -1):
+            module_path = '.'.join(parts[:i])
+            try:
+                import importlib
+                mod = importlib.import_module(module_path)
+                obj = mod
+                for attr in parts[i:]:
+                    obj = getattr(obj, attr)
+                if callable(obj):
+                    self._callable_registry[qualified_name] = obj
+                    return obj
+            except (ImportError, AttributeError):
+                continue
+        return None
+
+    def _detect_server_port(self, framework):
+        """Detect the port the traced server is running on."""
+        # Check common env vars
+        for var in ('TRUEFLOW_SERVER_PORT', 'PORT', 'UVICORN_PORT', 'FLASK_RUN_PORT'):
+            val = os.getenv(var)
+            if val:
+                try:
+                    return int(val)
+                except ValueError:
+                    pass
+        # Check sys.argv for --port / -p
+        for i, arg in enumerate(sys.argv):
+            if arg in ('--port', '-p') and i + 1 < len(sys.argv):
+                try:
+                    return int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+            if arg.startswith('--port='):
+                try:
+                    return int(arg.split('=', 1)[1])
+                except ValueError:
+                    pass
+        # Defaults
+        return 5000 if framework == 'flask' else 8000
+
+    def _try_inject_endpoint(self, frame, framework):
+        """Detect app object in frame.f_globals and inject /_trueflow/invoke."""
+        try:
+            f_globals = frame.f_globals
+            app_obj = None
+
+            if framework == 'fastapi':
+                for name, obj in f_globals.items():
+                    if hasattr(obj, 'add_api_route') and hasattr(obj, 'openapi'):
+                        app_obj = obj
+                        break
+            elif framework == 'flask':
+                for name, obj in f_globals.items():
+                    if hasattr(obj, 'add_url_rule') and hasattr(obj, 'route') and hasattr(obj, 'config'):
+                        app_obj = obj
+                        break
+
+            if app_obj is None:
+                return
+
+            self._detected_app_object = app_obj
+            self._trueflow_endpoint_injected = True  # Set BEFORE injection
+            self._detected_server_port = self._detect_server_port(framework)
+
+            # Inject in background thread to avoid blocking trace hot path
+            import threading
+            threading.Thread(
+                target=self._inject_endpoints,
+                args=(app_obj, framework),
+                daemon=True
+            ).start()
+
+            self.logger.info("Detected {0} app, injecting /_trueflow/invoke (port {1})".format(
+                framework, self._detected_server_port))
+        except Exception as e:
+            self.logger.warning("Failed to detect app for injection: {0}".format(e))
+
+    def _inject_endpoints(self, app_obj, framework):
+        """Inject /_trueflow/invoke, /_trueflow/functions, /_trueflow/openapi.json."""
+        try:
+            instrumentor = self
+
+            if framework == 'fastapi':
+                self._inject_fastapi(app_obj, instrumentor)
+            elif framework == 'flask':
+                self._inject_flask(app_obj, instrumentor)
+
+            self.logger.info("/_trueflow/ endpoints injected into {0} app".format(framework))
+
+            # Notify IDE via trace event
+            if self.trace_server and self.trace_server.clients:
+                self.trace_server.stream_trace({
+                    'type': 'trueflow_endpoint_injected',
+                    'timestamp': time.time(),
+                    'call_id': 'endpoint_injection',
+                    'module': '__trueflow__',
+                    'function': '_inject_endpoints',
+                    'framework': framework,
+                    'port': self._detected_server_port,
+                    'session_id': self.session_id,
+                    'process_id': self.process_id,
+                })
+        except Exception as e:
+            self.logger.error("Endpoint injection failed: {0}".format(e))
+            self._trueflow_endpoint_injected = False  # Allow retry
+
+    def _inject_fastapi(self, app, instrumentor):
+        """Inject endpoints into FastAPI/Starlette app."""
+        import json as json_mod
+        import asyncio as _asyncio
+
+        async def trueflow_invoke(request):
+            from starlette.responses import JSONResponse
+            try:
+                body = await request.json()
+                func_name = body.get('function_name', '')
+                args = body.get('args', {})
+                if not func_name:
+                    return JSONResponse({'error': 'function_name is required'}, status_code=400)
+
+                fn = instrumentor._callable_registry.get(func_name)
+                if fn is None:
+                    fn = instrumentor._resolve_function(func_name)
+                if fn is None:
+                    return JSONResponse({
+                        'error': 'Function not found: {0}'.format(func_name),
+                        'available': list(instrumentor._callable_registry.keys())[:50]
+                    }, status_code=404)
+
+                if _asyncio.iscoroutinefunction(fn):
+                    result = await fn(**args)
+                else:
+                    result = fn(**args)
+
+                try:
+                    serialized = json_mod.loads(json_mod.dumps(result, default=str))
+                except (TypeError, ValueError):
+                    serialized = str(result)
+
+                return JSONResponse({'result': serialized, 'function': func_name})
+            except Exception as e:
+                import traceback
+                return JSONResponse({'error': str(e), 'traceback': traceback.format_exc()}, status_code=500)
+
+        async def trueflow_functions(request):
+            from starlette.responses import JSONResponse
+            funcs = []
+            for name, ref in instrumentor._callable_registry.items():
+                funcs.append({
+                    'name': name,
+                    'is_async': _asyncio.iscoroutinefunction(ref),
+                    'module': getattr(ref, '__module__', ''),
+                })
+            return JSONResponse({
+                'functions': funcs, 'count': len(funcs),
+                'framework': 'fastapi', 'port': instrumentor._detected_server_port
+            })
+
+        async def trueflow_openapi(request):
+            from starlette.responses import JSONResponse
+            try:
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                if script_dir not in sys.path:
+                    sys.path.insert(0, script_dir)
+                from project_scanner import ProjectScanner
+                from mcp_tool_generator import MCPToolGenerator
+
+                scanner = ProjectScanner(os.getcwd())
+                generator = MCPToolGenerator()
+                func_list = []
+                for qname in instrumentor._callable_registry:
+                    parts = qname.rsplit('.', 1)
+                    fname = parts[-1] if len(parts) > 1 else qname
+                    for fpath, funcs in scanner.functions.items():
+                        if fname in funcs or qname.split('.')[-1] in funcs:
+                            meta = scanner.extract_function_metadata(fpath, fname)
+                            if meta:
+                                func_list.append((meta, qname))
+                            break
+                if func_list:
+                    spec = generator.generate_openapi_spec(
+                        func_list,
+                        server_url="http://127.0.0.1:{0}".format(instrumentor._detected_server_port)
+                    )
+                    return JSONResponse(spec)
+                return JSONResponse({'openapi': '3.0.3', 'info': {'title': 'TrueFlow', 'version': '1.0.0'}, 'paths': {}})
+            except Exception as e:
+                return JSONResponse({'error': str(e)}, status_code=500)
+
+        from starlette.routing import Route
+        app.routes.insert(0, Route('/_trueflow/invoke', trueflow_invoke, methods=['POST']))
+        app.routes.insert(0, Route('/_trueflow/functions', trueflow_functions, methods=['GET']))
+        app.routes.insert(0, Route('/_trueflow/openapi.json', trueflow_openapi, methods=['GET']))
+
+    def _inject_flask(self, app, instrumentor):
+        """Inject endpoints into Flask app."""
+        import json as json_mod
+
+        def trueflow_invoke():
+            from flask import request, jsonify
+            try:
+                body = request.get_json(force=True)
+                func_name = body.get('function_name', '')
+                args = body.get('args', {})
+                if not func_name:
+                    return jsonify({'error': 'function_name is required'}), 400
+
+                fn = instrumentor._callable_registry.get(func_name)
+                if fn is None:
+                    fn = instrumentor._resolve_function(func_name)
+                if fn is None:
+                    return jsonify({
+                        'error': 'Function not found: {0}'.format(func_name),
+                        'available': list(instrumentor._callable_registry.keys())[:50]
+                    }), 404
+
+                result = fn(**args)
+                try:
+                    serialized = json_mod.loads(json_mod.dumps(result, default=str))
+                except (TypeError, ValueError):
+                    serialized = str(result)
+
+                return jsonify({'result': serialized, 'function': func_name})
+            except Exception as e:
+                import traceback
+                return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+        def trueflow_functions():
+            from flask import jsonify
+            funcs = [{'name': n, 'module': getattr(r, '__module__', '')}
+                     for n, r in instrumentor._callable_registry.items()]
+            return jsonify({
+                'functions': funcs, 'count': len(funcs),
+                'framework': 'flask', 'port': instrumentor._detected_server_port
+            })
+
+        app.add_url_rule('/_trueflow/invoke', 'trueflow_invoke', trueflow_invoke, methods=['POST'])
+        app.add_url_rule('/_trueflow/functions', 'trueflow_functions', trueflow_functions, methods=['GET'])
 
     def _cleanup_old_calls(self):
         """Cleanup old call records to prevent memory growth."""

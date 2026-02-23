@@ -96,7 +96,16 @@ class TraceSocketClient(
             learningPhase = if (data.get("learning_phase")?.isJsonNull == true) null else data.get("learning_phase")?.asString,
             // Handle JsonNull: GSON returns JsonNull for JSON null values, not Kotlin null
             traceData = data.get("trace_data")?.let { if (it.isJsonNull) null else it.asJsonObject },
-            language = data.get("language")?.asString ?: "python"
+            language = data.get("language")?.asString ?: "python",
+            // Extended fields - additive, all have defaults for backward compat
+            durationMs = data.get("duration_ms")?.asDouble,
+            params = data.get("params")?.let { if (it.isJsonNull) null else it.asJsonObject },
+            dataSource = data.get("data_source")?.let { if (it.isJsonNull) null else it.asString },
+            returnValue = data.get("return_value")?.let { if (it.isJsonNull) null else it.toString().take(200) },
+            protocolSummary = data.get("protocol_summary")?.let { if (it.isJsonNull) null else it.asJsonObject },
+            protocolDetails = data.get("protocol_details")?.let { if (it.isJsonNull) null else it.asJsonObject },
+            framework = data.get("framework")?.let { if (it.isJsonNull) null else it.asString },
+            isAiAgent = data.get("is_ai_agent")?.asBoolean ?: false
         )
     }
 
@@ -132,7 +141,16 @@ data class TraceEvent(
     val correlationId: String?, // Learning cycle correlation ID
     val learningPhase: String?, // Learning phase (perception, reasoning, etc.)
     val traceData: com.google.gson.JsonObject? = null,  // Complete trace data for cycle_complete events
-    val language: String = "python"  // Source language: python, java, javascript, rust
+    val language: String = "python",  // Source language: python, java, javascript, rust
+    // Extended fields (all optional with defaults for backward compat)
+    val durationMs: Double? = null,           // Duration in ms (from 'return' events)
+    val params: com.google.gson.JsonObject? = null,  // Function parameters
+    val dataSource: String? = null,           // Data source: "video", "api", "screen", "audio"
+    val returnValue: String? = null,          // Return value summary (truncated)
+    val protocolSummary: com.google.gson.JsonObject? = null,  // Protocol counts: {sql: 2, ws: 1, ...}
+    val protocolDetails: com.google.gson.JsonObject? = null,  // First item per protocol (truncated)
+    val framework: String? = null,            // Detected framework (e.g. "flask", "django")
+    val isAiAgent: Boolean = false            // Is this an AI agent call
 ) {
     /**
      * Get minimalistic language tag: py, js, java, rs (empty for python default)

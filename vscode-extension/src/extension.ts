@@ -84,6 +84,11 @@ let mcpStatusBarItem: vscode.StatusBarItem;
 let sidebarProvider: TrueFlowSidebarProvider | undefined;
 let explorerServer: InteractiveExplorerServer | undefined;
 
+// Per-function protocol accumulation from trace events (for explorer visualization)
+const functionProtocols: Map<string, Record<string, number>> = new Map();
+const functionFrameworks: Map<string, string> = new Map();
+const functionAiAgents: Set<string> = new Set();
+
 /**
  * Get the global TraceSocketClient instance (for session save/restore and RPC fallback).
  */
@@ -288,7 +293,8 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('trueflow.downloadAIModel', () => downloadAIModel()),
         vscode.commands.registerCommand('trueflow.startAIServer', () => startAIServer()),
         vscode.commands.registerCommand('trueflow.stopAIServer', () => stopAIServer()),
-        vscode.commands.registerCommand('trueflow.showAIChat', () => AIExplanationProvider.getInstance().show(context))
+        vscode.commands.registerCommand('trueflow.showAIChat', () => AIExplanationProvider.getInstance().show(context)),
+        vscode.commands.registerCommand('trueflow.exposeAsMCPTool', () => exposeEditorFunctionAsMCPTool())
     ];
 
     context.subscriptions.push(...commands);
@@ -353,6 +359,23 @@ function setupSocketClientHandlers(): void {
                 type: 'traceEvent',
                 event
             });
+        }
+
+        // Accumulate per-function protocol data for Interactive Explorer
+        const funcKey = `${event.module}.${event.function}`;
+        if (event.type === 'call') {
+            if (event.framework) {
+                functionFrameworks.set(funcKey, event.framework);
+            }
+            if (event.is_ai_agent) {
+                functionAiAgents.add(funcKey);
+            }
+        } else if (event.type === 'return' && event.protocol_summary) {
+            const existing = functionProtocols.get(funcKey) || {};
+            for (const [proto, count] of Object.entries(event.protocol_summary)) {
+                existing[proto] = (existing[proto] || 0) + (typeof count === 'number' ? count : 1);
+            }
+            functionProtocols.set(funcKey, existing);
         }
     });
 
@@ -1317,6 +1340,58 @@ function showTraceViewer(context: vscode.ExtensionContext, initialTab?: string):
                     console.error('[TrueFlow] Failed to load explorer HTML:', error);
                 }
                 break;
+            case 'exposeMCPTool': {
+                // Right-click "Expose as MCP Tool" from Dead Code tab
+                const toolData = message.data;
+                try {
+                    const http = await import('http');
+                    const postBody = JSON.stringify(toolData);
+                    const req = http.request({
+                        hostname: '127.0.0.1',
+                        port: 5681,
+                        path: '/expose_tool',
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Content-Length': Buffer.byteLength(postBody)
+                        },
+                        timeout: 10000
+                    }, (res) => {
+                        let body = '';
+                        res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+                        res.on('end', () => {
+                            try {
+                                const result = JSON.parse(body);
+                                if (result.error) {
+                                    vscode.window.showErrorMessage('MCP Tool Generation Failed: ' + result.error);
+                                } else {
+                                    const config = JSON.stringify({
+                                        [result.tool_name]: { command: 'python', args: [result.server_path] }
+                                    }, null, 2);
+                                    vscode.window.showInformationMessage(
+                                        'MCP Tool Created: ' + result.tool_name,
+                                        'Copy Config'
+                                    ).then(action => {
+                                        if (action === 'Copy Config') {
+                                            vscode.env.clipboard.writeText(config);
+                                        }
+                                    });
+                                }
+                            } catch (parseErr) {
+                                vscode.window.showErrorMessage('MCP Tool: Invalid response from Hub');
+                            }
+                        });
+                    });
+                    req.on('error', (err: Error) => {
+                        vscode.window.showErrorMessage('MCP Tool: Hub not reachable at :5681. Start TrueFlow Hub first.');
+                    });
+                    req.write(postBody);
+                    req.end();
+                } catch (err) {
+                    vscode.window.showErrorMessage('MCP Tool: Failed to connect to Hub');
+                }
+                break;
+            }
         }
     });
 
@@ -1448,6 +1523,127 @@ async function exportDiagram(): Promise<void> {
             vscode.window.showInformationMessage(`Diagram exported to ${saveUri.fsPath}`);
         }
     }
+}
+
+/**
+ * Editor context menu: "Expose as MCP Tool"
+ * Finds the enclosing Python function at the cursor and sends it to the Hub.
+ */
+async function exposeEditorFunctionAsMCPTool(): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.languageId !== 'python') {
+        vscode.window.showWarningMessage('Place cursor inside a Python function to expose as MCP tool.');
+        return;
+    }
+
+    const doc = editor.document;
+    const cursorLine = editor.selection.active.line;
+
+    // Search upward for enclosing def/async def
+    const defPattern = /^\s*(async\s+)?def\s+(\w+)\s*\(/;
+    let funcName: string | null = null;
+    let funcLine = 0;
+    let funcIndent = 0;
+
+    for (let line = cursorLine; line >= 0; line--) {
+        const text = doc.lineAt(line).text;
+        const match = defPattern.exec(text);
+        if (match) {
+            funcName = match[2];
+            funcLine = line + 1; // 1-based
+            funcIndent = text.length - text.trimStart().length;
+            break;
+        }
+    }
+
+    if (!funcName) {
+        vscode.window.showWarningMessage('No Python function found at cursor position.');
+        return;
+    }
+
+    // Check for enclosing class (less indentation above the def)
+    const classPattern = /^\s*class\s+(\w+)/;
+    let className: string | null = null;
+    if (funcIndent > 0) {
+        for (let line = funcLine - 2; line >= 0; line--) {
+            const text = doc.lineAt(line).text;
+            const lineIndent = text.length - text.trimStart().length;
+            if (lineIndent < funcIndent) {
+                const classMatch = classPattern.exec(text);
+                if (classMatch) {
+                    className = classMatch[1];
+                }
+                break;
+            }
+        }
+    }
+
+    const qualifiedFunc = className ? `${className}.${funcName}` : funcName;
+
+    // Derive module name from file path
+    const filePath = doc.uri.fsPath;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    let moduleName = filePath;
+    if (workspaceRoot && filePath.startsWith(workspaceRoot)) {
+        moduleName = filePath.substring(workspaceRoot.length);
+    }
+    moduleName = moduleName
+        .replace(/\\/g, '/')
+        .replace(/^\//, '')
+        .replace(/\.py$/, '')
+        .replace(/\/__init__$/, '')
+        .replace(/\//g, '.');
+
+    // POST to Hub
+    const http = await import('http');
+    const postBody = JSON.stringify({
+        function_name: qualifiedFunc,
+        module: moduleName,
+        file: filePath,
+        line: funcLine
+    });
+
+    const req = http.request({
+        hostname: '127.0.0.1',
+        port: 5681,
+        path: '/expose_tool',
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postBody)
+        },
+        timeout: 10000
+    }, (res) => {
+        let body = '';
+        res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+        res.on('end', () => {
+            try {
+                const result = JSON.parse(body);
+                if (result.error) {
+                    vscode.window.showErrorMessage('MCP Tool Generation Failed: ' + result.error);
+                } else {
+                    const config = JSON.stringify({
+                        [result.tool_name]: { command: 'python', args: [result.server_path] }
+                    }, null, 2);
+                    vscode.window.showInformationMessage(
+                        `MCP Tool Created: ${result.tool_name}`,
+                        'Copy Config'
+                    ).then(action => {
+                        if (action === 'Copy Config') {
+                            vscode.env.clipboard.writeText(config);
+                        }
+                    });
+                }
+            } catch {
+                vscode.window.showErrorMessage('MCP Tool: Invalid response from Hub');
+            }
+        });
+    });
+    req.on('error', () => {
+        vscode.window.showErrorMessage('MCP Tool: Hub not reachable at :5681. Start TrueFlow Hub first.');
+    });
+    req.write(postBody);
+    req.end();
 }
 
 function setupTraceWatcher(context: vscode.ExtensionContext): void {
@@ -2993,6 +3189,7 @@ function getTraceViewerHtml(initialTab?: string): string {
         // Refresh Interactive Explorer visualization (debounced)
         function refreshInteractiveExplorer() {
             buildExplorerData();
+            updateDeadCodeList();
             scheduleExplorerRender(true);
         }
 
@@ -3105,6 +3302,21 @@ function getTraceViewerHtml(initialTab?: string): string {
                 dead_functions: explorerData.deadFunctions,
                 why_not_covered: explorerData.whyNotCovered
             };
+
+            // Merge accumulated protocol data into function entries for explorer
+            for (const funcKey of Object.keys(vizData.functions)) {
+                const protos = functionProtocols.get(funcKey);
+                if (protos) {
+                    (vizData.functions as any)[funcKey].protocols = protos;
+                }
+                const fw = functionFrameworks.get(funcKey);
+                if (fw) {
+                    (vizData.functions as any)[funcKey].framework = fw;
+                }
+                if (functionAiAgents.has(funcKey)) {
+                    (vizData.functions as any)[funcKey].is_ai_agent = true;
+                }
+            }
 
             const funcCount = Object.keys(vizData.functions).length;
 
@@ -4704,6 +4916,238 @@ function getTraceViewerHtml(initialTab?: string): string {
             return div.innerHTML;
         }
 
+        // Dead Code list rendering with right-click context menu
+        let activeContextMenu = null;
+        function updateDeadCodeList() {
+            const container = document.getElementById('deadcode-list');
+            if (!container || !explorerData) return;
+
+            const allFuncs = explorerData.functions || {};
+            const deadSet = new Set(explorerData.deadFunctions || []);
+            const coveredSet = new Set(explorerData.coveredFunctions || []);
+            const whyNot = explorerData.whyNotCovered || {};
+
+            // Combine dead + alive into a sorted list
+            const rows = [];
+            for (const [funcKey, info] of Object.entries(allFuncs)) {
+                const isDead = deadSet.has(funcKey);
+                const isAlive = coveredSet.has(funcKey);
+                const status = isAlive ? 'ALIVE' : (isDead ? 'DEAD' : 'UNKNOWN');
+                const parts = funcKey.split('.');
+                const funcName = parts.pop() || funcKey;
+                const moduleName = parts.join('.') || info.module || '';
+                rows.push({
+                    status: status,
+                    module: moduleName,
+                    function: funcName,
+                    funcKey: funcKey,
+                    file: info.file || '',
+                    line: info.line || 0,
+                    callCount: info.callCount || 0,
+                    reason: whyNot[funcKey] ? whyNot[funcKey].reasons?.[0]?.explanation : ''
+                });
+            }
+
+            if (rows.length === 0) {
+                container.innerHTML = '<div class="placeholder"><p>Run your application with TrueFlow to detect uncovered functions.</p></div>';
+                return;
+            }
+
+            // Sort: DEAD first, then by module
+            rows.sort((a, b) => {
+                if (a.status !== b.status) return a.status === 'DEAD' ? -1 : 1;
+                return a.module.localeCompare(b.module) || a.function.localeCompare(b.function);
+            });
+
+            // Update dead count stat
+            const deadCountEl = document.getElementById('dead-count');
+            if (deadCountEl) deadCountEl.textContent = String(rows.filter(r => r.status === 'DEAD').length);
+
+            // Build table
+            let html = '<table class="data-table" style="width:100%;">';
+            html += '<thead><tr>';
+            html += '<th style="width:70px;">Status</th>';
+            html += '<th>Module</th>';
+            html += '<th>Function</th>';
+            html += '<th>File:Line</th>';
+            html += '<th style="width:60px;">Calls</th>';
+            html += '</tr></thead><tbody>';
+
+            rows.forEach(row => {
+                const statusColor = row.status === 'ALIVE' ? '#4ade80' : (row.status === 'DEAD' ? '#f87171' : '#888');
+                const statusBg = row.status === 'ALIVE' ? 'rgba(74,222,128,0.15)' : (row.status === 'DEAD' ? 'rgba(248,113,113,0.15)' : 'rgba(136,136,136,0.1)');
+                const fileLine = row.file ? (row.file + ':' + row.line) : '';
+                html += '<tr class="deadcode-row" data-funckey="' + escapeHtml(row.funcKey) + '" data-module="' + escapeHtml(row.module) + '" data-function="' + escapeHtml(row.function) + '" data-file="' + escapeHtml(row.file) + '" data-line="' + row.line + '" title="' + escapeHtml(row.reason || '') + '">';
+                html += '<td><span style="padding:2px 6px;border-radius:4px;font-size:10px;background:' + statusBg + ';color:' + statusColor + ';">' + row.status + '</span></td>';
+                html += '<td style="font-size:11px;color:#888;">' + escapeHtml(row.module) + '</td>';
+                html += '<td style="font-weight:500;">' + escapeHtml(row.function) + '</td>';
+                html += '<td style="font-size:11px;color:#888;">' + escapeHtml(fileLine) + '</td>';
+                html += '<td style="text-align:center;">' + row.callCount + '</td>';
+                html += '</tr>';
+            });
+
+            html += '</tbody></table>';
+            container.innerHTML = html;
+
+            // Attach right-click context menu to each row
+            container.querySelectorAll('.deadcode-row').forEach(rowEl => {
+                rowEl.addEventListener('contextmenu', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    showDeadCodeContextMenu(e, rowEl.dataset);
+                });
+            });
+        }
+
+        function showDeadCodeContextMenu(e, data) {
+            // Remove existing context menu if any
+            if (activeContextMenu) {
+                activeContextMenu.remove();
+                activeContextMenu = null;
+            }
+
+            const menu = document.createElement('div');
+            menu.style.cssText = 'position:fixed;z-index:10000;background:var(--vscode-menu-background,#252526);border:1px solid var(--vscode-menu-border,#454545);border-radius:4px;padding:4px 0;box-shadow:0 4px 12px rgba(0,0,0,0.5);min-width:180px;font-size:12px;';
+
+            // Expose as MCP Tool
+            const exposeItem = document.createElement('div');
+            exposeItem.textContent = 'Expose as MCP Tool';
+            exposeItem.style.cssText = 'padding:6px 20px;cursor:pointer;color:var(--vscode-menu-foreground,#ccc);';
+            exposeItem.addEventListener('mouseenter', () => { exposeItem.style.background = 'var(--vscode-menu-selectionBackground,#094771)'; });
+            exposeItem.addEventListener('mouseleave', () => { exposeItem.style.background = ''; });
+            exposeItem.addEventListener('click', () => {
+                vscode.postMessage({
+                    type: 'exposeMCPTool',
+                    data: {
+                        function_name: data.function,
+                        module: data.module,
+                        file: data.file,
+                        line: parseInt(data.line) || 0
+                    }
+                });
+                menu.remove();
+                activeContextMenu = null;
+            });
+            menu.appendChild(exposeItem);
+
+            // Separator
+            const sep = document.createElement('div');
+            sep.style.cssText = 'height:1px;background:var(--vscode-menu-separatorBackground,#454545);margin:4px 0;';
+            menu.appendChild(sep);
+
+            // Copy function name
+            const copyItem = document.createElement('div');
+            copyItem.textContent = 'Copy Function Name';
+            copyItem.style.cssText = 'padding:6px 20px;cursor:pointer;color:var(--vscode-menu-foreground,#ccc);';
+            copyItem.addEventListener('mouseenter', () => { copyItem.style.background = 'var(--vscode-menu-selectionBackground,#094771)'; });
+            copyItem.addEventListener('mouseleave', () => { copyItem.style.background = ''; });
+            copyItem.addEventListener('click', () => {
+                navigator.clipboard.writeText(data.funckey || (data.module + '.' + data.function));
+                menu.remove();
+                activeContextMenu = null;
+            });
+            menu.appendChild(copyItem);
+
+            // Position menu
+            menu.style.left = e.clientX + 'px';
+            menu.style.top = e.clientY + 'px';
+            document.body.appendChild(menu);
+            activeContextMenu = menu;
+
+            // Close on click outside
+            const closeHandler = (ev) => {
+                if (!menu.contains(ev.target)) {
+                    menu.remove();
+                    activeContextMenu = null;
+                    document.removeEventListener('click', closeHandler);
+                }
+            };
+            setTimeout(() => document.addEventListener('click', closeHandler), 10);
+        }
+
+        // Protocol data tracking
+        let sqlQueryCount = 0;
+        const sqlCallers = new Map();
+        const distributedEvents = [];
+
+        function updateProtocolData(event) {
+            const summary = event.protocol_summary || {};
+            const details = event.protocol_details || {};
+            const funcKey = event.module + '.' + event.function;
+
+            // Update SQL tab
+            if (summary.sql) {
+                sqlQueryCount += summary.sql;
+                sqlCallers.set(funcKey, (sqlCallers.get(funcKey) || 0) + summary.sql);
+
+                const sqlContainer = document.getElementById('sql-queries');
+                if (sqlContainer) {
+                    // Build live SQL view
+                    let html = '<div class="sql-stats">' +
+                        '<strong>Live SQL:</strong> ' + sqlQueryCount + ' queries from ' +
+                        sqlCallers.size + ' callers</div>';
+
+                    // Show callers with high query counts (potential N+1)
+                    const sortedCallers = Array.from(sqlCallers.entries())
+                        .sort((a, b) => b[1] - a[1]);
+
+                    html += '<table class="perf-table"><tr><th>Function</th><th>Queries</th><th>Detail</th></tr>';
+                    for (const [caller, count] of sortedCallers.slice(0, 20)) {
+                        const warning = count >= 10 ? ' sql-warning' : (count >= 5 ? ' sql-error' : '');
+                        html += '<tr class="' + warning + '"><td>' + escapeHtml(caller) +
+                            '</td><td>' + count + '</td><td>' +
+                            escapeHtml((details.sql || '').substring(0, 80)) + '</td></tr>';
+                    }
+                    html += '</table>';
+                    sqlContainer.innerHTML = html;
+                }
+            }
+
+            // Update distributed tab
+            for (const proto of ['websocket', 'webrtc', 'mcp', 'agent', 'process',
+                                  'grpc', 'graphql', 'mqtt', 'amqp', 'kafka', 'redis']) {
+                if (summary[proto]) {
+                    distributedEvents.push({
+                        protocol: proto,
+                        module: event.module,
+                        function: event.function,
+                        count: summary[proto],
+                        detail: details[proto] || funcKey + '()',
+                        timestamp: event.timestamp
+                    });
+                }
+            }
+
+            // Update distributed section if we have events
+            if (distributedEvents.length > 0) {
+                const distContainer = document.getElementById('distributed-content');
+                if (distContainer) {
+                    const recentEvents = distributedEvents.slice(-50);
+                    let html = '<div><strong>Live Distributed Events:</strong> ' +
+                        distributedEvents.length + ' total</div>';
+                    html += '<table class="perf-table"><tr><th>Protocol</th><th>Function</th>' +
+                        '<th>Count</th><th>Detail</th></tr>';
+                    for (const evt of recentEvents.reverse()) {
+                        html += '<tr><td>' + evt.protocol.toUpperCase() + '</td><td>' +
+                            escapeHtml(evt.module + '.' + evt.function) + '</td><td>' +
+                            evt.count + '</td><td>' +
+                            escapeHtml(evt.detail.substring(0, 80)) + '</td></tr>';
+                    }
+                    html += '</table>';
+                    // Update the distributed content area
+                    const existing = distContainer.querySelector('.live-distributed');
+                    if (existing) {
+                        existing.innerHTML = html;
+                    } else {
+                        const div = document.createElement('div');
+                        div.className = 'live-distributed';
+                        div.innerHTML = html;
+                        distContainer.prepend(div);
+                    }
+                }
+            }
+        }
+
         // Handle messages from extension
         window.addEventListener('message', event => {
             const message = event.data;
@@ -4745,6 +5189,11 @@ function getTraceViewerHtml(initialTab?: string): string {
                     callTrace.push(message.event);
                     if (callTrace.length > 1000) callTrace.shift();
                     updateCallTrace(callTrace);
+
+                    // Handle protocol detections from return events
+                    if (message.event.protocol_summary) {
+                        updateProtocolData(message.event);
+                    }
 
                     // Update diagram with active participants only (throttled)
                     if (eventCount % 10 === 0) {

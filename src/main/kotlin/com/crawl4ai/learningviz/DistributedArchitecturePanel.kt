@@ -331,61 +331,91 @@ class DistributedArchitecturePanel(private val project: Project) : JPanel(Border
         isProcess: Boolean
     ) {
         val timestamp = formatTimestamp(event.timestamp)
-        val eventData = "${event.module}.${event.function}() at ${event.file}:${event.line}"
+        // Use actual protocol detail when available, fall back to module.function()
+        val fallbackData = "${event.module}.${event.function}() at ${event.file}:${event.line}"
+        val details = event.protocolDetails
 
         // Add to appropriate table based on detected type
         val langPrefix = if (event.language != "python") "[${event.language}] " else ""
 
         if (isWebSocket) {
+            val wsDetail = details?.get("websocket")?.asString ?: fallbackData
             websocketModel.addRow(arrayOf(
                 langPrefix + event.module,
                 event.function,
-                "call", // Type (we only have call events from socket)
-                truncate(eventData, 100),
+                "call",
+                truncate(wsDetail, 100),
                 timestamp
             ))
         }
 
         if (isWebRTC) {
+            val rtcDetail = details?.get("webrtc")?.asString ?: fallbackData
             webrtcModel.addRow(arrayOf(
                 langPrefix + event.module,
                 event.function,
                 "call",
-                truncate(eventData, 100),
+                truncate(rtcDetail, 100),
                 timestamp
             ))
         }
 
         if (isMCP) {
+            val mcpDetail = details?.get("mcp")?.asString ?: fallbackData
             mcpModel.addRow(arrayOf(
                 langPrefix + event.module,
                 event.function,
-                "unknown", // Protocol (not available from basic trace)
-                truncate(eventData, 100),
+                "mcp",
+                truncate(mcpDetail, 100),
                 timestamp
             ))
         }
 
         if (isAgent) {
+            val agentDetail = details?.get("agent")?.asString ?: fallbackData
+            val framework = event.framework ?: "detected"
             agentModel.addRow(arrayOf(
                 langPrefix + event.module,
                 event.function,
-                "detected", // Framework
+                framework,
                 "call",
-                truncate(eventData, 100),
+                truncate(agentDetail, 100),
                 timestamp
             ))
         }
 
         if (isProcess) {
+            val procDetail = details?.get("process")?.asString
             processModel.addRow(arrayOf(
                 langPrefix + event.module,
                 event.function,
-                "spawn/fork",
+                procDetail ?: "spawn/fork",
                 event.processId,
                 event.sessionId + " [" + event.language + "]",
                 timestamp
             ))
+        }
+
+        // Also handle additional protocols detected by protocol_summary
+        // These don't have their own tabs but show in the most relevant existing tab
+        val summary = event.protocolSummary
+        if (summary != null) {
+            for (proto in listOf("grpc", "graphql", "mqtt", "amqp", "kafka", "redis",
+                                 "memcached", "elasticsearch", "sse", "http2", "thrift",
+                                 "zeromq", "nats")) {
+                if (summary.has(proto) && !isWebSocket && !isWebRTC && !isMCP && !isAgent && !isProcess) {
+                    val protoDetail = details?.get(proto)?.asString ?: fallbackData
+                    val count = summary.get(proto).asInt
+                    // Show in WebSocket tab as general network activity
+                    websocketModel.addRow(arrayOf(
+                        langPrefix + event.module,
+                        event.function,
+                        proto.uppercase(),
+                        truncate("[$count] $protoDetail", 100),
+                        timestamp
+                    ))
+                }
+            }
         }
 
         // Update stats label

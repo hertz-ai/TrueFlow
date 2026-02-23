@@ -22,7 +22,12 @@ class SessionSettings : PersistentStateComponent<SessionSettings.State> {
         var autoSaveEnabled: Boolean = true,
         var autoSaveIntervalMinutes: Int = 5,
         var autoRestoreOnStartup: Boolean = true,
-        var maxAutoSavedSessions: Int = 10
+        var maxAutoSavedSessions: Int = 10,
+        // Performance: reduces tracing overhead by skipping pattern detection
+        // and parameter extraction. Core functionality (dead code, call graphs,
+        // performance metrics, flamegraphs) is fully preserved.
+        // Only affects: Manim video parameter labels, file-based protocol annotations.
+        var lightweightMode: Boolean = false
     )
 
     private var myState = State()

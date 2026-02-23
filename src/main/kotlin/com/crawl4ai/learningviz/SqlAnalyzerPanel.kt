@@ -32,6 +32,11 @@ class SqlAnalyzerPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val queriesModel: DefaultTableModel
     private var sqlData: SqlAnalysisData? = null
 
+    // Live SQL tracking from socket events
+    private var liveSqlCount = 0
+    private val liveSqlPatterns = mutableSetOf<String>()
+    private val liveSqlCallers = mutableMapOf<String, Int>()  // function -> query count
+
     init {
         // Top stats panel
         val statsPanel = JPanel(FlowLayout(FlowLayout.LEFT))
@@ -73,6 +78,74 @@ class SqlAnalyzerPanel(private val project: Project) : JPanel(BorderLayout()) {
         add(splitPane, BorderLayout.CENTER)
 
         statsLabel.text = "No SQL analysis data loaded"
+    }
+
+    /**
+     * Update from live socket trace event containing protocol_summary with SQL data.
+     * Called from handleTraceEvent() when a return event has sql detections.
+     */
+    fun updateFromSocketTrace(event: TraceEvent) {
+        val sqlCount = event.protocolSummary?.get("sql")?.asInt ?: return
+        val sqlDetail = event.protocolDetails?.get("sql")?.asString ?: ""
+
+        // Accumulate live SQL stats
+        liveSqlCount += sqlCount
+        // Extract SQL command type (SELECT, INSERT, UPDATE, DELETE, etc.)
+        val cmdType = sqlDetail.trim().substringBefore(" ").uppercase()
+        if (cmdType.isNotEmpty()) {
+            liveSqlPatterns.add(cmdType)
+        }
+        val callerKey = "${event.module}.${event.function}"
+        liveSqlCallers[callerKey] = (liveSqlCallers[callerKey] ?: 0) + sqlCount
+
+        SwingUtilities.invokeLater {
+            // Add to queries table (reuse existing table for live data)
+            queriesModel.addRow(arrayOf(
+                truncate(sqlDetail, 200),
+                event.module,
+                event.function,
+                "${event.file}:${event.line}"
+            ))
+
+            // Live N+1 detection: same caller executing many queries
+            val callerCount = liveSqlCallers[callerKey] ?: 0
+            if (callerCount >= 5) {
+                // Check if we already have an issue row for this caller
+                var existingRow = -1
+                for (i in 0 until issuesModel.rowCount) {
+                    if (issuesModel.getValueAt(i, 1) == callerKey) {
+                        existingRow = i
+                        break
+                    }
+                }
+                if (existingRow >= 0) {
+                    issuesModel.setValueAt(callerCount, existingRow, 2)
+                } else {
+                    val severity = if (callerCount >= 20) "HIGH" else if (callerCount >= 10) "MEDIUM" else "LOW"
+                    issuesModel.addRow(arrayOf(
+                        severity,
+                        callerKey,
+                        callerCount,
+                        truncate(sqlDetail, 150),
+                        "Possible N+1: $callerKey executed $callerCount queries"
+                    ))
+                }
+            }
+
+            // Update stats
+            val patternStr = liveSqlPatterns.joinToString(", ")
+            statsLabel.text = "Live SQL | Total: $liveSqlCount | Patterns: $patternStr | Callers: ${liveSqlCallers.size}"
+            statsLabel.foreground = if (liveSqlCallers.values.any { it >= 10 }) JBColor.RED else JBColor.foreground()
+        }
+    }
+
+    /**
+     * Reset live SQL tracking state (e.g. on new session).
+     */
+    fun resetLiveState() {
+        liveSqlCount = 0
+        liveSqlPatterns.clear()
+        liveSqlCallers.clear()
     }
 
     fun loadSqlAnalysis(file: File) {

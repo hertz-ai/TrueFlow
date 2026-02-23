@@ -293,6 +293,13 @@ if HAS_MCP:
             # Lazy tool loading (for low-throughput LLMs)
             Tool(name="get_tool_categories", description="Get tool categories for lazy loading", inputSchema={"type": "object", "properties": {}, "required": []}),
             Tool(name="smart_query", description="Auto-classify and route query to appropriate tool", inputSchema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
+
+            # MCP Tool Generation (hub-local, no IDE needed)
+            Tool(name="expose_as_mcp_tool", description="Generate a standalone MCP server wrapping a function, making it callable by any MCP client. Works with any language TrueFlow supports.", inputSchema={"type": "object", "properties": {"function_name": {"type": "string", "description": "Function name, optionally qualified (e.g. ClassName.method)"}, "file": {"type": "string", "description": "Absolute path to the source file"}, "module": {"type": "string", "description": "Module/package name"}, "line": {"type": "integer", "description": "Line number of function definition"}, "strategy": {"type": "string", "enum": ["import", "embed", "proxy"], "default": "import", "description": "import=live link to original, embed=standalone copy, proxy=HTTP call to live server via /_trueflow/invoke"}, "server_url": {"type": "string", "description": "Target server URL for proxy strategy (e.g. http://localhost:8000)"}, "tool_name": {"type": "string", "description": "Custom tool name (optional)"}}, "required": ["function_name", "file"]}),
+            Tool(name="list_exposed_tools", description="List all functions that have been exposed as MCP tools", inputSchema={"type": "object", "properties": {}, "required": []}),
+            Tool(name="unexpose_mcp_tool", description="Remove a previously exposed MCP tool and delete its server file", inputSchema={"type": "object", "properties": {"tool_name": {"type": "string", "description": "Name of the tool to remove"}}, "required": ["tool_name"]}),
+            Tool(name="generate_openapi_spec", description="Generate OpenAPI 3.0 spec for all exposed functions. Works with any language.", inputSchema={"type": "object", "properties": {"server_url": {"type": "string", "default": "http://localhost:8000", "description": "Base URL of the running server"}}, "required": []}),
+            Tool(name="generate_mcp_client", description="Generate a standalone MCP client script for calling a generated MCP tool", inputSchema={"type": "object", "properties": {"tool_name": {"type": "string", "description": "Name of the exposed tool"}}, "required": ["tool_name"]}),
         ]
 
     @mcp_server.call_tool()
@@ -344,13 +351,31 @@ async def _route_tool(name: str, args: dict) -> str:
                 "video": {"tools": ["manim_generate_video", "manim_list_videos"], "requires_ide": True},
                 "sessions": {"tools": ["save_trace_session", "list_trace_sessions", "restore_trace_session"], "requires_ide": True},
                 "ai": {"tools": ["ai_server_start", "ai_server_stop", "ai_server_status"], "requires_ide": False},
-                "hub": {"tools": ["list_projects", "get_project_info"], "requires_ide": False}
+                "hub": {"tools": ["list_projects", "get_project_info"], "requires_ide": False},
+                "mcp_tools": {"tools": ["expose_as_mcp_tool", "list_exposed_tools", "unexpose_mcp_tool", "generate_openapi_spec", "generate_mcp_client"], "requires_ide": False}
             },
             "note": "Most tools require an IDE (PyCharm/IntelliJ IDEA/VS Code) with TrueFlow plugin connected."
         }, indent=2)
 
     if name == "smart_query":
         return await _smart_query(args.get("query", ""))
+
+    # === MCP Tool Generation (hub-local, no IDE needed) ===
+
+    if name == "expose_as_mcp_tool":
+        return await _expose_as_mcp_tool(args)
+
+    if name == "list_exposed_tools":
+        return await _list_exposed_tools()
+
+    if name == "unexpose_mcp_tool":
+        return await _unexpose_mcp_tool(args.get("tool_name", ""))
+
+    if name == "generate_openapi_spec":
+        return await _generate_openapi_spec(args)
+
+    if name == "generate_mcp_client":
+        return await _generate_mcp_client(args)
 
     # === AI server tools (hub can manage directly) ===
 
@@ -400,6 +425,201 @@ async def _route_tool(name: str, args: dict) -> str:
         }, indent=2)
 
     return json.dumps(response, indent=2)
+
+
+# ============================================================================
+# MCP TOOL GENERATION (hub-local, no IDE needed)
+# ============================================================================
+
+async def _expose_as_mcp_tool(args: dict) -> str:
+    """Generate a standalone MCP server wrapping a Python function."""
+    function_name = args.get("function_name", "")
+    file_path = args.get("file", "")
+
+    if not function_name or not file_path:
+        return json.dumps({"error": "function_name and file are required"})
+
+    if not os.path.isfile(file_path):
+        return json.dumps({"error": f"File not found: {file_path}"})
+
+    strategy = args.get("strategy", "import")
+    tool_name_override = args.get("tool_name", None)
+    module_name = args.get("module", "")
+
+    try:
+        # Import generator and scanner (they live alongside this file)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+
+        from project_scanner import ProjectScanner
+        from mcp_tool_generator import MCPToolGenerator
+
+        # Determine project root from the file path
+        project_root = str(state.project_dir) if state.project_dir else os.path.dirname(file_path)
+
+        # Extract function metadata via AST
+        scanner = ProjectScanner(project_root)
+        metadata = scanner.extract_function_metadata(file_path, function_name)
+
+        if metadata is None:
+            return json.dumps({"error": f"Function '{function_name}' not found in {file_path}"})
+
+        # Generate the MCP server
+        server_url = args.get("server_url", None)
+        generator = MCPToolGenerator()
+        result = generator.generate(
+            metadata, file_path, function_name,
+            strategy=strategy,
+            tool_name_override=tool_name_override,
+            project_root=project_root,
+            server_url=server_url
+        )
+
+        if "error" in result:
+            return json.dumps(result)
+
+        logger.info(f"MCP tool generated: {result['tool_name']} -> {result['server_path']}")
+
+        # Broadcast to connected IDEs
+        await broadcast("tool_exposed", {
+            "tool_name": result["tool_name"],
+            "function_name": function_name,
+            "server_path": result["server_path"],
+            "strategy": strategy
+        })
+
+        return json.dumps(result, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Failed to generate MCP tool: {e}")
+        return json.dumps({"error": str(e)})
+
+
+async def _list_exposed_tools() -> str:
+    """List all functions that have been exposed as MCP tools."""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+
+        from mcp_tool_generator import MCPToolGenerator
+        generator = MCPToolGenerator()
+        tools = generator.list_exposed_tools()
+        return json.dumps({"tools": tools, "count": len(tools)}, indent=2, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+async def _unexpose_mcp_tool(tool_name: str) -> str:
+    """Remove a previously exposed MCP tool."""
+    if not tool_name:
+        return json.dumps({"error": "tool_name is required"})
+
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+
+        from mcp_tool_generator import MCPToolGenerator
+        generator = MCPToolGenerator()
+        result = generator.unexpose_tool(tool_name)
+
+        if "error" not in result:
+            logger.info(f"MCP tool removed: {tool_name}")
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+async def _generate_openapi_spec(args: dict) -> str:
+    """Generate OpenAPI 3.0 spec for all exposed functions."""
+    server_url = args.get("server_url", "http://localhost:8000")
+
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+
+        from mcp_tool_generator import MCPToolGenerator
+        generator = MCPToolGenerator()
+
+        # Gather all exposed tools from registry
+        tools = generator.list_exposed_tools()
+        if not tools:
+            return json.dumps({"error": "No tools exposed yet. Use expose_as_mcp_tool first."})
+
+        functions = []
+        for tool_name, tool_info in tools.items():
+            functions.append({
+                "function_name": tool_info.get("function_name", tool_name),
+                "metadata": {"parameters": [], "is_async": False, "is_method": False,
+                             "docstring": "", **(tool_info.get("input_schema_meta", {}))},
+                "source_file": tool_info.get("source_file", ""),
+                "language": tool_info.get("language", "python"),
+            })
+            # If input_schema is stored, reconstruct parameter info
+            schema = tool_info.get("input_schema", {})
+            if schema.get("properties"):
+                params = []
+                required = schema.get("required", [])
+                for pname, pschema in schema["properties"].items():
+                    params.append({
+                        "name": pname,
+                        "annotation": pschema.get("type", "string"),
+                        "has_default": pname not in required,
+                        "default": str(pschema.get("default", "")) if "default" in pschema else None
+                    })
+                functions[-1]["metadata"]["parameters"] = params
+
+        result = generator.generate_openapi_spec(functions, server_url=server_url)
+
+        if "error" in result:
+            return json.dumps(result)
+
+        logger.info(f"OpenAPI spec generated: {result['spec_path']}")
+        return json.dumps({
+            "spec_path": result["spec_path"],
+            "function_count": len(functions),
+            "server_url": server_url,
+            "swagger_hint": f"Open {result['spec_path']} in https://editor.swagger.io"
+        }, indent=2)
+
+    except Exception as e:
+        logger.error(f"Failed to generate OpenAPI spec: {e}")
+        return json.dumps({"error": str(e)})
+
+
+async def _generate_mcp_client(args: dict) -> str:
+    """Generate a standalone MCP client for calling an exposed tool."""
+    tool_name = args.get("tool_name", "")
+    if not tool_name:
+        return json.dumps({"error": "tool_name is required"})
+
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+
+        from mcp_tool_generator import MCPToolGenerator
+        generator = MCPToolGenerator()
+        result = generator.generate_mcp_client(tool_name)
+
+        if "error" in result:
+            return json.dumps(result)
+
+        logger.info(f"MCP client generated: {result['client_path']}")
+        return json.dumps({
+            "client_path": result["client_path"],
+            "tool_name": tool_name,
+            "usage_cli": f"python {result['client_path']} --arg1 value1",
+            "usage_library": f"from mcp_client_{tool_name} import call_{tool_name}"
+        }, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Failed to generate MCP client: {e}")
+        return json.dumps({"error": str(e)})
 
 
 # ============================================================================
@@ -588,7 +808,8 @@ async def run_sse_mcp_server():
                 "search_function", "get_call_graph", "get_callers",
                 "get_callees", "get_source_code", "get_project_structure",
                 "get_why_not_covered", "ai_server_start", "ai_server_stop",
-                "ai_server_status",
+                "ai_server_status", "expose_as_mcp_tool", "list_exposed_tools",
+                "unexpose_mcp_tool", "generate_openapi_spec", "generate_mcp_client",
             ],
             "projects": list(state.projects.keys()),
             "health": f"http://127.0.0.1:{MCP_SSE_PORT}/health",
@@ -611,11 +832,61 @@ async def run_sse_mcp_server():
             "count": len(state.projects),
         })
 
+    async def handle_expose_tool(request):
+        """HTTP endpoint: generate MCP server from a function."""
+        try:
+            data = await request.json()
+            result = await _expose_as_mcp_tool(data)
+            return JSONResponse(json.loads(result))
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    async def handle_exposed_tools(request):
+        """HTTP endpoint: list all exposed MCP tools."""
+        try:
+            result = await _list_exposed_tools()
+            return JSONResponse(json.loads(result))
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    async def handle_unexpose_tool(request):
+        """HTTP endpoint: remove an exposed MCP tool."""
+        try:
+            data = await request.json()
+            tool_name = data.get("tool_name", "")
+            result = await _unexpose_mcp_tool(tool_name)
+            return JSONResponse(json.loads(result))
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    async def handle_generate_openapi(request):
+        """HTTP endpoint: generate OpenAPI spec for all exposed functions."""
+        try:
+            data = await request.json() if request.method == "POST" else {}
+            result = await _generate_openapi_spec(data)
+            return JSONResponse(json.loads(result))
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    async def handle_generate_client(request):
+        """HTTP endpoint: generate MCP client for a tool."""
+        try:
+            data = await request.json()
+            result = await _generate_mcp_client(data)
+            return JSONResponse(json.loads(result))
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     app = Starlette(
         routes=[
             Route("/health", handle_health),
             Route("/projects", handle_projects),
             Route("/.well-known/mcp", handle_well_known_mcp),
+            Route("/expose_tool", handle_expose_tool, methods=["POST"]),
+            Route("/exposed_tools", handle_exposed_tools),
+            Route("/unexpose_tool", handle_unexpose_tool, methods=["POST"]),
+            Route("/generate_openapi", handle_generate_openapi, methods=["GET", "POST"]),
+            Route("/generate_client", handle_generate_client, methods=["POST"]),
             Route("/sse", handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
         ],

@@ -2249,7 +2249,10 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
         whyNotCovered: Map<String, WhyNotCoveredInfo>,
         resolvedCallGraph: Map<String, List<String>> = emptyMap(),  // Static call graph for cross-class connections
         classInstantiationOrder: Map<String, Double> = emptyMap(),  // className -> first init timestamp (for ordering)
-        functionFirstCalledTimestamp: Map<String, Double> = emptyMap()  // funcKey -> first call timestamp
+        functionFirstCalledTimestamp: Map<String, Double> = emptyMap(),  // funcKey -> first call timestamp
+        functionProtocols: Map<String, Map<String, Int>> = emptyMap(),  // funcKey -> {proto -> count}
+        functionFrameworks: Map<String, String> = emptyMap(),  // funcKey -> framework name
+        functionAiAgents: Set<String> = emptySet()  // funcKeys that are AI agents
     ) {
         val coveredFunctions = calledFunctions.keys.toList()
         val deadFunctions = allFunctions.filter { it !in calledFunctions.keys }
@@ -2262,7 +2265,10 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                 "file" to file,
                 "call_count" to (calledFunctions[func] ?: 0),
                 "first_called" to (functionFirstCalledTimestamp[func]),  // When this function was first invoked
-                "branches" to emptyList<Any>()  // Will be populated by branch analyzer
+                "branches" to emptyList<Any>(),  // Will be populated by branch analyzer
+                "protocols" to (functionProtocols[func] ?: emptyMap<String, Int>()),
+                "framework" to functionFrameworks[func],
+                "is_ai_agent" to (func in functionAiAgents)
             )
         }
 

@@ -1133,6 +1133,12 @@ fn handle_request(req: Request) -> Response {
                     envVars["CRAWL4AI_TRACE_DIR"] = traceDir
                     envVars["PYTHONPATH"] = runtimeInjectorDir
 
+                    // Lightweight mode from settings (reduces tracing CPU overhead)
+                    val sessionSettings = SessionSettings.getInstance(project)
+                    if (sessionSettings.state.lightweightMode) {
+                        envVars["PYCHARM_PLUGIN_LIGHTWEIGHT_MODE"] = "1"
+                    }
+
                     if (modulesToTrace.isNotEmpty()) {
                         envVars["CRAWL4AI_TRACE_MODULES"] = modulesToTrace.joinToString(",")
                     }

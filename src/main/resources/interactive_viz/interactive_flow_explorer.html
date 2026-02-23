@@ -1036,6 +1036,21 @@
                 <div class="legend-color" style="background: rgba(239, 68, 68, 0.3); border: 1px solid #ef4444;"></div>
                 <span>Dead Class</span>
             </div>
+            <div style="border-top: 1px solid #4a4a6a; margin: 8px 0; padding-top: 8px;">
+                <div style="font-size: 10px; color: #888; margin-bottom: 4px;">PROTOCOL TAGS</div>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #38bdf8; border-radius: 50%; height: 6px; margin-top: 4px;"></div>
+                <span>SQL / Database</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #a78bfa; border-radius: 50%; border: 2px solid #a78bfa; background: transparent; box-sizing: border-box;"></div>
+                <span>WebSocket / MCP / gRPC</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #4ec9b0;"></div>
+                <span>AI Agent Function</span>
+            </div>
         </div>
 
         <div id="controls-hint">
@@ -1453,6 +1468,21 @@
                             <span class="tooltip-meta-label">First Called:</span>
                             <span class="tooltip-meta-value">${firstCalledText}</span>
                         </div>
+                        ${(() => {
+                            const protocols = info.protocols || {};
+                            const protoKeys = Object.keys(protocols);
+                            if (protoKeys.length === 0 && !info.framework && !info.is_ai_agent) return '';
+                            const protoColors = {sql:'#38bdf8',websocket:'#a78bfa',mcp:'#c084fc',grpc:'#818cf8',graphql:'#f472b6',http:'#fb923c',redis:'#ef4444',kafka:'#22c55e',mqtt:'#14b8a6',elasticsearch:'#fbbf24',sse:'#e879f9',amqp:'#f97316'};
+                            let badges = '<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:2px;">';
+                            protoKeys.forEach(p => {
+                                const c = protoColors[p] || '#6b7280';
+                                badges += '<span style="background:' + c + ';color:#fff;padding:1px 5px;border-radius:8px;font-size:9px;">' + p.toUpperCase() + ' ' + protocols[p] + 'x</span>';
+                            });
+                            if (info.framework) badges += '<span style="background:#334155;color:#94a3b8;padding:1px 5px;border-radius:8px;font-size:9px;">' + info.framework + '</span>';
+                            if (info.is_ai_agent) badges += '<span style="background:#065f46;color:#4ec9b0;padding:1px 5px;border-radius:8px;font-size:9px;">AI Agent</span>';
+                            badges += '</div>';
+                            return badges;
+                        })()}
                         <div class="tooltip-nav">
                             <div class="tooltip-nav-btn ${parent ? '' : 'disabled'}" data-action="parent" data-target="${parent || ''}">
                                 <span class="nav-icon parent">↑</span>
@@ -3349,6 +3379,39 @@
                     mesh.add(ring);
                 }
 
+                // Protocol visual markers (from live trace data)
+                if (info.protocols) {
+                    const protos = info.protocols;
+                    // SQL/Database: small cyan disk below node
+                    if (protos.sql || protos.redis || protos.elasticsearch || protos.memcached) {
+                        const diskGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.1, 12);
+                        const diskMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.9 });
+                        const disk = new THREE.Mesh(diskGeo, diskMat);
+                        disk.position.y = -0.7;
+                        disk.renderOrder = 3;
+                        mesh.add(disk);
+                    }
+                    // Network protocols: purple ring above node
+                    if (protos.websocket || protos.mcp || protos.grpc || protos.graphql || protos.mqtt || protos.amqp || protos.kafka) {
+                        const netRingGeo = new THREE.TorusGeometry(0.5, 0.04, 6, 16);
+                        const netRingMat = new THREE.MeshBasicMaterial({ color: 0xa78bfa, transparent: true, opacity: 0.85 });
+                        const netRing = new THREE.Mesh(netRingGeo, netRingMat);
+                        netRing.rotation.x = Math.PI / 2;
+                        netRing.position.y = 0.6;
+                        netRing.renderOrder = 3;
+                        mesh.add(netRing);
+                    }
+                }
+                // AI Agent: small teal sphere indicator
+                if (info.is_ai_agent) {
+                    const agentGeo = new THREE.SphereGeometry(0.15, 8, 8);
+                    const agentMat = new THREE.MeshBasicMaterial({ color: 0x4ec9b0 });
+                    const agentSphere = new THREE.Mesh(agentGeo, agentMat);
+                    agentSphere.position.set(0.9, 0.5, 0);
+                    agentSphere.renderOrder = 3;
+                    mesh.add(agentSphere);
+                }
+
                 // Set node render order (after edges)
                 mesh.renderOrder = 2;
 
@@ -4059,6 +4122,26 @@
 
                     if (data.info.branches && data.info.branches.length > 0) {
                         html += `<div class="info-row"><span class="info-label">Branches:</span><span class="info-value">${data.info.branches.length}</span></div>`;
+                    }
+
+                    // Protocol Activity section
+                    const protocols = data.info.protocols || {};
+                    const protoKeys = Object.keys(protocols);
+                    if (protoKeys.length > 0 || data.info.framework || data.info.is_ai_agent) {
+                        html += '<div class="why-section" style="border-color: rgba(56, 189, 248, 0.4);">';
+                        html += '<h4 style="color: #38bdf8;">Protocol Activity</h4>';
+                        const protoColors = {sql:'#38bdf8',websocket:'#a78bfa',mcp:'#c084fc',grpc:'#818cf8',graphql:'#f472b6',http:'#fb923c',redis:'#ef4444',kafka:'#22c55e',mqtt:'#14b8a6',elasticsearch:'#fbbf24',sse:'#e879f9',amqp:'#f97316',webrtc:'#06b6d4',thrift:'#d946ef',zeromq:'#84cc16',nats:'#0ea5e9',memcached:'#f59e0b'};
+                        protoKeys.forEach(p => {
+                            const c = protoColors[p] || '#7dd3fc';
+                            html += `<div class="reason" style="color: ${c};">${p.toUpperCase()}: ${protocols[p]} call(s)</div>`;
+                        });
+                        if (data.info.framework) {
+                            html += `<div style="font-size: 10px; color: #999; margin-top: 4px;">Framework: ${data.info.framework}</div>`;
+                        }
+                        if (data.info.is_ai_agent) {
+                            html += '<div style="font-size: 10px; color: #4ec9b0; margin-top: 2px;">AI Agent Function</div>';
+                        }
+                        html += '</div>';
                     }
                 }
 

@@ -14,6 +14,7 @@ class SettingsConfigurable(private val project: Project) : Configurable {
     private lateinit var autoSaveIntervalSpinner: JSpinner
     private lateinit var autoRestoreCheckbox: JCheckBox
     private lateinit var maxSessionsSpinner: JSpinner
+    private lateinit var lightweightModeCheckbox: JCheckBox
 
     override fun getDisplayName(): String = "TrueFlow"
 
@@ -66,8 +67,24 @@ class SettingsConfigurable(private val project: Project) : Configurable {
         maxSessionsSpinner.toolTipText = "Oldest auto-saves are deleted when this limit is reached"
         panel.add(maxSessionsSpinner, gbc)
 
+        // Performance section header
+        gbc.gridx = 0; gbc.gridy = 6; gbc.gridwidth = 2
+        gbc.insets = JBUI.insets(12, 4, 4, 4)
+        panel.add(JLabel("<html><b>Performance</b></html>"), gbc)
+        gbc.insets = JBUI.insets(4)
+
+        // Lightweight mode
+        gbc.gridy = 7; gbc.gridwidth = 2
+        lightweightModeCheckbox = JCheckBox("Lightweight Mode", state.lightweightMode)
+        lightweightModeCheckbox.toolTipText =
+            "<html>Reduces tracing CPU overhead by skipping parameter extraction and protocol detection.<br>" +
+            "Core features (dead code, call graphs, performance, flamegraphs) are fully preserved.<br>" +
+            "Only affects: Manim video parameter labels and file-based protocol annotations.<br>" +
+            "Takes effect on next traced process launch (or live via toolbar toggle).</html>"
+        panel.add(lightweightModeCheckbox, gbc)
+
         // Spacer
-        gbc.gridx = 0; gbc.gridy = 6; gbc.gridwidth = 2; gbc.weighty = 1.0
+        gbc.gridx = 0; gbc.gridy = 8; gbc.gridwidth = 2; gbc.weighty = 1.0
         gbc.fill = GridBagConstraints.BOTH
         panel.add(JPanel(), gbc)
 
@@ -80,17 +97,22 @@ class SettingsConfigurable(private val project: Project) : Configurable {
         return autoSaveCheckbox.isSelected != state.autoSaveEnabled ||
                 (autoSaveIntervalSpinner.value as Int) != state.autoSaveIntervalMinutes ||
                 autoRestoreCheckbox.isSelected != state.autoRestoreOnStartup ||
-                (maxSessionsSpinner.value as Int) != state.maxAutoSavedSessions
+                (maxSessionsSpinner.value as Int) != state.maxAutoSavedSessions ||
+                lightweightModeCheckbox.isSelected != state.lightweightMode
     }
 
     override fun apply() {
         val settings = SessionSettings.getInstance(project)
+        val newLightweight = lightweightModeCheckbox.isSelected
         settings.loadState(SessionSettings.State(
             autoSaveEnabled = autoSaveCheckbox.isSelected,
             autoSaveIntervalMinutes = autoSaveIntervalSpinner.value as Int,
             autoRestoreOnStartup = autoRestoreCheckbox.isSelected,
-            maxAutoSavedSessions = maxSessionsSpinner.value as Int
+            maxAutoSavedSessions = maxSessionsSpinner.value as Int,
+            lightweightMode = newLightweight
         ))
+        // Write config file so running Python processes can pick it up
+        writeLightweightConfig(newLightweight)
     }
 
     override fun reset() {
@@ -99,6 +121,18 @@ class SettingsConfigurable(private val project: Project) : Configurable {
         autoSaveIntervalSpinner.value = state.autoSaveIntervalMinutes
         autoRestoreCheckbox.isSelected = state.autoRestoreOnStartup
         maxSessionsSpinner.value = state.maxAutoSavedSessions
+        lightweightModeCheckbox.isSelected = state.lightweightMode
+    }
+
+    private fun writeLightweightConfig(enabled: Boolean) {
+        try {
+            val configDir = java.io.File("${project.basePath}/.trueflow")
+            configDir.mkdirs()
+            val configFile = java.io.File(configDir, "performance_config.json")
+            configFile.writeText("""{"lightweight_mode": $enabled}""")
+        } catch (_: Exception) {
+            // Non-critical
+        }
     }
 
     override fun disposeUIResources() {

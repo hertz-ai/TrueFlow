@@ -2,7 +2,7 @@
   "name": "trueflow",
   "displayName": "TrueFlow - Deterministic Code Visualizer",
   "description": "Unblackbox LLM code with deterministic truth. Zero-code Python runtime instrumentation with 3D animated execution videos.",
-  "version": "0.1.596",
+  "version": "0.1.605",
   "publisher": "hevolve-ai",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -60,6 +60,11 @@
         "command": "trueflow.exportDiagram",
         "title": "TrueFlow: Export Diagram",
         "icon": "$(export)"
+      },
+      {
+        "command": "trueflow.exposeAsMCPTool",
+        "title": "TrueFlow: Expose as MCP Tool",
+        "icon": "$(plug)"
       },
       {
         "command": "trueflow.connectSocket",
@@ -203,6 +208,11 @@
         {
           "when": "editorLangId == python",
           "command": "trueflow.autoIntegrate",
+          "group": "trueflow"
+        },
+        {
+          "when": "editorLangId == python",
+          "command": "trueflow.exposeAsMCPTool",
           "group": "trueflow"
         }
       ],
