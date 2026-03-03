@@ -346,7 +346,9 @@ class LlamaCppServer:
             return None
 
         # Check various possible locations
+        # Windows CMake with --config Release puts binaries in build/bin/Release/
         possible_names = [
+            self.llama_cpp_path / "build" / "bin" / "Release" / "llama-server.exe",
             self.llama_cpp_path / "build" / "bin" / "llama-server",
             self.llama_cpp_path / "build" / "bin" / "llama-server.exe",
             self.llama_cpp_path / "llama-server",
@@ -385,9 +387,16 @@ class LlamaCppServer:
                     capture_output=True, text=True, timeout=5
                 )
                 output = (result.stdout + result.stderr).strip()
-                # Parse build number from output like "version: 4067 (b4067)"
-                # or "llama-server version b8184"
+                # Parse build number from output like:
+                #   "version: 8192 (137435ff1)"  (pre-built release)
+                #   "version: 4067 (b4067)"      (older format)
+                #   "llama-server version b8184"  (legacy)
                 import re
+                # Try "version: NNNN" first (pre-built releases)
+                match = re.search(r'version:\s*(\d{4,})', output)
+                if match:
+                    return int(match.group(1))
+                # Try "bNNNN" format (source builds, git tags)
                 match = re.search(r'b(\d{4,})', output)
                 if match:
                     return int(match.group(1))
@@ -450,55 +459,100 @@ class LlamaCppServer:
         progress_callback: Optional[Callable[[str, float], None]] = None
     ) -> bool:
         """
-        Update llama.cpp to the latest version via git pull + rebuild.
+        Update llama.cpp to the latest pre-built release from GitHub.
 
-        If llama.cpp is not installed, falls back to install_llama_cpp().
+        Downloads pre-built binaries (much faster than building from source).
+        Falls back to install_llama_cpp() for fresh installs.
         """
+        import zipfile
+        import shutil
+        import urllib.request
+        import json
+        import re
+
         def report(msg: str, pct: float):
             logger.info(f"{msg} ({pct:.1f}%)")
             if progress_callback:
                 progress_callback(msg, pct)
 
         install_dir = Path.home() / ".trueflow" / "llama.cpp"
-
-        # If not installed yet, do a fresh install
-        if not install_dir.exists() or not (install_dir / ".git").exists():
-            report("No existing installation found, doing fresh install...", 0)
-            return self.install_llama_cpp(progress_callback)
+        bin_dir = install_dir / "build" / "bin" / "Release"
 
         old_version = self.get_version()
         report(f"Current build: b{old_version}" if old_version else "Current build: unknown", 0)
 
         try:
-            # Fetch latest and reset to origin (since we use --depth 1)
-            report("Fetching latest llama.cpp...", 10)
-            subprocess.run(
-                ["git", "fetch", "--depth", "1", "origin"],
-                cwd=str(install_dir), check=True, capture_output=True
-            )
-            subprocess.run(
-                ["git", "reset", "--hard", "origin/HEAD"],
-                cwd=str(install_dir), check=True, capture_output=True
-            )
-            report("Source updated", 30)
+            # Fetch latest release info from GitHub API
+            report("Checking latest release...", 10)
+            api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "TrueFlow"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                release = json.loads(resp.read().decode())
 
-            # Rebuild
-            report("Rebuilding llama.cpp...", 40)
-            build_dir = install_dir / "build"
-            build_dir.mkdir(exist_ok=True)
+            tag = release.get("tag_name", "")
+            tag_match = re.search(r'b?(\d{4,})', tag)
+            new_build = int(tag_match.group(1)) if tag_match else None
 
-            cmake_args = [
-                "cmake", "..",
-                "-DBUILD_SHARED_LIBS=OFF",
-                "-DGGML_CUDA=OFF",
-                "-DLLAMA_CURL=OFF",
-            ]
-            subprocess.run(cmake_args, cwd=str(build_dir), check=True, capture_output=True)
-            report("CMake configured", 60)
+            if old_version and new_build and old_version >= new_build:
+                report(f"Already up to date (b{old_version})", 100)
+                return True
 
-            build_args = ["cmake", "--build", ".", "--config", "Release", "-j"]
-            subprocess.run(build_args, cwd=str(build_dir), check=True, capture_output=True)
-            report("Build complete", 90)
+            # Find the right asset for this platform
+            import platform
+            os_name = sys.platform
+            arch = platform.machine().lower()
+
+            if os_name == "win32":
+                asset_pattern = f"llama-{tag}-bin-win-cpu-x64.zip"
+            elif os_name == "darwin":
+                asset_pattern = f"llama-{tag}-bin-macos-arm64.zip"
+            else:
+                asset_pattern = f"llama-{tag}-bin-ubuntu-x64.zip"
+
+            download_url = None
+            asset_name = None
+            for asset in release.get("assets", []):
+                if asset["name"] == asset_pattern:
+                    download_url = asset["browser_download_url"]
+                    asset_name = asset["name"]
+                    break
+
+            if not download_url:
+                logger.error(f"No matching asset found for pattern: {asset_pattern}")
+                return False
+
+            report(f"Downloading {asset_name}...", 20)
+
+            # Download
+            install_dir.mkdir(parents=True, exist_ok=True)
+            zip_path = install_dir / asset_name
+            urllib.request.urlretrieve(download_url, str(zip_path))
+            report("Download complete", 60)
+
+            # Extract to build/bin/Release
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            report("Extracting binaries...", 70)
+
+            with zipfile.ZipFile(str(zip_path), 'r') as zf:
+                # Get prefix directory from archive
+                names = zf.namelist()
+                prefix = ""
+                if names and "/" in names[0]:
+                    prefix = names[0].split("/")[0] + "/"
+
+                for name in names:
+                    if name.endswith("/"):
+                        continue
+                    basename = name[len(prefix):] if prefix else name
+                    if not basename:
+                        continue
+                    dest = bin_dir / basename
+                    with zf.open(name) as src:
+                        with open(str(dest), 'wb') as dst:
+                            dst.write(src.read())
+
+            zip_path.unlink()
+            report("Extracted", 85)
 
             self.llama_cpp_path = install_dir
             new_version = self.get_version()
@@ -507,9 +561,6 @@ class LlamaCppServer:
             report(version_msg, 100)
             return True
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Update failed: {e.stderr.decode() if e.stderr else str(e)}")
-            return False
         except Exception as e:
             logger.error(f"Update failed: {e}")
             return False
@@ -519,59 +570,113 @@ class LlamaCppServer:
         progress_callback: Optional[Callable[[str, float], None]] = None
     ) -> bool:
         """
-        Install llama.cpp from source (CPU-only build).
+        Install llama.cpp by downloading the latest pre-built release from GitHub.
 
-        This builds llama.cpp for CPU inference without CUDA.
+        No build toolchain (cmake, compiler) required — downloads ready-to-run binaries.
+        Auto-detects platform (Windows/macOS/Linux) and downloads the appropriate build.
         """
+        import zipfile
+        import shutil
+        import urllib.request
+        import json
+        import re
+        import platform
+
         def report(msg: str, pct: float):
             logger.info(f"{msg} ({pct:.1f}%)")
             if progress_callback:
                 progress_callback(msg, pct)
 
         install_dir = Path.home() / ".trueflow" / "llama.cpp"
+        bin_dir = install_dir / "build" / "bin" / "Release"
 
         try:
-            report("Cloning llama.cpp repository...", 0)
+            # Fetch latest release info
+            report("Checking latest llama.cpp release...", 5)
+            api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "TrueFlow"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                release = json.loads(resp.read().decode())
 
-            # Clone repo
-            if install_dir.exists():
-                shutil.rmtree(install_dir)
+            tag = release.get("tag_name", "")
+            report(f"Latest release: {tag}", 10)
 
-            subprocess.run(
-                ["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp", str(install_dir)],
-                check=True,
-                capture_output=True
-            )
-            report("Repository cloned", 20)
+            # Determine asset name for this platform
+            os_name = sys.platform
+            if os_name == "win32":
+                asset_pattern = f"llama-{tag}-bin-win-cpu-x64.zip"
+            elif os_name == "darwin":
+                asset_pattern = f"llama-{tag}-bin-macos-arm64.zip"
+            else:
+                asset_pattern = f"llama-{tag}-bin-ubuntu-x64.zip"
 
-            # Build (CPU-only)
-            report("Building llama.cpp (CPU-only)...", 30)
+            # Find download URL
+            download_url = None
+            asset_name = None
+            for asset in release.get("assets", []):
+                if asset["name"] == asset_pattern:
+                    download_url = asset["browser_download_url"]
+                    asset_name = asset["name"]
+                    break
 
-            build_dir = install_dir / "build"
-            build_dir.mkdir(exist_ok=True)
+            if not download_url:
+                logger.error(f"No pre-built binary found for this platform: {asset_pattern}")
+                return False
 
-            # CMake configure
-            cmake_args = [
-                "cmake", "..",
-                "-DBUILD_SHARED_LIBS=OFF",
-                "-DGGML_CUDA=OFF",  # CPU-only
-                "-DLLAMA_CURL=OFF",
-            ]
+            # Clean existing installation
+            if bin_dir.exists():
+                shutil.rmtree(bin_dir)
+            bin_dir.mkdir(parents=True, exist_ok=True)
 
-            subprocess.run(cmake_args, cwd=build_dir, check=True, capture_output=True)
-            report("CMake configured", 50)
+            # Download
+            report(f"Downloading {asset_name}...", 20)
+            zip_path = install_dir / asset_name
+            install_dir.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(download_url, str(zip_path))
+            report("Download complete", 60)
 
-            # CMake build
-            build_args = ["cmake", "--build", ".", "--config", "Release", "-j"]
-            subprocess.run(build_args, cwd=build_dir, check=True, capture_output=True)
-            report("Build complete", 100)
+            # Extract all files (executables + DLLs) into build/bin/Release/
+            report("Extracting binaries...", 70)
+            with zipfile.ZipFile(str(zip_path), 'r') as zf:
+                names = zf.namelist()
+                # Detect archive prefix directory (e.g., "llama-b8192-bin-win-cpu-x64/")
+                prefix = ""
+                for n in names:
+                    if "/" in n and not n.endswith("/"):
+                        prefix = n.split("/")[0] + "/"
+                        break
 
+                files_extracted = 0
+                for name in names:
+                    if name.endswith("/"):
+                        continue
+                    basename = name[len(prefix):] if prefix and name.startswith(prefix) else name
+                    if not basename:
+                        continue
+                    dest = bin_dir / basename
+                    with zf.open(name) as src:
+                        with open(str(dest), 'wb') as dst:
+                            dst.write(src.read())
+                    # Set executable permission on Unix
+                    if os_name != "win32" and not basename.endswith(".dll"):
+                        import stat
+                        dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
+                    files_extracted += 1
+
+            zip_path.unlink()
+            report(f"Extracted {files_extracted} files", 90)
+
+            # Verify llama-server exists
             self.llama_cpp_path = install_dir
+            server_exe = self._get_server_executable()
+            if server_exe is None:
+                logger.error("llama-server not found after extraction")
+                return False
+
+            version = self.get_version()
+            report(f"Installed llama.cpp b{version}" if version else "Installation complete", 100)
             return True
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Build failed: {e.stderr.decode() if e.stderr else str(e)}")
-            return False
         except Exception as e:
             logger.error(f"Installation failed: {e}")
             return False
@@ -621,10 +726,23 @@ class LlamaCppServer:
                 str(server_exe),
                 "--model", str(model_path),
                 "--port", str(self.port),
-                "--ctx-size", str(self.n_ctx),
                 "--threads", str(self.n_threads),
                 "--host", "127.0.0.1",
             ]
+
+            # Qwen3.5 models require specific flags
+            # Ref: https://qwen.readthedocs.io/en/latest/run_locally/llama.cpp.html
+            if model_name.startswith("qwen3.5"):
+                cmd.extend([
+                    "--jinja",                  # Required: use embedded chat template
+                    "--ctx-size", "16384",       # Qwen3.5 needs larger context
+                    "--temp", "0.7",             # Recommended for non-thinking mode
+                    "--top-k", "20",
+                    "--top-p", "0.95",
+                    "--no-context-shift",        # Prevent context corruption
+                ])
+            else:
+                cmd.extend(["--ctx-size", str(self.n_ctx)])
 
             # Add vision projector if available
             mmproj_path = self.model_manager.get_mmproj_path(model_name)
@@ -634,16 +752,37 @@ class LlamaCppServer:
             logger.info(f"Starting server: {' '.join(cmd)}")
 
             try:
+                # Hide console window on Windows
+                startupinfo = None
+                creationflags = 0
+                if sys.platform == 'win32':
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0  # SW_HIDE
+                    creationflags = subprocess.CREATE_NO_WINDOW
+
                 self.process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    bufsize=1
+                    bufsize=1,
+                    startupinfo=startupinfo,
+                    creationflags=creationflags
                 )
 
-                # Wait for server to be ready
-                ready = self._wait_for_ready(timeout=60, callback=callback)
+                # Larger models need more time to load weights
+                # 4B+ models can take 60-90s on CPU
+                config = MODELS.get(model_name)
+                size_mb = config.size_mb if config else 0
+                if size_mb >= 2500:
+                    startup_timeout = 180  # 3 min for 4B+ models
+                elif size_mb >= 1500:
+                    startup_timeout = 120  # 2 min for 2B VL models
+                else:
+                    startup_timeout = 60   # 1 min for small models
+
+                ready = self._wait_for_ready(timeout=startup_timeout, callback=callback)
                 if not ready:
                     self.stop()
                     return False
@@ -666,33 +805,53 @@ class LlamaCppServer:
 
         start_time = time.time()
         health_url = f"http://127.0.0.1:{self.port}/health"
+        logger.info(f"Waiting for server to start (timeout: {timeout}s)...")
 
         while time.time() - start_time < timeout:
-            # Read any output
+            # Drain server output to prevent pipe buffer deadlock
+            # readline() can block, so we drain what's available
             if self.process and self.process.stdout:
                 try:
                     line = self.process.stdout.readline()
-                    if line and callback:
-                        callback(line.strip())
-                except:
+                    if line:
+                        stripped = line.strip()
+                        logger.debug(f"llama-server: {stripped}")
+                        if callback:
+                            callback(stripped)
+                except Exception:
                     pass
 
-            # Check if process died
+            # Check if process died early
             if self.process and self.process.poll() is not None:
-                logger.error("Server process died")
+                logger.error("Server process died during startup")
+                # Drain remaining output for diagnostics
+                if self.process and self.process.stdout:
+                    try:
+                        remaining = self.process.stdout.read()
+                        if remaining:
+                            logger.error(f"Server output: {remaining[:2000]}")
+                    except Exception:
+                        pass
                 return False
 
             # Check health endpoint
             try:
                 req = urllib.request.urlopen(health_url, timeout=2)
                 if req.status == 200:
+                    elapsed = time.time() - start_time
+                    logger.info(f"Server ready (took {elapsed:.1f}s)")
                     return True
             except urllib.error.URLError:
                 pass
 
+            # Log progress every 15 seconds
+            elapsed = time.time() - start_time
+            if int(elapsed) % 15 == 0 and int(elapsed) > 0 and elapsed - int(elapsed) < 0.6:
+                logger.info(f"Still loading model... ({int(elapsed)}s/{timeout}s)")
+
             time.sleep(0.5)
 
-        logger.error("Server startup timeout")
+        logger.error(f"Server startup timeout after {timeout}s")
         return False
 
     def stop(self):
