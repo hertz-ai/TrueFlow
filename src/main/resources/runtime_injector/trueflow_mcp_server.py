@@ -332,8 +332,18 @@ async def list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}, "required": []}
         ),
         Tool(
+            name="ai_server_update",
+            description="Update llama.cpp to latest build. Required for Qwen3.5 models (need b8148+).",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        Tool(
+            name="ai_server_version",
+            description="Get the installed llama.cpp build version number.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        Tool(
             name="ai_download_model",
-            description="Download an AI model from HuggingFace. Presets: Qwen3-VL-2B-Instruct-Q4_K_XL (1.5GB), Qwen3-2B-Instruct-Q4_K_M (1.1GB)",
+            description="Download an AI model from HuggingFace. Presets: Qwen3-VL-2B-Instruct-Q4_K_XL (1.5GB), Qwen3-2B-Instruct-Q4_K_M (1.1GB), Qwen3.5-2B-Q4_K_M (1.28GB), Qwen3.5-4B-Q4_K_M (2.74GB)",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -428,6 +438,10 @@ async def call_tool(name: str, arguments: dict) -> Sequence[TextContent]:
             result = await ai_server_stop()
         elif name == "ai_server_status":
             result = await ai_server_status()
+        elif name == "ai_server_update":
+            result = await ai_server_update()
+        elif name == "ai_server_version":
+            result = await ai_server_version()
         elif name == "ai_download_model":
             result = await ai_download_model(arguments.get("model_name", "Qwen3-VL-2B-Instruct-Q4_K_XL"))
         elif name == "ai_explain_code":
@@ -1419,6 +1433,42 @@ async def ai_server_status() -> str:
     }, indent=2)
 
 
+async def ai_server_update() -> str:
+    """Update llama.cpp to the latest build."""
+    try:
+        from local_llm_server import LlamaCppServer
+        server = LlamaCppServer()
+        old_ver = server.get_version()
+
+        messages = []
+        def on_progress(msg, pct):
+            messages.append(f"{msg} ({pct:.0f}%)")
+
+        success = server.update_llama_cpp(progress_callback=on_progress)
+        if success:
+            new_ver = server.get_version()
+            ver_msg = f"b{old_ver} → b{new_ver}" if old_ver and new_ver else "complete"
+            return f"Update {ver_msg}. Steps: {'; '.join(messages[-3:])}"
+        else:
+            return f"Update failed. Log: {'; '.join(messages[-3:])}"
+    except Exception as e:
+        return f"Update failed: {str(e)}"
+
+
+async def ai_server_version() -> str:
+    """Get the installed llama.cpp build version."""
+    try:
+        from local_llm_server import LlamaCppServer
+        server = LlamaCppServer()
+        ver = server.get_version()
+        if ver:
+            return json.dumps({"build": ver, "build_tag": f"b{ver}"}, indent=2)
+        else:
+            return json.dumps({"build": None, "message": "llama.cpp not installed or version unknown"}, indent=2)
+    except Exception as e:
+        return f"Error checking version: {str(e)}"
+
+
 async def ai_download_model(model_name: str = "Qwen3-VL-2B-Instruct-Q4_K_XL") -> str:
     """Download an AI model from HuggingFace."""
     MODEL_PRESETS = {
@@ -1437,6 +1487,14 @@ async def ai_download_model(model_name: str = "Qwen3-VL-2B-Instruct-Q4_K_XL") ->
         "Qwen3-2B-Instruct-Q4_K_M": {
             "repo": "unsloth/Qwen3-2B-Instruct-GGUF",
             "file": "Qwen3-2B-Instruct-Q4_K_M.gguf"
+        },
+        "Qwen3.5-2B-UD-Q4_K_XL": {
+            "repo": "unsloth/Qwen3.5-2B-GGUF",
+            "file": "Qwen3.5-2B-UD-Q4_K_XL.gguf"
+        },
+        "Qwen3.5-4B-UD-Q4_K_XL": {
+            "repo": "unsloth/Qwen3.5-4B-GGUF",
+            "file": "Qwen3.5-4B-UD-Q4_K_XL.gguf"
         }
     }
 

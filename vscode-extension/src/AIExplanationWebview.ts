@@ -121,6 +121,24 @@ const MODEL_PRESETS: ModelPreset[] = [
         sizeMB: 1100,
         description: "Text-only, fastest, no vision support",
         hasVision: false
+    },
+    // Qwen3.5 models - 256K context, 201 languages, text-only
+    // Note: Requires llama.cpp build b8148+, NOT compatible with Ollama
+    {
+        displayName: "Qwen3.5-2B UD-Q4_K_XL",
+        repoId: "unsloth/Qwen3.5-2B-GGUF",
+        fileName: "Qwen3.5-2B-UD-Q4_K_XL.gguf",
+        sizeMB: 1340,
+        description: "256K context, text-only, lightweight (llama.cpp only)",
+        hasVision: false
+    },
+    {
+        displayName: "Qwen3.5-4B UD-Q4_K_XL",
+        repoId: "unsloth/Qwen3.5-4B-GGUF",
+        fileName: "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+        sizeMB: 2910,
+        description: "256K context, text-only, better quality (llama.cpp only)",
+        hasVision: false
     }
 ];
 

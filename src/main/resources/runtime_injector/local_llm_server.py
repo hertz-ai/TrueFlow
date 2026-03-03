@@ -47,6 +47,9 @@ class ModelConfig:
     description: str
 
 
+# Minimum llama.cpp build required for Qwen3.5 models (graph fix for multi-GPU/RPC)
+MIN_LLAMACPP_BUILD_QWEN35 = 8148
+
 # Available models - from https://docs.unsloth.ai/models/qwen3-vl-how-to-run-and-fine-tune
 MODELS = {
     # Qwen3-VL Vision-Language Models (recommended for code understanding)
@@ -85,6 +88,22 @@ MODELS = {
         mmproj_file=None,  # Text-only
         size_mb=1100,
         description="Qwen3 2B - Text-only, fastest"
+    ),
+    # Qwen3.5 models - 256K context, 201 languages, text-only
+    # Note: Qwen3.5 GGUF only works with llama.cpp, NOT Ollama
+    "qwen3.5-2b": ModelConfig(
+        repo_id="unsloth/Qwen3.5-2B-GGUF",
+        model_file="Qwen3.5-2B-UD-Q4_K_XL.gguf",
+        mmproj_file=None,  # Text-only
+        size_mb=1340,
+        description="Qwen3.5 2B - 256K context, text-only, lightweight"
+    ),
+    "qwen3.5-4b": ModelConfig(
+        repo_id="unsloth/Qwen3.5-4B-GGUF",
+        model_file="Qwen3.5-4B-UD-Q4_K_XL.gguf",
+        mmproj_file=None,  # Text-only
+        size_mb=2910,
+        description="Qwen3.5 4B - 256K context, text-only, better quality"
     ),
 }
 
@@ -346,6 +365,155 @@ class LlamaCppServer:
         """Check if llama.cpp is installed."""
         return self._get_server_executable() is not None
 
+    def get_version(self) -> Optional[int]:
+        """
+        Get the llama.cpp build number (e.g., 8184).
+
+        Tries two methods:
+        1. Run `llama-server --version` and parse the build number
+        2. Read the git tag from the llama.cpp repo directory
+
+        Returns:
+            Build number as int, or None if unknown
+        """
+        # Method 1: Run the server executable with --version
+        server_exe = self._get_server_executable()
+        if server_exe:
+            try:
+                result = subprocess.run(
+                    [str(server_exe), "--version"],
+                    capture_output=True, text=True, timeout=5
+                )
+                output = (result.stdout + result.stderr).strip()
+                # Parse build number from output like "version: 4067 (b4067)"
+                # or "llama-server version b8184"
+                import re
+                match = re.search(r'b(\d{4,})', output)
+                if match:
+                    return int(match.group(1))
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        # Method 2: Check git describe in the repo directory
+        if self.llama_cpp_path and (self.llama_cpp_path / ".git").exists():
+            try:
+                result = subprocess.run(
+                    ["git", "describe", "--tags", "--abbrev=0"],
+                    cwd=str(self.llama_cpp_path),
+                    capture_output=True, text=True, timeout=5
+                )
+                tag = result.stdout.strip()
+                import re
+                match = re.search(r'b(\d{4,})', tag)
+                if match:
+                    return int(match.group(1))
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        return None
+
+    def check_version_for_model(self, model_name: str) -> tuple:
+        """
+        Check if installed llama.cpp version supports the given model.
+
+        Returns:
+            (is_compatible, current_version, required_version)
+        """
+        current = self.get_version()
+        required = None
+
+        if model_name.startswith("qwen3.5"):
+            required = MIN_LLAMACPP_BUILD_QWEN35
+
+        if required is None:
+            return (True, current, None)
+
+        if current is None:
+            # Can't determine version — warn but don't block
+            logger.warning(
+                f"Cannot determine llama.cpp version. "
+                f"Model {model_name} requires build b{required}+. "
+                f"Run update_llama_cpp() if loading fails."
+            )
+            return (True, None, required)
+
+        is_ok = current >= required
+        if not is_ok:
+            logger.warning(
+                f"llama.cpp build b{current} is too old for {model_name}. "
+                f"Required: b{required}+. Run update_llama_cpp() to update."
+            )
+        return (is_ok, current, required)
+
+    def update_llama_cpp(
+        self,
+        progress_callback: Optional[Callable[[str, float], None]] = None
+    ) -> bool:
+        """
+        Update llama.cpp to the latest version via git pull + rebuild.
+
+        If llama.cpp is not installed, falls back to install_llama_cpp().
+        """
+        def report(msg: str, pct: float):
+            logger.info(f"{msg} ({pct:.1f}%)")
+            if progress_callback:
+                progress_callback(msg, pct)
+
+        install_dir = Path.home() / ".trueflow" / "llama.cpp"
+
+        # If not installed yet, do a fresh install
+        if not install_dir.exists() or not (install_dir / ".git").exists():
+            report("No existing installation found, doing fresh install...", 0)
+            return self.install_llama_cpp(progress_callback)
+
+        old_version = self.get_version()
+        report(f"Current build: b{old_version}" if old_version else "Current build: unknown", 0)
+
+        try:
+            # Fetch latest and reset to origin (since we use --depth 1)
+            report("Fetching latest llama.cpp...", 10)
+            subprocess.run(
+                ["git", "fetch", "--depth", "1", "origin"],
+                cwd=str(install_dir), check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "reset", "--hard", "origin/HEAD"],
+                cwd=str(install_dir), check=True, capture_output=True
+            )
+            report("Source updated", 30)
+
+            # Rebuild
+            report("Rebuilding llama.cpp...", 40)
+            build_dir = install_dir / "build"
+            build_dir.mkdir(exist_ok=True)
+
+            cmake_args = [
+                "cmake", "..",
+                "-DBUILD_SHARED_LIBS=OFF",
+                "-DGGML_CUDA=OFF",
+                "-DLLAMA_CURL=OFF",
+            ]
+            subprocess.run(cmake_args, cwd=str(build_dir), check=True, capture_output=True)
+            report("CMake configured", 60)
+
+            build_args = ["cmake", "--build", ".", "--config", "Release", "-j"]
+            subprocess.run(build_args, cwd=str(build_dir), check=True, capture_output=True)
+            report("Build complete", 90)
+
+            self.llama_cpp_path = install_dir
+            new_version = self.get_version()
+
+            version_msg = f"Updated: b{old_version} → b{new_version}" if old_version and new_version else "Update complete"
+            report(version_msg, 100)
+            return True
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Update failed: {e.stderr.decode() if e.stderr else str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"Update failed: {e}")
+            return False
+
     def install_llama_cpp(
         self,
         progress_callback: Optional[Callable[[str, float], None]] = None
@@ -432,6 +600,15 @@ class LlamaCppServer:
             server_exe = self._get_server_executable()
             if server_exe is None:
                 logger.error("llama.cpp server not found. Call install_llama_cpp() first.")
+                return False
+
+            # Check version compatibility for the requested model
+            is_ok, cur_ver, req_ver = self.check_version_for_model(model_name)
+            if not is_ok:
+                logger.error(
+                    f"llama.cpp build b{cur_ver} does not support {model_name} "
+                    f"(requires b{req_ver}+). Run update_llama_cpp() first."
+                )
                 return False
 
             model_path = self.model_manager.get_model_path(model_name)
@@ -742,6 +919,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TrueFlow Local LLM Service")
     parser.add_argument("--download", action="store_true", help="Download model")
     parser.add_argument("--install", action="store_true", help="Install llama.cpp")
+    parser.add_argument("--update", action="store_true", help="Update llama.cpp to latest")
+    parser.add_argument("--version", action="store_true", help="Show llama.cpp build version")
     parser.add_argument("--start", action="store_true", help="Start server")
     parser.add_argument("--test", action="store_true", help="Test generation")
     parser.add_argument("--model", default="qwen3-vl-2b", help="Model name")
@@ -750,6 +929,10 @@ if __name__ == "__main__":
 
     service = LocalLLMService(args.model)
 
+    if args.version:
+        ver = service.server.get_version()
+        print(f"llama.cpp build: b{ver}" if ver else "llama.cpp version: unknown (not installed?)")
+
     if args.download:
         print("Downloading model...")
         service.model_manager.download_model(args.model, lambda m, p: print(f"  {m} ({p:.0f}%)"))
@@ -757,6 +940,15 @@ if __name__ == "__main__":
     if args.install:
         print("Installing llama.cpp...")
         service.server.install_llama_cpp(lambda m, p: print(f"  {m} ({p:.0f}%)"))
+
+    if args.update:
+        print("Updating llama.cpp...")
+        if service.server.update_llama_cpp(lambda m, p: print(f"  {m} ({p:.0f}%)")):
+            ver = service.server.get_version()
+            print(f"Now at build: b{ver}" if ver else "Update complete")
+        else:
+            print("Update failed")
+            sys.exit(1)
 
     if args.start or args.test:
         print("Ensuring LLM service is ready...")
@@ -772,9 +964,11 @@ if __name__ == "__main__":
         )
         print(f"\nResponse:\n{response}")
 
-    if not any([args.download, args.install, args.start, args.test]):
+    if not any([args.download, args.install, args.update, args.version, args.start, args.test]):
         print("Available models:")
         for model in service.model_manager.list_available_models():
             status = "downloaded" if model['downloaded'] else "not downloaded"
             vision = " (vision)" if model['has_vision'] else ""
             print(f"  {model['name']}: {model['description']}{vision} [{status}]")
+        ver = service.server.get_version()
+        print(f"\nllama.cpp build: b{ver}" if ver else "\nllama.cpp: not installed")

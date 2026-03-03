@@ -131,6 +131,24 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             "Text-only, fastest, no vision support",
             hasVision = false
         ),
+        // Qwen3.5 models - 256K context, 201 languages, text-only
+        // Note: Requires llama.cpp build b8148+, NOT compatible with Ollama
+        ModelPreset(
+            "Qwen3.5-2B UD-Q4_K_XL",
+            "unsloth/Qwen3.5-2B-GGUF",
+            "Qwen3.5-2B-UD-Q4_K_XL.gguf",
+            1340,
+            "256K context, text-only, lightweight (llama.cpp only)",
+            hasVision = false
+        ),
+        ModelPreset(
+            "Qwen3.5-4B UD-Q4_K_XL",
+            "unsloth/Qwen3.5-4B-GGUF",
+            "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+            2910,
+            "256K context, text-only, better quality (llama.cpp only)",
+            hasVision = false
+        ),
         ModelPreset(
             "Custom HuggingFace Model...",
             "",
