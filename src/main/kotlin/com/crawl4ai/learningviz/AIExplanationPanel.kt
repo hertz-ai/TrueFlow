@@ -2211,14 +2211,19 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     private fun buildMCPToolsDocumentation(): String {
         // Ultra-compact format for minimal token usage (ASCII only for compatibility)
         return """
-            |MCP Tools (use mcp{"tool":"name","args":{}} to call):
-            |- get_trace_data: call history
-            |- get_dead_code: unused functions
-            |- get_performance_data: hotspots
-            |- get_sql_queries: SQL with N+1
-            |- export_diagram(format): plantuml/mermaid/d2
-            |- search_function(function_name): find function
-            |- get_call_chain(function_name): callers/callees
+            |You have access to TrueFlow MCP tools. To call a tool, output EXACTLY this format on its own line:
+            |mcp{"tool":"TOOL_NAME","args":{}}
+            |
+            |Available tools:
+            |- get_trace_data: call history and execution data
+            |- get_dead_code: functions defined but never called (dead code analysis)
+            |- get_performance_data: performance hotspots and timing
+            |- search_function: find a function. Args: {"function_name":"name"}
+            |- get_call_chain: callers and callees. Args: {"function_name":"name"}
+            |- export_diagram: generate diagram. Args: {"format":"plantuml"}
+            |
+            |Example: To get dead code, output: mcp{"tool":"get_dead_code","args":{}}
+            |I will execute the tool and give you the results. Then answer the question using that data.
         """.trimMargin()
     }
 
@@ -2365,6 +2370,11 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             // Model requested a tool - execute it and continue conversation
             val (toolResponse, remainingText) = mcpResult
 
+            // Notify user that a tool call is happening
+            SwingUtilities.invokeLater {
+                webChatPanel?.updateStatus("Executing tool call...")
+            }
+
             // Add tool result to messages and call LLM again
             val followUpMessages = messages.toMutableList()
             followUpMessages.add(mapOf("role" to "assistant", "content" to content))
@@ -2412,25 +2422,38 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
      * Returns (toolResponse, remainingText) or null if no tool call.
      */
     private fun detectAndExecuteMCPCall(content: String): Pair<String, String>? {
-        // Look for ```mcp{...}``` pattern
-        val mcpPattern = Regex("```mcp\\s*\\{([^}]+)\\}\\s*```", RegexOption.DOT_MATCHES_ALL)
-        val match = mcpPattern.find(content) ?: return null
+        // Match multiple formats the LLM may produce:
+        //   ```mcp{"tool":"name","args":{}}```
+        //   mcp{"tool":"name","args":{}}
+        //   ```mcp\n{"tool":"name","args":{}}\n```
+        //   ```json\nmcp{"tool":"name"}\n```
+        val patterns = listOf(
+            Regex("```(?:mcp|json)?\\s*(?:mcp)?\\s*(\\{[^`]*?\"tool\"[^`]*?\\})\\s*```", RegexOption.DOT_MATCHES_ALL),
+            Regex("(?:^|\\s)mcp\\s*(\\{.*?\"tool\".*?\\})", RegexOption.DOT_MATCHES_ALL)
+        )
 
-        try {
-            val jsonStr = "{${match.groupValues[1]}}"
-            val toolCall = Gson().fromJson(jsonStr, JsonObject::class.java)
-            val toolName = toolCall.get("tool")?.asString ?: return null
-            val args = toolCall.getAsJsonObject("args") ?: JsonObject()
+        for (pattern in patterns) {
+            val match = pattern.find(content) ?: continue
+            try {
+                val jsonStr = match.groupValues[1].trim()
+                val toolCall = Gson().fromJson(jsonStr, JsonObject::class.java)
+                val toolName = toolCall.get("tool")?.asString ?: continue
+                val args = toolCall.getAsJsonObject("args") ?: JsonObject()
 
-            // Execute the tool
-            val result = executeMCPTool(toolName, args)
-            val remainingText = content.replace(match.value, "").trim()
+                PluginLogger.info("[MCP Tool Call] Detected tool=$toolName, args=$args")
 
-            return Pair(result, remainingText)
-        } catch (e: Exception) {
-            PluginLogger.warn("Failed to parse MCP call: ${e.message}")
-            return null
+                // Execute the tool
+                val result = executeMCPTool(toolName, args)
+                val remainingText = content.replace(match.value, "").trim()
+
+                PluginLogger.info("[MCP Tool Call] Result length=${result.length}")
+                return Pair(result, remainingText)
+            } catch (e: Exception) {
+                PluginLogger.warn("Failed to parse MCP call: ${e.message}")
+                continue
+            }
         }
+        return null
     }
 
     /**
@@ -2456,15 +2479,42 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         return when (toolName) {
             "get_trace_data" -> {
                 val data = callTraceData
-                if (data != null && data.size() > 0) Gson().toJson(data) else null
+                if (data != null && data.size() > 0) {
+                    Gson().toJson(data)
+                } else {
+                    // Fall back to live tool window data
+                    val tw = toolWindow
+                    if (tw?.hasTraceData() == true) {
+                        val liveData = tw.getRpcDeadCode()
+                        liveData.getAsJsonArray("called_functions")?.let { called ->
+                            """{"calls":${Gson().toJson(called)},"total_calls":${called.size()}}"""
+                        }
+                    } else null
+                }
             }
             "get_dead_code" -> {
                 val data = deadCodeData
-                if (data != null && data.size() > 0) Gson().toJson(data) else null
+                if (data != null && data.size() > 0) {
+                    Gson().toJson(data)
+                } else {
+                    // Fall back to live tool window data (restored sessions, live traces)
+                    val tw = toolWindow
+                    if (tw?.hasTraceData() == true) {
+                        val liveData = tw.getRpcDeadCode()
+                        if (liveData.has("error")) null else Gson().toJson(liveData)
+                    } else null
+                }
             }
             "get_performance_data" -> {
                 val data = performanceData
-                if (data != null && data.size() > 0) Gson().toJson(data) else null
+                if (data != null && data.size() > 0) {
+                    Gson().toJson(data)
+                } else {
+                    // Fall back to live tool window data
+                    val tw = toolWindow
+                    val liveData = tw?.getRpcPerformanceData()
+                    if (liveData != null && liveData.size() > 0) Gson().toJson(liveData) else null
+                }
             }
             "get_sql_queries" -> {
                 // TODO: Implement SQL query data collection
@@ -2478,15 +2528,33 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             }
             "search_function" -> {
                 val funcName = args.get("function_name")?.asString ?: ""
-                if (callTraceData != null) searchFunctionInTrace(funcName) else null
+                if (callTraceData != null) {
+                    searchFunctionInTrace(funcName)
+                } else {
+                    val tw = toolWindow
+                    val data = tw?.getRpcSearchFunctions(funcName)
+                    if (data != null) Gson().toJson(data) else null
+                }
             }
             "get_call_chain" -> {
                 val funcName = args.get("function_name")?.asString ?: ""
-                if (callTraceData != null) getCallChainForFunction(funcName) else null
+                if (callTraceData != null) {
+                    getCallChainForFunction(funcName)
+                } else {
+                    val tw = toolWindow
+                    val data = tw?.getRpcCallChain(funcName)
+                    if (data != null) Gson().toJson(data) else null
+                }
             }
             "get_flamegraph_data" -> {
                 val data = performanceData
-                if (data != null && data.size() > 0) Gson().toJson(data) else null
+                if (data != null && data.size() > 0) {
+                    Gson().toJson(data)
+                } else {
+                    val tw = toolWindow
+                    val liveData = tw?.getRpcFlamegraphData()
+                    if (liveData != null) Gson().toJson(liveData) else null
+                }
             }
             else -> null
         }
