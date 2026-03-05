@@ -340,6 +340,113 @@ class LlamaCppServer:
 
         return None
 
+    @staticmethod
+    def _detect_nvidia_gpu() -> bool:
+        """Check if an NVIDIA GPU is available via nvidia-smi."""
+        try:
+            startupinfo = None
+            creationflags = 0
+            if sys.platform == 'win32':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+                creationflags = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+                startupinfo=startupinfo, creationflags=creationflags
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                logger.info(f"NVIDIA GPU detected: {result.stdout.strip().splitlines()[0]}")
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+        return False
+
+    def _has_cuda_dlls(self) -> bool:
+        """Check if CUDA DLLs are present in the binary directory."""
+        server_exe = self._get_server_executable()
+        if not server_exe:
+            return False
+        bin_dir = server_exe.parent
+        import glob
+        for pattern in ["ggml-cuda.dll", "ggml-cuda.so", "cublas64*.dll"]:
+            if glob.glob(str(bin_dir / pattern)):
+                return True
+        return False
+
+    @staticmethod
+    def _get_release_assets(tag: str, assets: list, prefer_cuda: bool = False) -> list:
+        """
+        Get download URLs for the appropriate platform assets.
+
+        Returns list of (asset_name, download_url) tuples.
+        For CUDA builds on Windows, includes both the main binary and cudart package.
+        """
+        os_name = sys.platform
+        to_download = []
+
+        if os_name == "win32":
+            if prefer_cuda:
+                main_pattern = f"llama-{tag}-bin-win-cuda-12.4-x64.zip"
+                cudart_pattern = f"cudart-llama-bin-win-cuda-12.4-x64.zip"
+            else:
+                main_pattern = f"llama-{tag}-bin-win-cpu-x64.zip"
+                cudart_pattern = None
+        elif os_name == "darwin":
+            main_pattern = f"llama-{tag}-bin-macos-arm64.zip"
+            cudart_pattern = None
+        else:
+            main_pattern = f"llama-{tag}-bin-ubuntu-x64.zip"
+            cudart_pattern = None
+
+        asset_map = {a["name"]: a["browser_download_url"] for a in assets}
+
+        if main_pattern in asset_map:
+            to_download.append((main_pattern, asset_map[main_pattern]))
+        elif prefer_cuda:
+            # Fall back to CPU if CUDA asset not found
+            cpu_fallback = f"llama-{tag}-bin-win-cpu-x64.zip" if os_name == "win32" else f"llama-{tag}-bin-ubuntu-x64.zip"
+            if cpu_fallback in asset_map:
+                logger.warning("CUDA build not available, falling back to CPU")
+                to_download.append((cpu_fallback, asset_map[cpu_fallback]))
+                cudart_pattern = None
+
+        if cudart_pattern and cudart_pattern in asset_map:
+            to_download.append((cudart_pattern, asset_map[cudart_pattern]))
+
+        return to_download
+
+    @staticmethod
+    def _extract_release_zip(zip_path: Path, bin_dir: Path):
+        """Extract a release zip into bin_dir, stripping the top-level directory prefix."""
+        import zipfile
+        with zipfile.ZipFile(str(zip_path), 'r') as zf:
+            names = zf.namelist()
+            prefix = ""
+            for n in names:
+                if "/" in n and not n.endswith("/"):
+                    prefix = n.split("/")[0] + "/"
+                    break
+
+            count = 0
+            for name in names:
+                if name.endswith("/"):
+                    continue
+                basename = name[len(prefix):] if prefix and name.startswith(prefix) else name
+                if not basename:
+                    continue
+                dest = bin_dir / basename
+                with zf.open(name) as src:
+                    with open(str(dest), 'wb') as dst:
+                        dst.write(src.read())
+                if sys.platform != "win32" and not basename.endswith(".dll"):
+                    import stat
+                    dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
+                count += 1
+        zip_path.unlink()
+        return count
+
     def _get_server_executable(self) -> Optional[Path]:
         """Get path to llama-server executable."""
         if self.llama_cpp_path is None:
@@ -382,9 +489,22 @@ class LlamaCppServer:
         server_exe = self._get_server_executable()
         if server_exe:
             try:
+                # Set cwd to the binary's directory so DLLs (mtmd.dll, ggml-cuda.dll, etc.) are found
+                env = os.environ.copy()
+                bin_dir = str(server_exe.parent)
+                env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+                startupinfo = None
+                creationflags = 0
+                if sys.platform == 'win32':
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0
+                    creationflags = subprocess.CREATE_NO_WINDOW
                 result = subprocess.run(
                     [str(server_exe), "--version"],
-                    capture_output=True, text=True, timeout=5
+                    capture_output=True, text=True, timeout=10,
+                    cwd=bin_dir, env=env,
+                    startupinfo=startupinfo, creationflags=creationflags
                 )
                 output = (result.stdout + result.stderr).strip()
                 # Parse build number from output like:
@@ -461,11 +581,8 @@ class LlamaCppServer:
         """
         Update llama.cpp to the latest pre-built release from GitHub.
 
-        Downloads pre-built binaries (much faster than building from source).
-        Falls back to install_llama_cpp() for fresh installs.
+        Auto-detects NVIDIA GPU and downloads CUDA build if available.
         """
-        import zipfile
-        import shutil
         import urllib.request
         import json
         import re
@@ -482,8 +599,7 @@ class LlamaCppServer:
         report(f"Current build: b{old_version}" if old_version else "Current build: unknown", 0)
 
         try:
-            # Fetch latest release info from GitHub API
-            report("Checking latest release...", 10)
+            report("Checking latest release...", 5)
             api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
             req = urllib.request.Request(api_url, headers={"User-Agent": "TrueFlow"})
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -497,68 +613,34 @@ class LlamaCppServer:
                 report(f"Already up to date (b{old_version})", 100)
                 return True
 
-            # Find the right asset for this platform
-            import platform
-            os_name = sys.platform
-            arch = platform.machine().lower()
+            has_gpu = self._detect_nvidia_gpu()
+            report(f"GPU: {'NVIDIA — CUDA build' if has_gpu else 'none — CPU build'}", 10)
 
-            if os_name == "win32":
-                asset_pattern = f"llama-{tag}-bin-win-cpu-x64.zip"
-            elif os_name == "darwin":
-                asset_pattern = f"llama-{tag}-bin-macos-arm64.zip"
-            else:
-                asset_pattern = f"llama-{tag}-bin-ubuntu-x64.zip"
-
-            download_url = None
-            asset_name = None
-            for asset in release.get("assets", []):
-                if asset["name"] == asset_pattern:
-                    download_url = asset["browser_download_url"]
-                    asset_name = asset["name"]
-                    break
-
-            if not download_url:
-                logger.error(f"No matching asset found for pattern: {asset_pattern}")
+            assets_to_download = self._get_release_assets(
+                tag, release.get("assets", []), prefer_cuda=has_gpu
+            )
+            if not assets_to_download:
+                logger.error("No matching release assets found")
                 return False
 
-            report(f"Downloading {asset_name}...", 20)
-
-            # Download
             install_dir.mkdir(parents=True, exist_ok=True)
-            zip_path = install_dir / asset_name
-            urllib.request.urlretrieve(download_url, str(zip_path))
-            report("Download complete", 60)
-
-            # Extract to build/bin/Release
             bin_dir.mkdir(parents=True, exist_ok=True)
-            report("Extracting binaries...", 70)
 
-            with zipfile.ZipFile(str(zip_path), 'r') as zf:
-                # Get prefix directory from archive
-                names = zf.namelist()
-                prefix = ""
-                if names and "/" in names[0]:
-                    prefix = names[0].split("/")[0] + "/"
-
-                for name in names:
-                    if name.endswith("/"):
-                        continue
-                    basename = name[len(prefix):] if prefix else name
-                    if not basename:
-                        continue
-                    dest = bin_dir / basename
-                    with zf.open(name) as src:
-                        with open(str(dest), 'wb') as dst:
-                            dst.write(src.read())
-
-            zip_path.unlink()
-            report("Extracted", 85)
+            total = len(assets_to_download)
+            for i, (asset_name, download_url) in enumerate(assets_to_download):
+                pct_base = 15 + (i * 70 // total)
+                report(f"Downloading {asset_name}...", pct_base)
+                zip_path = install_dir / asset_name
+                urllib.request.urlretrieve(download_url, str(zip_path))
+                report(f"Extracting {asset_name}...", pct_base + 35 // total)
+                self._extract_release_zip(zip_path, bin_dir)
 
             self.llama_cpp_path = install_dir
             new_version = self.get_version()
 
-            version_msg = f"Updated: b{old_version} → b{new_version}" if old_version and new_version else "Update complete"
-            report(version_msg, 100)
+            build_type = "CUDA" if any("cuda" in a[0] for a in assets_to_download) else "CPU"
+            version_msg = f"Updated: b{old_version} → b{new_version} ({build_type})"
+            report(version_msg if old_version and new_version else f"Update complete ({build_type})", 100)
             return True
 
         except Exception as e:
@@ -572,15 +654,12 @@ class LlamaCppServer:
         """
         Install llama.cpp by downloading the latest pre-built release from GitHub.
 
-        No build toolchain (cmake, compiler) required — downloads ready-to-run binaries.
-        Auto-detects platform (Windows/macOS/Linux) and downloads the appropriate build.
+        No build toolchain required. Auto-detects NVIDIA GPU and downloads
+        CUDA build if available, otherwise CPU build.
         """
-        import zipfile
         import shutil
         import urllib.request
         import json
-        import re
-        import platform
 
         def report(msg: str, pct: float):
             logger.info(f"{msg} ({pct:.1f}%)")
@@ -591,7 +670,6 @@ class LlamaCppServer:
         bin_dir = install_dir / "build" / "bin" / "Release"
 
         try:
-            # Fetch latest release info
             report("Checking latest llama.cpp release...", 5)
             api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
             req = urllib.request.Request(api_url, headers={"User-Agent": "TrueFlow"})
@@ -599,74 +677,33 @@ class LlamaCppServer:
                 release = json.loads(resp.read().decode())
 
             tag = release.get("tag_name", "")
-            report(f"Latest release: {tag}", 10)
+            report(f"Latest release: {tag}", 8)
 
-            # Determine asset name for this platform
-            os_name = sys.platform
-            if os_name == "win32":
-                asset_pattern = f"llama-{tag}-bin-win-cpu-x64.zip"
-            elif os_name == "darwin":
-                asset_pattern = f"llama-{tag}-bin-macos-arm64.zip"
-            else:
-                asset_pattern = f"llama-{tag}-bin-ubuntu-x64.zip"
+            has_gpu = self._detect_nvidia_gpu()
+            report(f"GPU: {'NVIDIA — will download CUDA build' if has_gpu else 'none — CPU build'}", 10)
 
-            # Find download URL
-            download_url = None
-            asset_name = None
-            for asset in release.get("assets", []):
-                if asset["name"] == asset_pattern:
-                    download_url = asset["browser_download_url"]
-                    asset_name = asset["name"]
-                    break
-
-            if not download_url:
-                logger.error(f"No pre-built binary found for this platform: {asset_pattern}")
+            assets_to_download = self._get_release_assets(
+                tag, release.get("assets", []), prefer_cuda=has_gpu
+            )
+            if not assets_to_download:
+                logger.error("No matching release assets found")
                 return False
 
-            # Clean existing installation
             if bin_dir.exists():
                 shutil.rmtree(bin_dir)
             bin_dir.mkdir(parents=True, exist_ok=True)
-
-            # Download
-            report(f"Downloading {asset_name}...", 20)
-            zip_path = install_dir / asset_name
             install_dir.mkdir(parents=True, exist_ok=True)
-            urllib.request.urlretrieve(download_url, str(zip_path))
-            report("Download complete", 60)
 
-            # Extract all files (executables + DLLs) into build/bin/Release/
-            report("Extracting binaries...", 70)
-            with zipfile.ZipFile(str(zip_path), 'r') as zf:
-                names = zf.namelist()
-                # Detect archive prefix directory (e.g., "llama-b8192-bin-win-cpu-x64/")
-                prefix = ""
-                for n in names:
-                    if "/" in n and not n.endswith("/"):
-                        prefix = n.split("/")[0] + "/"
-                        break
+            total = len(assets_to_download)
+            for i, (asset_name, download_url) in enumerate(assets_to_download):
+                pct_base = 15 + (i * 70 // total)
+                report(f"Downloading {asset_name}...", pct_base)
+                zip_path = install_dir / asset_name
+                urllib.request.urlretrieve(download_url, str(zip_path))
+                report(f"Extracting {asset_name}...", pct_base + 35 // total)
+                count = self._extract_release_zip(zip_path, bin_dir)
+                report(f"Extracted {count} files", pct_base + 65 // total)
 
-                files_extracted = 0
-                for name in names:
-                    if name.endswith("/"):
-                        continue
-                    basename = name[len(prefix):] if prefix and name.startswith(prefix) else name
-                    if not basename:
-                        continue
-                    dest = bin_dir / basename
-                    with zf.open(name) as src:
-                        with open(str(dest), 'wb') as dst:
-                            dst.write(src.read())
-                    # Set executable permission on Unix
-                    if os_name != "win32" and not basename.endswith(".dll"):
-                        import stat
-                        dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
-                    files_extracted += 1
-
-            zip_path.unlink()
-            report(f"Extracted {files_extracted} files", 90)
-
-            # Verify llama-server exists
             self.llama_cpp_path = install_dir
             server_exe = self._get_server_executable()
             if server_exe is None:
@@ -674,7 +711,8 @@ class LlamaCppServer:
                 return False
 
             version = self.get_version()
-            report(f"Installed llama.cpp b{version}" if version else "Installation complete", 100)
+            build_type = "CUDA" if any("cuda" in a[0] for a in assets_to_download) else "CPU"
+            report(f"Installed llama.cpp b{version} ({build_type})" if version else "Installation complete", 100)
             return True
 
         except Exception as e:
@@ -749,6 +787,13 @@ class LlamaCppServer:
             if mmproj_path:
                 cmd.extend(["--mmproj", str(mmproj_path)])
 
+            # GPU offload: if CUDA DLLs are present, offload all layers
+            if self._has_cuda_dlls() and self._detect_nvidia_gpu():
+                cmd.extend(["-ngl", "99"])
+                logger.info("GPU acceleration enabled (CUDA, offloading all layers)")
+            else:
+                logger.info("Using CPU-only mode")
+
             logger.info(f"Starting server: {' '.join(cmd)}")
 
             try:
@@ -761,12 +806,19 @@ class LlamaCppServer:
                     startupinfo.wShowWindow = 0  # SW_HIDE
                     creationflags = subprocess.CREATE_NO_WINDOW
 
+                # Set cwd to binary dir so DLLs (ggml-cuda.dll, mtmd.dll) are found
+                bin_dir = str(server_exe.parent)
+                env = os.environ.copy()
+                env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+
                 self.process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    cwd=bin_dir,
+                    env=env,
                     startupinfo=startupinfo,
                     creationflags=creationflags
                 )

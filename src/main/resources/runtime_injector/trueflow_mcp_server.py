@@ -343,7 +343,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="ai_download_model",
-            description="Download an AI model from HuggingFace. Presets: Qwen3-VL-2B-Instruct-Q4_K_XL (1.5GB), Qwen3-2B-Instruct-Q4_K_M (1.1GB), Qwen3.5-2B-Q4_K_M (1.28GB), Qwen3.5-4B-Q4_K_M (2.74GB)",
+            description="Download an AI model from HuggingFace. Presets: Qwen3-VL-2B-Instruct-Q4_K_XL (1.5GB), Qwen3-2B-Instruct-Q4_K_M (1.1GB), Qwen3.5-2B-UD-Q4_K_XL (1.34GB), Qwen3.5-4B-UD-Q4_K_XL (2.91GB)",
             inputSchema={
                 "type": "object",
                 "properties": {
