@@ -1549,7 +1549,7 @@ async def ai_explain_code(question: str, context_type: str = "all") -> str:
         import urllib.request
 
         payload = json.dumps({
-            "model": "qwen3-vl",
+            "model": "qwen3.5",
             "messages": [
                 {"role": "system", "content": "You are TrueFlow AI, a code analysis assistant. Analyze the execution trace context and answer the developer's question."},
                 {"role": "user", "content": f"{question}\n{context}" if context else question}

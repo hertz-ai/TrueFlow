@@ -20,35 +20,35 @@ interface ModelPreset {
 
 // Model presets from https://docs.unsloth.ai/models/qwen3-vl-how-to-run-and-fine-tune
 const MODEL_PRESETS: ModelPreset[] = [
-    // Qwen3-VL Vision-Language Models (recommended for code understanding)
+    // Qwen3.5 models - 256K context, unified VLM (vision+text), default choice
     {
-        displayName: "Qwen3-VL-2B Instruct Q4_K_XL (Recommended)",
+        displayName: "Qwen3.5-4B VL (Recommended)",
+        repoId: "unsloth/Qwen3.5-4B-GGUF",
+        fileName: "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+        sizeMB: 2910,
+        description: "256K context, vision+text, best quality (GPU ≥4GB VRAM)"
+    },
+    {
+        displayName: "Qwen3.5-2B VL",
+        repoId: "unsloth/Qwen3.5-2B-GGUF",
+        fileName: "Qwen3.5-2B-UD-Q4_K_XL.gguf",
+        sizeMB: 1340,
+        description: "256K context, vision+text, lightweight (low VRAM / CPU)"
+    },
+    // Qwen3-VL models - older generation
+    {
+        displayName: "Qwen3-VL-2B Instruct Q4_K_XL",
         repoId: "unsloth/Qwen3-VL-2B-Instruct-GGUF",
         fileName: "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf",
         sizeMB: 1500,
-        description: "Vision+text, best for code analysis with diagrams"
+        description: "Vision+text, good for code analysis with diagrams"
     },
-    {
-        displayName: "Qwen3-VL-2B Thinking Q4_K_XL",
-        repoId: "unsloth/Qwen3-VL-2B-Thinking-GGUF",
-        fileName: "Qwen3-VL-2B-Thinking-UD-Q4_K_XL.gguf",
-        sizeMB: 1500,
-        description: "Vision+text with chain-of-thought reasoning"
-    },
-    // Larger models for better quality (need more RAM)
     {
         displayName: "Qwen3-VL-4B Instruct Q4_K_XL",
         repoId: "unsloth/Qwen3-VL-4B-Instruct-GGUF",
         fileName: "Qwen3-VL-4B-Instruct-UD-Q4_K_XL.gguf",
         sizeMB: 2800,
         description: "Larger model, better quality, needs ~6GB RAM"
-    },
-    {
-        displayName: "Qwen3-VL-8B Instruct Q4_K_XL",
-        repoId: "unsloth/Qwen3-VL-8B-Instruct-GGUF",
-        fileName: "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf",
-        sizeMB: 5000,
-        description: "Best quality for complex code, needs ~10GB RAM"
     },
     // Text-only models (faster, no vision support)
     {
@@ -818,6 +818,9 @@ async function autoIntegrateProject(context: vscode.ExtensionContext): Promise<v
     const injectorDest = path.join(trueflowDir, 'runtime_injector');
     await copyRuntimeInjector(context.extensionPath, injectorDest);
 
+    // Ensure .trueflow/ and .pycharm_plugin/ are in .git/info/exclude
+    ensureGitExclude(workspaceRoot, ['.trueflow/', '.pycharm_plugin/']);
+
     // Create sitecustomize.py for automatic tracing
     const sitecustomizePath = path.join(trueflowDir, 'sitecustomize.py');
     const sitecustomizeContent = `# TrueFlow Auto-Instrumentation
@@ -1017,6 +1020,25 @@ class RuntimeInstrumentor:
 `;
         fs.writeFileSync(path.join(destPath, 'python_runtime_instrumentor.py'), stubContent);
         console.log('[TrueFlow] Created runtime injector stub');
+    }
+}
+
+/**
+ * Ensure entries are in .git/info/exclude so deployed dirs never get staged.
+ * Only appends if the exclude file exists and doesn't already contain the entry.
+ */
+function ensureGitExclude(workspaceRoot: string, entries: string[]): void {
+    try {
+        const excludePath = path.join(workspaceRoot, '.git', 'info', 'exclude');
+        if (!fs.existsSync(excludePath)) { return; }
+        let content = fs.readFileSync(excludePath, 'utf-8');
+        const toAdd = entries.filter(e => !content.includes(e));
+        if (toAdd.length > 0) {
+            fs.appendFileSync(excludePath, '\n' + toAdd.join('\n') + '\n');
+            console.log(`[TrueFlow] Added to .git/info/exclude: ${toAdd.join(', ')}`);
+        }
+    } catch (e) {
+        // Non-critical — don't block deployment
     }
 }
 

@@ -60,27 +60,37 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
     )
 
     private val modelPresets = listOf(
-        // Qwen3-VL models - excellent for code analysis
-        // Note: mmproj files use unique LOCAL names to avoid conflicts when switching models
-        // mmprojSourceFile is the name on HuggingFace, mmprojFile is the local name
+        // Qwen3.5 models - 256K context, unified VLM (vision+text), default choice
+        // Requires llama.cpp build b8148+, NOT compatible with Ollama
         ModelPreset(
-            "Qwen3-VL-2B Instruct Q4_K_XL (Recommended)",
-            "unsloth/Qwen3-VL-2B-Instruct-GGUF",
-            "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf",
-            1500,
-            "Vision+text, best for code analysis with diagrams",
+            "Qwen3.5-4B VL (Recommended)",
+            "unsloth/Qwen3.5-4B-GGUF",
+            "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+            2910,
+            "256K context, vision+text, best quality (GPU ≥4GB VRAM)",
             hasVision = true,
-            mmprojFile = "mmproj-Qwen3-VL-2B-F16.gguf",
+            mmprojFile = "mmproj-Qwen3.5-4B-F16.gguf",
             mmprojSourceFile = "mmproj-F16.gguf"
         ),
         ModelPreset(
-            "Qwen3-VL-2B Thinking Q4_K_XL",
-            "unsloth/Qwen3-VL-2B-Thinking-GGUF",
-            "Qwen3-VL-2B-Thinking-UD-Q4_K_XL.gguf",
-            1500,
-            "Vision+text with chain-of-thought reasoning",
+            "Qwen3.5-2B VL",
+            "unsloth/Qwen3.5-2B-GGUF",
+            "Qwen3.5-2B-UD-Q4_K_XL.gguf",
+            1340,
+            "256K context, vision+text, lightweight (low VRAM / CPU)",
             hasVision = true,
-            mmprojFile = "mmproj-Qwen3-VL-2B-Thinking-F16.gguf",
+            mmprojFile = "mmproj-Qwen3.5-2B-F16.gguf",
+            mmprojSourceFile = "mmproj-F16.gguf"
+        ),
+        // Qwen3-VL models - older generation, still good for code analysis
+        ModelPreset(
+            "Qwen3-VL-2B Instruct Q4_K_XL",
+            "unsloth/Qwen3-VL-2B-Instruct-GGUF",
+            "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf",
+            1500,
+            "Vision+text, good for code analysis with diagrams",
+            hasVision = true,
+            mmprojFile = "mmproj-Qwen3-VL-2B-F16.gguf",
             mmprojSourceFile = "mmproj-F16.gguf"
         ),
         ModelPreset(
@@ -122,31 +132,13 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
             hasVision = true,
             mmprojFile = "mmproj-SmolVLM-256M-Instruct-f16.gguf"
         ),
-        // Text-only option
+        // Text-only options
         ModelPreset(
             "Qwen3-2B Text-Only Q4_K_M",
             "unsloth/Qwen3-2B-Instruct-GGUF",
             "Qwen3-2B-Instruct-Q4_K_M.gguf",
             1100,
             "Text-only, fastest, no vision support",
-            hasVision = false
-        ),
-        // Qwen3.5 models - 256K context, 201 languages, text-only
-        // Note: Requires llama.cpp build b8148+, NOT compatible with Ollama
-        ModelPreset(
-            "Qwen3.5-2B UD-Q4_K_XL",
-            "unsloth/Qwen3.5-2B-GGUF",
-            "Qwen3.5-2B-UD-Q4_K_XL.gguf",
-            1340,
-            "256K context, text-only, lightweight (llama.cpp only)",
-            hasVision = false
-        ),
-        ModelPreset(
-            "Qwen3.5-4B UD-Q4_K_XL",
-            "unsloth/Qwen3.5-4B-GGUF",
-            "Qwen3.5-4B-UD-Q4_K_XL.gguf",
-            2910,
-            "256K context, text-only, better quality (llama.cpp only)",
             hasVision = false
         ),
         ModelPreset(
@@ -1845,7 +1837,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
 
         val requestBody = Gson().toJson(mapOf(
-            "model" to "qwen3-vl",
+            "model" to "qwen3.5",
             "messages" to messages,
             "max_tokens" to 1024,
             "temperature" to 0.7
@@ -2325,7 +2317,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
 
         val requestBody = Gson().toJson(mapOf(
-            "model" to "qwen3-vl",
+            "model" to "qwen3.5",
             "messages" to messages,
             "max_tokens" to 1024,
             "temperature" to 0.7
@@ -2382,7 +2374,7 @@ class AIExplanationPanel(private val project: Project) : JPanel(BorderLayout()) 
 
             // Make follow-up call with tool results
             val followUpBody = Gson().toJson(mapOf(
-                "model" to "qwen3-vl",
+                "model" to "qwen3.5",
                 "messages" to followUpMessages,
                 "max_tokens" to 1024,
                 "temperature" to 0.7

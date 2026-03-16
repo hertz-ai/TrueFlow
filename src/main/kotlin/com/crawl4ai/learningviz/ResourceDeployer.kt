@@ -136,6 +136,7 @@ object ResourceDeployer {
     fun deployAll(project: Project): Boolean {
         PluginLogger.info("Starting resource deployment...")
         deployRuntimeInjector(project)
+        ensureGitExclude(project)
 
         // Check if plugin version changed — hub needs restart to load new Python code
         val versionChanged = checkAndUpdateVersionMarker(project)
@@ -145,6 +146,27 @@ object ResourceDeployer {
             PluginLogger.info("Resource deployment completed")
         }
         return versionChanged
+    }
+
+    /**
+     * Ensure .pycharm_plugin/ is in .git/info/exclude so it never gets staged.
+     * Only writes if the exclude file exists and doesn't already contain the entry.
+     */
+    private fun ensureGitExclude(project: Project) {
+        try {
+            val projectPath = project.basePath ?: return
+            val excludeFile = File(projectPath, ".git/info/exclude")
+            if (!excludeFile.exists()) return
+
+            val content = excludeFile.readText()
+            val entry = ".pycharm_plugin/"
+            if (content.contains(entry)) return
+
+            excludeFile.appendText("\n$entry\n")
+            PluginLogger.info("Added $entry to .git/info/exclude")
+        } catch (e: Exception) {
+            PluginLogger.debug("Could not update git exclude: ${e.message}")
+        }
     }
 
     /**

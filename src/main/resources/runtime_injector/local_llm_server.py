@@ -94,16 +94,16 @@ MODELS = {
     "qwen3.5-2b": ModelConfig(
         repo_id="unsloth/Qwen3.5-2B-GGUF",
         model_file="Qwen3.5-2B-UD-Q4_K_XL.gguf",
-        mmproj_file=None,  # Text-only
+        mmproj_file="mmproj-F16.gguf",  # Unified VLM - vision encoder
         size_mb=1340,
-        description="Qwen3.5 2B - 256K context, text-only, lightweight"
+        description="Qwen3.5 2B - Unified VLM, 256K context, vision+text"
     ),
     "qwen3.5-4b": ModelConfig(
         repo_id="unsloth/Qwen3.5-4B-GGUF",
         model_file="Qwen3.5-4B-UD-Q4_K_XL.gguf",
-        mmproj_file=None,  # Text-only
+        mmproj_file="mmproj-F16.gguf",  # Unified VLM - vision encoder
         size_mb=2910,
-        description="Qwen3.5 4B - 256K context, text-only, better quality"
+        description="Qwen3.5 4B - Unified VLM, 256K context, vision+text"
     ),
 }
 
@@ -136,6 +136,15 @@ class ModelManager:
         config = MODELS[model_name]
         if config.mmproj_file is None:
             return None
+
+        # Try model-specific name first (e.g., mmproj-Qwen3.5-4B-F16.gguf)
+        # then fall back to generic name from config (e.g., mmproj-F16.gguf)
+        model_prefix = config.model_file.split("-UD-")[0] if "-UD-" in config.model_file else config.model_file.split("-Q")[0]
+        specific_name = f"mmproj-{model_prefix}-F16.gguf"
+        specific_path = self.models_dir / specific_name
+        if specific_path.exists():
+            return specific_path
+
         mmproj_path = self.models_dir / config.mmproj_file
         if mmproj_path.exists():
             return mmproj_path
@@ -199,6 +208,9 @@ class ModelManager:
 
                 # Download vision projector if needed
                 if config.mmproj_file:
+                    # Use model-specific name to avoid collisions between models
+                    model_prefix = config.model_file.split("-UD-")[0] if "-UD-" in config.model_file else config.model_file.split("-Q")[0]
+                    local_mmproj_name = f"mmproj-{model_prefix}-F16.gguf"
                     report(f"Downloading {config.mmproj_file}...", 50)
                     hf_hub_download(
                         repo_id=config.repo_id,
@@ -206,7 +218,12 @@ class ModelManager:
                         local_dir=str(self.models_dir),
                         local_dir_use_symlinks=False
                     )
-                    report(f"Downloaded {config.mmproj_file}", 100)
+                    # Rename to model-specific name if generic name was used
+                    generic_path = self.models_dir / config.mmproj_file
+                    specific_path = self.models_dir / local_mmproj_name
+                    if generic_path.exists() and not specific_path.exists():
+                        generic_path.rename(specific_path)
+                    report(f"Downloaded {local_mmproj_name}", 100)
                 else:
                     report("Download complete", 100)
 
@@ -721,7 +738,7 @@ class LlamaCppServer:
 
     def start(
         self,
-        model_name: str = "qwen3-vl-2b",
+        model_name: str = "qwen3.5-4b",
         callback: Optional[Callable[[str], None]] = None
     ) -> bool:
         """
@@ -949,7 +966,7 @@ class LocalLLMService:
         - Custom HuggingFace URLs
     """
 
-    def __init__(self, model_name: str = "qwen3-vl-2b", model_path: Optional[str] = None):
+    def __init__(self, model_name: str = "qwen3.5-4b", model_path: Optional[str] = None):
         """
         Initialize the LLM service.
 

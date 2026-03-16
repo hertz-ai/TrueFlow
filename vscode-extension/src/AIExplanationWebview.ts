@@ -40,30 +40,43 @@ interface ChatMessage {
 }
 
 const MODEL_PRESETS: ModelPreset[] = [
-    // Qwen3-VL models - excellent for code analysis
-    // Note: mmproj file is required for vision - verified from HuggingFace repos
+    // Qwen3.5 models - 256K context, unified VLM (vision+text), default choice
+    // Requires llama.cpp build b8148+, NOT compatible with Ollama
     {
-        displayName: "Qwen3-VL-2B Instruct Q4_K_XL (Recommended)",
+        displayName: "Qwen3.5-4B VL (Recommended)",
+        repoId: "unsloth/Qwen3.5-4B-GGUF",
+        fileName: "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+        sizeMB: 2910,
+        description: "256K context, vision+text, best quality (GPU ≥4GB VRAM)",
+        hasVision: true,
+        mmprojRepoId: "unsloth/Qwen3.5-4B-GGUF",
+        mmprojFileName: "mmproj-F16.gguf",
+        mmprojLocalFileName: "mmproj-Qwen3.5-4B-F16.gguf",
+        mmprojSizeMB: 642
+    },
+    {
+        displayName: "Qwen3.5-2B VL",
+        repoId: "unsloth/Qwen3.5-2B-GGUF",
+        fileName: "Qwen3.5-2B-UD-Q4_K_XL.gguf",
+        sizeMB: 1340,
+        description: "256K context, vision+text, lightweight (low VRAM / CPU)",
+        hasVision: true,
+        mmprojRepoId: "unsloth/Qwen3.5-2B-GGUF",
+        mmprojFileName: "mmproj-F16.gguf",
+        mmprojLocalFileName: "mmproj-Qwen3.5-2B-F16.gguf",
+        mmprojSizeMB: 642
+    },
+    // Qwen3-VL models - older generation, still good for code analysis
+    {
+        displayName: "Qwen3-VL-2B Instruct Q4_K_XL",
         repoId: "unsloth/Qwen3-VL-2B-Instruct-GGUF",
         fileName: "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf",
         sizeMB: 1500,
-        description: "Vision+text, best for code analysis with diagrams",
+        description: "Vision+text, good for code analysis with diagrams",
         hasVision: true,
         mmprojRepoId: "unsloth/Qwen3-VL-2B-Instruct-GGUF",
         mmprojFileName: "mmproj-F16.gguf",
         mmprojLocalFileName: "mmproj-Qwen3-VL-2B-F16.gguf",
-        mmprojSizeMB: 819
-    },
-    {
-        displayName: "Qwen3-VL-2B Thinking Q4_K_XL",
-        repoId: "unsloth/Qwen3-VL-2B-Thinking-GGUF",
-        fileName: "Qwen3-VL-2B-Thinking-UD-Q4_K_XL.gguf",
-        sizeMB: 1500,
-        description: "Vision+text with chain-of-thought reasoning",
-        hasVision: true,
-        mmprojRepoId: "unsloth/Qwen3-VL-2B-Thinking-GGUF",
-        mmprojFileName: "mmproj-F16.gguf",
-        mmprojLocalFileName: "mmproj-Qwen3-VL-2B-Thinking-F16.gguf",
         mmprojSizeMB: 819
     },
     {
@@ -113,31 +126,13 @@ const MODEL_PRESETS: ModelPreset[] = [
         mmprojLocalFileName: "mmproj-SmolVLM-256M-F16.gguf",
         mmprojSizeMB: 50
     },
-    // Text-only option
+    // Text-only options
     {
         displayName: "Qwen3-2B Text-Only Q4_K_M",
         repoId: "unsloth/Qwen3-2B-Instruct-GGUF",
         fileName: "Qwen3-2B-Instruct-Q4_K_M.gguf",
         sizeMB: 1100,
         description: "Text-only, fastest, no vision support",
-        hasVision: false
-    },
-    // Qwen3.5 models - 256K context, 201 languages, text-only
-    // Note: Requires llama.cpp build b8148+, NOT compatible with Ollama
-    {
-        displayName: "Qwen3.5-2B UD-Q4_K_XL",
-        repoId: "unsloth/Qwen3.5-2B-GGUF",
-        fileName: "Qwen3.5-2B-UD-Q4_K_XL.gguf",
-        sizeMB: 1340,
-        description: "256K context, text-only, lightweight (llama.cpp only)",
-        hasVision: false
-    },
-    {
-        displayName: "Qwen3.5-4B UD-Q4_K_XL",
-        repoId: "unsloth/Qwen3.5-4B-GGUF",
-        fileName: "Qwen3.5-4B-UD-Q4_K_XL.gguf",
-        sizeMB: 2910,
-        description: "256K context, text-only, better quality (llama.cpp only)",
         hasVision: false
     }
 ];
