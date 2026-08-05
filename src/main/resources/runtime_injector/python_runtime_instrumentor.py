@@ -356,6 +356,24 @@ class FunctionCall(object):
 # RUNTIME INSTRUMENTOR (Auto-injected by plugin)
 # ============================================================================
 
+
+def _cython_safe_noop_trace(frame, event, arg):
+    """Protocol-safe stand-in for `return None` from the global tracer.
+
+    CPython treats a None return as "do not trace this frame" and moves on.
+    Cython's CYTHON_TRACE line-tracing does NOT perform that None check on
+    compiled module-init frames: it calls whatever the tracer returned, so a
+    filtered compiled frame died with "TypeError: 'NoneType' object is not
+    callable" (reproduced minimally 2026-08-06: a 2-line tracer returning None
+    crashes importing any linetrace-built module; returning itself imports
+    clean). Every filter path in trace_function therefore returns THIS no-op
+    instead of None. Cost: skipped INTERPRETED frames now receive per-line
+    calls into a no-op (CPython would have skipped the frame entirely); only
+    trace builds pay it, and it is the price of tracing Cython targets at all.
+    """
+    return _cython_safe_noop_trace
+
+
 class RuntimeInstrumentor(object):
     """
     Runtime instrumentor injected by PyCharm plugin.
@@ -807,18 +825,33 @@ class RuntimeInstrumentor(object):
         try:
             # Build function registry event
             all_functions = []
+            # Sources whose module imports as a C extension under THIS
+            # interpreter. sys.settrace never fires for them, so they cannot be
+            # reported covered no matter how much they run. Tagging lets the
+            # consumer separate INVISIBLE from DEAD instead of counting a
+            # compiled-away function as never-executed. getattr keeps an older
+            # scanner working, and the key is purely additive so a consumer that
+            # does not know it is unaffected.
+            shadowed = getattr(scanner, 'compiled_shadowed', {}) or {}
+            n_compiled = 0
             for filepath, functions in scanner.functions.items():
+                is_compiled = filepath in shadowed
                 for func_name in functions:
                     # Extract module name from filepath
                     module = self._filepath_to_module(filepath)
                     # Get line number from scanner
                     line_number = scanner.get_function_line(filepath, func_name)
-                    all_functions.append({
+                    entry = {
                         'module': module,
                         'function': func_name,
                         'file': filepath,
                         'line': line_number
-                    })
+                    }
+                    if is_compiled:
+                        entry['compiled'] = True
+                        entry['traceable'] = False
+                        n_compiled += 1
+                    all_functions.append(entry)
 
             # Send registry event
             # Note: traceData expects trace_data field in JSON
@@ -838,9 +871,24 @@ class RuntimeInstrumentor(object):
                 'learning_phase': None,
                 'trace_data': {
                     'total_functions': len(all_functions),
+                    'compiled_functions': n_compiled,
+                    'traceable_functions': len(all_functions) - n_compiled,
                     'functions': all_functions
                 }
             }
+            if n_compiled:
+                # Pre-formatted single string: the DummyLogger fallback's
+                # warning(msg) accepts no lazy format args, and a TypeError here
+                # is swallowed by this function's except -- which would kill the
+                # registry send on exactly the compiled projects this warning
+                # exists for.
+                self.logger.warning(
+                    "{0} of {1} registry functions are in compiled extensions and "
+                    "CANNOT be traced by sys.settrace; max reportable coverage is "
+                    "{2:.1f}%. Rebuild with Cython profile=True, linetrace=True and "
+                    "-DCYTHON_TRACE=1 to see them.".format(
+                        n_compiled, len(all_functions),
+                        100.0 * (len(all_functions) - n_compiled) / max(len(all_functions), 1)))
 
             self.trace_server.stream_trace(registry_event, must_deliver=True)
             self.logger.info("Sent function registry: {0} functions".format(len(all_functions)))
@@ -1091,9 +1139,27 @@ class RuntimeInstrumentor(object):
         """sys.settrace callback - intercepts all function calls and returns."""
         try:
             if not self.enabled:
-                return
+                return _cython_safe_noop_trace  # Cython-safe: never return None
 
             code = frame.f_code
+
+            # CYTHON-COMPILED FRAMES (empirical guard, 2026-08-06): with
+            # HEVOLVE_CYTHON_TRACE builds + torch imported, letting this
+            # tracer's full body run for extension-loaded frames crashes the
+            # host at compiled module init ("TypeError: 'NoneType' object is
+            # not callable" from PyInit). Bisected hard: a trivial tracer is
+            # fine, this tracer wrapped by a return-swallowing spy is fine, no
+            # exception and no None-return path fires -- the incompatibility
+            # is in the full-body interaction itself. Until root-caused,
+            # compiled frames get the MINIMAL treatment: record nothing here,
+            # return the protocol-safe noop so Cython line events stay away
+            # from this body. Function coverage for compiled modules then
+            # comes from CALL events of the frames they invoke in interpreted
+            # code plus the registry; per-line compiled coverage stays off.
+            _ldr = frame.f_globals.get('__loader__')
+            if _ldr is not None and type(_ldr).__name__ == 'ExtensionFileLoader':
+                return _cython_safe_noop_trace
+
             # Use co_qualname (Python 3.3+) for class-qualified names like "ClassName.method"
             # This matches the format used by static analysis for proper call graph connections
             func_name = getattr(code, 'co_qualname', code.co_name)
@@ -1123,7 +1189,7 @@ class RuntimeInstrumentor(object):
             # Skip Python-generated internal functions (comprehensions, lambdas, etc.)
             # These clutter the visualization without providing useful information
             if func_name in ('<genexpr>', '<lambda>', '<listcomp>', '<setcomp>', '<dictcomp>'):
-                return
+                return _cython_safe_noop_trace  # Cython-safe: never return None
 
             # Skip internal Python modules (but allow __main__ for testing and database libraries)
             # Uses pre-computed frozensets from __init__ (O(1) lookup vs list rebuild per call)
@@ -1140,18 +1206,18 @@ class RuntimeInstrumentor(object):
             if self.scanner_ready and self.project_scanner:
                 # Skip tracing the instrumentor itself to reduce noise
                 if 'python_runtime_instrumentor' in filename or 'sitecustomize' in filename:
-                    return
+                    return _cython_safe_noop_trace  # Cython-safe: never return None
 
                 # Skip performance-critical library internals (PyTorch, transformers, etc.)
                 # These add massive overhead and aren't useful for debugging user code
                 if any(module.startswith(mod) for mod in self._performance_sensitive_modules):
                     # Allow top-level user calls INTO these libraries, but not their internals
                     if not self.project_scanner.is_project_file(filename):
-                        return
+                        return _cython_safe_noop_trace  # Cython-safe: never return None
 
                 # Skip PyTorch/model hooks (called thousands of times, huge overhead)
                 if func_name.endswith('_hook') or func_name.startswith('hook_'):
-                    return
+                    return _cython_safe_noop_trace  # Cython-safe: never return None
 
                 # Check if this function is in the project
                 should_trace = self.project_scanner.should_trace(filename, func_name)
@@ -1184,12 +1250,12 @@ class RuntimeInstrumentor(object):
                 ]
                 if any(indicator in filename for indicator in stdlib_indicators):
                     if not is_user_code:  # Unless it's in project directory
-                        return
+                        return _cython_safe_noop_trace  # Cython-safe: never return None
 
                 # Filter logic: Skip bootstrap/stdlib, skip site-packages (except DB libs and user's project)
                 if not is_db_module and not is_user_code:
                     if is_bootstrap or (module.startswith('_') and module != '__main__') or 'site-packages' in filename:
-                        return
+                        return _cython_safe_noop_trace  # Cython-safe: never return None
 
             frame_id = id(frame)
 
@@ -1208,7 +1274,7 @@ class RuntimeInstrumentor(object):
                         self.logger.warning("Call rate exceeds {0}/sec, disabling tracing to prevent performance degradation".format(self.max_calls_per_second))
                         self.enabled = False
                         sys.settrace(None)
-                    return
+                    return _cython_safe_noop_trace  # Cython-safe: never return None
 
                 # Periodic flush check for long-running processes
                 if current_time - self.last_flush_time >= self.flush_interval and not self.flush_lock:
@@ -1242,12 +1308,12 @@ class RuntimeInstrumentor(object):
                         if self.enabled:
                             self.logger.warning("Max calls limit ({0}) reached, disabling instrumentation".format(self.max_calls))
                             self.enabled = False
-                        return
+                        return _cython_safe_noop_trace  # Cython-safe: never return None
 
                 # Safety check: prevent stack overflow tracking
                 if len(self.call_stack) >= self.max_call_depth:
                     # Silently skip deep calls but continue tracking
-                    return
+                    return _cython_safe_noop_trace  # Cython-safe: never return None
 
                 # Path coverage optimization: skip already-covered execution paths.
                 # NOTE: this makes every surviving event UNIQUE (one per function
@@ -1581,7 +1647,7 @@ class RuntimeInstrumentor(object):
                 self.enabled = False
             except Exception:
                 pass
-            return None
+            return _cython_safe_noop_trace  # Cython-safe: never return None
 
     def _detect_learning_cycle_start(self, func_name, frame):
         """

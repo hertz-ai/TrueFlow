@@ -15,6 +15,17 @@ import os
 import ast
 import sys
 
+# The suffixes the RUNNING interpreter accepts for a C extension, most specific
+# first (CPython 3.10 on Windows: ['.cp310-win_amd64.pyd', '.pyd']). Asking
+# importlib rather than hardcoding matters because the ABI tag is what decides
+# whether a given .pyd shadows its .py for THIS interpreter -- a cp312 build is
+# inert under 3.10 and must not be treated as a shadow.
+try:
+    from importlib.machinery import EXTENSION_SUFFIXES
+except ImportError:  # Python 2
+    EXTENSION_SUFFIXES = ['.pyd'] if sys.platform == 'win32' else ['.so']
+
+
 class ProjectScanner(object):
     """Scans a Python project to find all user-defined functions."""
 
@@ -23,6 +34,29 @@ class ProjectScanner(object):
         self.functions = {}  # {file_path: set(function_names)}
         self.function_lines = {}  # {file_path: {function_name: line_number}}
         self.file_set = set()  # Set of all project files (for fast lookup)
+        # {abs_py_path: abs_extension_path} for sources whose module will import
+        # as a C extension. sys.settrace only fires on PYTHON frames, so nothing
+        # in these files can ever be reported as covered -- they are INVISIBLE,
+        # not dead, and conflating the two is what makes a running server look
+        # 0% covered. Populated by scan(); consumed by the instrumentor to tag
+        # the registry.
+        self.compiled_shadowed = {}
+
+    def compiled_shadow(self, filepath):
+        """Return the compiled extension that this interpreter imports INSTEAD
+        of the given .py, or None when the source is the thing that runs.
+
+        Only a sibling of the same basename counts: that is precisely what
+        FileFinder prefers over the .py.
+        """
+        if not filepath.endswith('.py'):
+            return None
+        base = filepath[:-3]
+        for suffix in EXTENSION_SUFFIXES:
+            candidate = base + suffix
+            if os.path.exists(candidate):
+                return candidate
+        return None
 
     def scan(self):
         """Scan the project directory for all Python files and extract functions."""
@@ -51,12 +85,35 @@ class ProjectScanner(object):
                             self.function_lines[abs_path] = func_lines
                             file_count += 1
                             function_count += len(functions)
+                            # Record, do NOT drop: self.functions doubles as the
+                            # trace whitelist, so removing entries here would
+                            # change tracing behaviour. This is additive.
+                            shadow = self.compiled_shadow(filepath)
+                            if shadow:
+                                self.compiled_shadowed[abs_path] = shadow
                     except Exception as e:
                         # Silently skip files that can't be parsed
                         pass
 
         print("[ProjectScanner] Found {0} functions in {1} files".format(
             function_count, file_count))
+
+        # Say it loudly at startup. Without this the only symptom is a coverage
+        # number stuck near zero, which reads as "the tracer is broken" and costs
+        # hours -- the functions are compiled away, not dead.
+        if self.compiled_shadowed:
+            hidden = sum(len(self.functions[p]) for p in self.compiled_shadowed)
+            pct = (100.0 * hidden / function_count) if function_count else 0.0
+            print("[ProjectScanner] WARNING: {0} of {1} functions ({2:.1f}%) live in {3} "
+                  "files shadowed by a compiled extension for this interpreter."
+                  .format(hidden, function_count, pct, len(self.compiled_shadowed)))
+            print("[ProjectScanner]          sys.settrace cannot see C extensions, so those "
+                  "can never be reported covered and will look DEAD.")
+            print("[ProjectScanner]          Rebuild the target with Cython directives "
+                  "profile=True, linetrace=True and -DCYTHON_TRACE=1 to make them traceable.")
+            example = sorted(self.compiled_shadowed.items())[0]
+            print("[ProjectScanner]          e.g. {0} -> {1}"
+                  .format(os.path.basename(example[0]), os.path.basename(example[1])))
         return self.functions
 
     def _extract_functions(self, filepath):
