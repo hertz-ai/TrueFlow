@@ -20,6 +20,12 @@ import json
 import socket
 from datetime import datetime
 
+# Python 2/3 compatibility for the send queue (4a async sender)
+try:
+    import queue as _queue_mod
+except ImportError:
+    import Queue as _queue_mod
+
 # Python 2/3 compatibility
 if sys.version_info[0] >= 3:
     from pathlib import Path
@@ -79,6 +85,9 @@ class TraceSocketServer(object):
     Similar to debugpy/pydevd remote debugging protocol.
     """
 
+    # Sentinel object that unblocks the sender thread on shutdown.
+    _STOP = object()
+
     def __init__(self, host='127.0.0.1', port=5678):
         self.logger = get_logger("trace_server")
         self.host = host
@@ -88,14 +97,45 @@ class TraceSocketServer(object):
         self.running = False
         self.lock = threading.Lock()
 
+        # Async sender (4a): the traced thread enqueues the RAW dict (O(1),
+        # serialization stays off the hot path) and a single background thread
+        # serializes and sends. One thread, not several: FIFO order is a
+        # protocol invariant (call before its return, registry before calls).
+        # Opt-in via TRUEFLOW_ASYNC_SEND=1 until validated against a live IDE.
+        self.async_send = os.getenv('TRUEFLOW_ASYNC_SEND', '0') == '1'
+        self.send_queue_size = int(os.getenv('TRUEFLOW_SEND_QUEUE_SIZE', '10000'))
+        # Per-client socket timeout. Without it a half-open connection blocks
+        # forever (sync mode: the traced thread; async mode: the sender thread).
+        # Must be generous: a branch_registry event has been observed at ~50MB.
+        self.send_timeout = float(os.getenv('TRUEFLOW_SEND_TIMEOUT', '15'))
+        self.send_queue = None
+        self._sender_thread = None
+        self.dropped_events = 0
+        self._drop_log_last = 0.0
+
     def start(self):
         """Start trace server in background thread."""
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # On Windows SO_REUSEADDR lets a SECOND traced process bind the same
+            # port and silently steal new connections (observed live: a stray
+            # tensorboard process and the real server both bound :5678). Use an
+            # exclusive bind there so the second process fails fast and logs.
+            if os.name == 'nt' and hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
             self.running = True
+
+            if self.async_send:
+                self.send_queue = _queue_mod.Queue(maxsize=self.send_queue_size)
+                self._sender_thread = threading.Thread(target=self._sender_loop)
+                self._sender_thread.daemon = True
+                self._sender_thread.start()
+                self.logger.info("Async sender enabled (queue={0}, timeout={1}s)".format(
+                    self.send_queue_size, self.send_timeout))
 
             # Accept connections in background thread
             accept_thread = threading.Thread(target=self._accept_connections)
@@ -115,6 +155,10 @@ class TraceSocketServer(object):
         while self.running:
             try:
                 client_socket, addr = self.server_socket.accept()
+                # A half-open or stalled client must never block a send forever
+                # (pre-fix behaviour: sendall with no timeout on the traced
+                # thread). On timeout the client is dropped, not waited on.
+                client_socket.settimeout(self.send_timeout)
                 with self.lock:
                     self.clients.append(client_socket)
                 self.logger.info("Client connected from {0}".format(addr))
@@ -127,11 +171,67 @@ class TraceSocketServer(object):
                     self.logger.warning("Error accepting connection")
                 break
 
-    def stream_trace(self, trace_data):
-        """Stream trace event to all connected clients."""
-        if not self.clients:
-            return
+    def stream_trace(self, trace_data, must_deliver=False):
+        """Stream trace event to all connected clients.
 
+        must_deliver marks events coverage/analysis cannot afford to lose
+        (registries, cycle boundaries, first sight of a function per cycle).
+        In async mode they may block briefly on a full queue instead of being
+        dropped; droppable events (repeat calls, timing samples) are shed
+        immediately under backpressure.
+
+        Returns True if the event was handed to the wire/queue, False if it
+        was dropped (queue full) or there was no client to receive it. The
+        call/return path uses this for PAIRED dropping: a call that never
+        went out must have its return suppressed too, or the plugin's
+        call-stack pairing corrupts. Sync mode always returns True after the
+        fanout attempt, preserving the exact legacy pairing behaviour.
+        """
+        if not self.clients:
+            return False
+
+        if self.async_send and self.send_queue is not None:
+            try:
+                self.send_queue.put_nowait(trace_data)
+                return True
+            except _queue_mod.Full:
+                pass
+            if must_deliver:
+                try:
+                    self.send_queue.put(trace_data, timeout=2.0)
+                    return True
+                except _queue_mod.Full:
+                    pass
+            self.dropped_events += 1
+            now = time.time()
+            if now - self._drop_log_last > 10.0:
+                self._drop_log_last = now
+                self.logger.warning("Send queue full, {0} events dropped so far{1}".format(
+                    self.dropped_events, " (incl. must-deliver!)" if must_deliver else ""))
+            return False
+
+        self._send_now(trace_data)
+        return True
+
+    def _sender_loop(self):
+        """Single background sender: preserves FIFO, keeps IO off traced threads."""
+        while True:
+            try:
+                item = self.send_queue.get(timeout=0.5)
+            except _queue_mod.Empty:
+                if not self.running:
+                    break
+                continue
+            if item is TraceSocketServer._STOP:
+                break
+            try:
+                self._send_now(item)
+            except Exception:
+                pass
+
+    def _send_now(self, trace_data):
+        """Serialize and fan out one event (runs on the caller in sync mode,
+        on the sender thread in async mode)."""
         try:
             # Serialize to JSON with newline delimiter (MUST NOT contain embedded newlines!)
             message = json.dumps(trace_data, separators=(',', ':')) + '\n'  # Compact JSON, no spaces
@@ -169,8 +269,22 @@ class TraceSocketServer(object):
             self.logger.error("Error streaming trace: {0}".format(str(e)), exc_info=True)
 
     def stop(self):
-        """Stop server and close all connections."""
+        """Stop server and close all connections, draining queued events first.
+
+        Without the drain, the tail of every run (the final returns, cycle_end,
+        the last coverage events) would be silently lost in async mode.
+        """
         self.running = False
+
+        if self._sender_thread is not None and self.send_queue is not None:
+            try:
+                self.send_queue.put_nowait(TraceSocketServer._STOP)
+            except _queue_mod.Full:
+                pass  # sender is behind; the 0.5s get-timeout + running=False ends it
+            self._sender_thread.join(timeout=15.0)
+            if self._sender_thread.is_alive():
+                self.logger.warning("Sender thread did not drain within 15s; tail may be lost")
+            self._sender_thread = None
 
         with self.lock:
             for client in self.clients:
@@ -538,6 +652,16 @@ class RuntimeInstrumentor(object):
         self.socket_sample_rate = int(os.getenv('PYCHARM_PLUGIN_SOCKET_SAMPLE_RATE', '10'))  # Stream 1 in N
         self.socket_event_counter = 0
 
+        # 4b: sampling is only safe on REDUNDANT events. The first sight of a
+        # function per cycle is unique and irreplaceable -- dropping it marks
+        # the function dead until a later cycle happens to sample it back in
+        # (P(seen) = 1 - 0.9^cycles; observed ~34% coverage after 4 cycles).
+        # First-sight events bypass the sampler. Kill switch for rollback only.
+        self.coverage_must_deliver = os.getenv('TRUEFLOW_COVERAGE_MUST_DELIVER', '1') == '1'
+        # First-sight tracking for the socket path when path coverage is off
+        # (when it is on, covered_paths already guarantees first-sight-only).
+        self._socket_first_sight = set()
+
         def scan_in_background():
             try:
                 from project_scanner import ProjectScanner
@@ -663,6 +787,17 @@ class RuntimeInstrumentor(object):
             self.logger.info("Client connected, sending branch registry...")
             self._send_branch_registry(self.branch_analyzer)
 
+        # Late-attach fix: covered_paths accrues from process start, but events
+        # streamed before any client connects are discarded. Without this reset,
+        # every function exercised during warm-up stays invisible to a client
+        # that attaches later (it is filtered as "already covered" and, absent
+        # learning cycles, never re-reported -- a long-running server goes
+        # permanently silent). Clearing here re-reports each function on its
+        # next call. Limitation: code that ran ONLY during warm-up and never
+        # runs again still cannot be re-reported.
+        self.covered_paths.clear()
+        self._socket_first_sight.clear()
+
     def _send_function_registry(self, scanner):
         """Send function registry to plugin for dead code detection."""
         if not self.trace_server or not self.trace_server.clients:
@@ -707,7 +842,7 @@ class RuntimeInstrumentor(object):
                 }
             }
 
-            self.trace_server.stream_trace(registry_event)
+            self.trace_server.stream_trace(registry_event, must_deliver=True)
             self.logger.info("Sent function registry: {0} functions".format(len(all_functions)))
 
         except Exception as e:
@@ -799,7 +934,7 @@ class RuntimeInstrumentor(object):
                 }
             }
 
-            self.trace_server.stream_trace(branch_event)
+            self.trace_server.stream_trace(branch_event, must_deliver=True)
             self.logger.info("Sent branch registry: {0} call sites, {1} functions with branches".format(
                 len(call_sites), len(function_branches)))
 
@@ -807,38 +942,123 @@ class RuntimeInstrumentor(object):
             self.logger.warning("Failed to send branch registry: {0}".format(str(e)))
 
     def _filepath_to_module(self, filepath):
-        """Convert file path to module name.
+        """Convert file path to the module name Python's __name__ would report.
 
-        Converts absolute path to relative module path to match Python's __name__.
-        Uses project root (cwd) as the base, producing paths like:
-        - src.crawl4ai.foo (if file is in src/crawl4ai/foo.py)
+        THIS MUST EQUAL __name__, and previously did not. The runtime side of the
+        tracer reads __name__ directly (see _trace_calls), while the static side
+        calls this. When the two disagree, `covered` and `dead` become DISJOINT
+        SETS rather than a partition, and the explorer reports every function as
+        dead no matter how much runtime data arrives. Observed on a real project:
+        allFunctions 1824, calledFunctions 3, deadFunctions 1824 -- note that
+        3 + 1824 EXCEEDS 1824, which is the signature of disjoint sets and is what
+        distinguishes this from mere under-sampling.
 
-        This must match what Python's __name__ returns at runtime.
+        The old implementation made the path relative to cwd, so a src/ layout
+        produced 'src.pkg.mod' while Python reports 'pkg.mod' (src/ being on
+        sys.path). Its own docstring claimed the two matched; they never did.
+
+        Resolution order, mirroring how Python itself resolves a module:
+          1. The longest sys.path entry that contains the file. This is Python's
+             own answer and handles src/, flat, installed, editable and namespace
+             layouts without special-casing any directory name. Longest wins
+             because both 'proj' and 'proj/src' can be on the path, and only the
+             longest reproduces __name__.
+          2. If no entry matches (file not imported yet, or a foreign tree), walk
+             up while __init__.py exists; the first directory without one is the
+             import root.
+          3. Otherwise cwd, which is the ORIGINAL behaviour, so a path this cannot
+             place is treated exactly as before.
         """
-        # Get absolute path and normalize
-        abs_path = os.path.abspath(filepath)
+        # exec'd strings, frozen imports and <stdin> have no module path. The old
+        # code turned '<string>' into a dotted absolute path; return it unchanged.
+        if not filepath or filepath.startswith('<'):
+            return filepath or ''
 
-        # Get project root (cwd) to make path relative
-        project_root = os.getcwd()
-
-        # Make path relative to project root
         try:
-            if abs_path.startswith(project_root):
-                rel_path = os.path.relpath(abs_path, project_root)
-            else:
-                rel_path = abs_path
+            abs_path = os.path.abspath(filepath)
+        except Exception:
+            return filepath
+        norm = os.path.normcase(abs_path)
+
+        # The entry script is module '__main__' at runtime, not '<stem>'. Without
+        # this, every function in the entry file is registered as 'main.func' but
+        # called as '__main__.func' -- permanently dead plus a junk key (verified
+        # against a live capture). Mirror Python: that file IS __main__.
+        try:
+            main_file = getattr(sys.modules.get('__main__'), '__file__', None)
+            if main_file and os.path.normcase(os.path.abspath(main_file)) == norm:
+                return '__main__'
+        except Exception:
+            pass
+
+        base = None
+        base_len = -1
+        try:
+            entries = list(sys.path)
+        except Exception:
+            entries = []
+        for entry in entries:
+            if not entry:
+                continue
+            try:
+                e_abs = os.path.abspath(entry)
+                e_norm = os.path.normcase(e_abs)
+            except Exception:
+                continue
+            if not e_norm.endswith(os.sep):
+                e_norm += os.sep
+            if norm.startswith(e_norm) and len(e_norm) > base_len:
+                base, base_len = e_abs, len(e_norm)
+
+        if base is None:
+            d = os.path.dirname(abs_path)
+            try:
+                while d and os.path.isfile(os.path.join(d, '__init__.py')):
+                    parent = os.path.dirname(d)
+                    if parent == d:
+                        break
+                    d = parent
+            except Exception:
+                d = None
+            base = d or os.getcwd()
+
+        try:
+            rel_path = os.path.relpath(abs_path, base)
         except ValueError:
             # Different drive on Windows
             rel_path = abs_path
+        if rel_path.startswith('..'):
+            # The base guess was wrong; fall back to cwd exactly as before.
+            try:
+                alt = os.path.relpath(abs_path, os.getcwd())
+                if not alt.startswith('..'):
+                    rel_path = alt
+            except ValueError:
+                pass
 
-        # Remove .py extension
-        module_path = rel_path.replace('.py', '')
-        # Convert path separators to dots
-        module_path = module_path.replace(os.sep, '.')
-        module_path = module_path.replace('/', '.')
-        # Remove leading dots
-        module_path = module_path.lstrip('.')
-        return module_path
+        # splitext, NOT replace('.py', ''): the old form corrupted every path
+        # containing '.py' as a SUBSTRING, so '.pyenv/x.py' became 'env.x' and
+        # 'my.python.py' became 'mython'. Both are silent, both mismatch __name__.
+        rel_path = os.path.splitext(rel_path)[0]
+
+        parts = [p for p in rel_path.replace('\\', '/').split('/') if p and p != '.']
+        # A package's __init__ IS the package; Python never reports 'pkg.__init__'.
+        if parts and parts[-1] == '__init__':
+            parts.pop()
+
+        # NEVER return empty for a real path. Callers build keys as
+        # "{module}.{func}", so an empty module yields '.funcname' -- a key that
+        # matches nothing and pollutes the function set (a bare '.' was observed
+        # in a live calledFunctions sample). Reachable when __init__.py sits
+        # directly on a sys.path root, where the pop above empties the list.
+        if not parts:
+            leaf = os.path.splitext(os.path.basename(abs_path))[0]
+            if leaf == '__init__':
+                leaf = os.path.basename(os.path.dirname(abs_path))
+            if leaf:
+                parts = [leaf]
+
+        return '.'.join(parts)
 
     def _get_module_for_function(self, func_name, branch_analyzer):
         """Get module name for a function from the branch analyzer.
@@ -1029,15 +1249,11 @@ class RuntimeInstrumentor(object):
                     # Silently skip deep calls but continue tracking
                     return
 
-                # Path coverage optimization: skip already-covered execution paths
-                # Applied universally (including socket clients) to reduce event volume.
-                # Socket clients get unique-path events which is sufficient for:
-                #   - Dead code detection (needs function-level coverage, not call counts)
-                #   - Call graph visualization (needs edges, not frequencies)
-                #   - Performance metrics (plugin has its own sampling gate)
-                # The plugin's socketTraceCalls counter runs on every received event,
-                # so unique-path filtering here won't affect call counting accuracy
-                # for the set of paths that ARE covered.
+                # Path coverage optimization: skip already-covered execution paths.
+                # NOTE: this makes every surviving event UNIQUE (one per function
+                # per cycle), i.e. no longer redundant. Sampling a stream of
+                # unique events loses coverage permanently for that cycle, which
+                # is why first-sight events bypass the sampler below (4b).
                 if self.enable_path_coverage:
                     path_key = (filename, code.co_firstlineno)
                     if path_key in self.covered_paths:
@@ -1133,9 +1349,25 @@ class RuntimeInstrumentor(object):
                 # Pair-aware: when a 'call' is sampled in, its call_id is tracked so
                 # the matching 'return' is also streamed. This prevents call stack
                 # corruption in the plugin's updateCallTraceFromSocketTrace().
+                #
+                # 4b split: the sampler only applies to REDUNDANT (repeat) events.
+                # The first sight of a code path per cycle is must-deliver: it is
+                # the one event dead-code detection cannot re-derive. Volume is
+                # bounded by the project's function count per cycle, which is
+                # trivial next to repeat-call traffic.
                 if has_socket:
+                    if self.enable_path_coverage:
+                        # Layer 1 above only lets first-sight events through.
+                        is_first_sight = True
+                    else:
+                        fs_key = (filename, code.co_firstlineno)
+                        is_first_sight = fs_key not in self._socket_first_sight
+                        if is_first_sight:
+                            self._socket_first_sight.add(fs_key)
+                    must_deliver = is_first_sight and self.coverage_must_deliver
+
                     self.socket_event_counter += 1
-                    should_stream = (self.socket_event_counter % self.socket_sample_rate == 0)
+                    should_stream = must_deliver or (self.socket_event_counter % self.socket_sample_rate == 0)
                     if should_stream:
                         # Track this call_id so its return event is also streamed
                         self._sampled_call_ids.add(call_id)
@@ -1171,7 +1403,20 @@ class RuntimeInstrumentor(object):
                             trace_event['framework'] = call_record.framework
                         if call_record.is_ai_agent:
                             trace_event['is_ai_agent'] = True
-                        self.trace_server.stream_trace(trace_event)
+                        delivered = self.trace_server.stream_trace(trace_event, must_deliver=must_deliver)
+                        if not delivered:
+                            # Paired drop: this call never reached the wire, so
+                            # its return must not either -- unmatched events
+                            # corrupt the plugin's call-stack pairing.
+                            self._sampled_call_ids.discard(call_id)
+                            # A dropped FIRST SIGHT must be re-armed, or coverage
+                            # loses this function for the rest of the cycle. The
+                            # next call re-enters the full path and re-attempts.
+                            if is_first_sight:
+                                if self.enable_path_coverage:
+                                    self.covered_paths.discard(path_key)
+                                else:
+                                    self._socket_first_sight.discard(fs_key)
 
                 # Auto-finalize if threshold reached (prevent memory growth)
                 if len(self.calls) >= self.auto_finalize_threshold and len(self.calls) % 1000 == 0:
@@ -1225,12 +1470,17 @@ class RuntimeInstrumentor(object):
                         except Exception:
                             pass
 
+                    # Pair bookkeeping OUTSIDE the clients guard: if the client
+                    # vanished between call and return, the id must still be
+                    # cleaned up here or the set leaks for the process's life.
+                    was_streamed = call_record.call_id in self._sampled_call_ids
+                    if was_streamed:
+                        self._sampled_call_ids.discard(call_record.call_id)
+
                     # Stream return event to PyCharm if connected
-                    # Pair-aware: only stream if the matching call was sampled in
+                    # Pair-aware: only stream if the matching call was streamed
                     if self.trace_server and self.trace_server.clients:
-                        if call_record.call_id in self._sampled_call_ids:
-                            # Remove from tracking set (matched pair complete)
-                            self._sampled_call_ids.discard(call_record.call_id)
+                        if was_streamed:
 
                             # Extract return value info (skip in lightweight mode)
                             return_info = None
@@ -1291,7 +1541,12 @@ class RuntimeInstrumentor(object):
                                 if protocol_summary:
                                     trace_event['protocol_summary'] = protocol_summary
                                     trace_event['protocol_details'] = protocol_details
-                            self.trace_server.stream_trace(trace_event)
+                            # The call reached the wire, so the plugin is OWED this
+                            # return: an unmatched call corrupts its stack pairing
+                            # (and SQL/Distributed counts ride on returns). Bounded:
+                            # one owed return per streamed call, and new calls stop
+                            # being admitted once the queue fills (paired drop).
+                            self.trace_server.stream_trace(trace_event, must_deliver=True)
 
                     try:
                         del self.active_calls[frame_id]
@@ -1367,6 +1622,7 @@ class RuntimeInstrumentor(object):
             # Set PYCHARM_PLUGIN_RESET_COVERAGE_PER_CYCLE=false to accumulate coverage across cycles
             if os.getenv('PYCHARM_PLUGIN_RESET_COVERAGE_PER_CYCLE', 'true').lower() == 'true':
                 self.covered_paths.clear()
+                self._socket_first_sight.clear()
 
             self.logger.info("Learning cycle started: {0} (entry: {1})".format(
                 correlation_id, func_name
@@ -1380,7 +1636,7 @@ class RuntimeInstrumentor(object):
                     'entry_point': func_name,
                     'timestamp': time.time()
                 }
-                self.trace_server.stream_trace(event)
+                self.trace_server.stream_trace(event, must_deliver=True)
 
             return correlation_id
 
@@ -1430,7 +1686,7 @@ class RuntimeInstrumentor(object):
                     'call_count': cycle['call_count'],
                     'timestamp': time.time()
                 }
-                self.trace_server.stream_trace(event)
+                self.trace_server.stream_trace(event, must_deliver=True)
 
             # Clear current cycle
             self.current_correlation_id = None
@@ -1466,7 +1722,7 @@ class RuntimeInstrumentor(object):
                 'call_count': cycle['call_count'],
                 'timestamp': time.time()
             }
-            self.trace_server.stream_trace(event)
+            self.trace_server.stream_trace(event, must_deliver=True)
 
         # Clean up depth tracking
         if correlation_id in self.cycle_call_stack_depth:
@@ -1736,7 +1992,7 @@ class RuntimeInstrumentor(object):
                     'type': 'cycle_complete',
                     'trace_data': trace_data  # Complete trace with all calls
                 }
-                self.trace_server.stream_trace(cycle_complete_event)
+                self.trace_server.stream_trace(cycle_complete_event, must_deliver=True)
                 self.streamed_cycles.add(correlation_id)  # Mark as streamed
                 self.logger.info("  STREAMED cycle_complete for {0} to plugin".format(correlation_id))
             except Exception as e:
@@ -2151,7 +2407,7 @@ class RuntimeInstrumentor(object):
                     'port': self._detected_server_port,
                     'session_id': self.session_id,
                     'process_id': self.process_id,
-                })
+                }, must_deliver=True)
         except Exception as e:
             self.logger.error("Endpoint injection failed: {0}".format(e))
             self._trueflow_endpoint_injected = False  # Allow retry
@@ -3220,7 +3476,7 @@ def _enable_instrumentation():
 
         # Register cleanup on exit
         import atexit
-        atexit.register(_safe_finalize)
+        atexit.register(_safe_shutdown)
 
         # Register signal handlers to catch crashes
         import signal
@@ -3253,7 +3509,16 @@ def _enable_instrumentation():
 
 
 def _safe_finalize():
-    """Safe finalize that never crashes."""
+    """Safe flush that never crashes and never tears anything down.
+
+    Called from the signal handler as well as the exit path, and the signal
+    handler's process may KEEP RUNNING afterwards: SIGBREAK is
+    flush-and-continue by design, and SIGINT re-raises KeyboardInterrupt,
+    which many apps catch and survive (checkpoint-on-Ctrl+C loops, graceful
+    servers). So this must not stop the trace server -- doing so silently
+    killed live streaming for the rest of such a process's life. Teardown
+    lives in _safe_shutdown, which only the real exit path runs.
+    """
     global _instrumentor
     try:
         if _instrumentor is not None:
@@ -3261,6 +3526,28 @@ def _safe_finalize():
     except Exception as e:
         # Use basic print since logger may not be available
         print("[PyCharm Plugin] Error during cleanup: {0}".format(str(e)))
+
+
+def _safe_shutdown():
+    """atexit-only teardown: flush, then stop the trace server, draining the
+    async send queue (4a) so the tail of the run reaches the IDE.
+
+    Registered with atexit, so it runs before daemon threads are killed.
+    Deliberately NOT part of _safe_finalize (the signal handler's process may
+    continue) and NOT part of finalize() (which also runs as a periodic
+    flush mid-session). finalize() is idempotent, so flushing again here on
+    the exit path is safe.
+    """
+    global _instrumentor
+    _safe_finalize()
+    try:
+        if _instrumentor is not None:
+            server = getattr(_instrumentor, 'trace_server', None)
+            if server is not None:
+                server.stop()
+                _instrumentor.trace_server = None
+    except Exception as e:
+        print("[PyCharm Plugin] Error during shutdown: {0}".format(str(e)))
 
 
 # Auto-enable if environment variable is set (plugin sets this)

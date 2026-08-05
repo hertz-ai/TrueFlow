@@ -103,7 +103,27 @@ export class ExplanationCacheManager {
         return cached !== undefined && cached.contentHash === contentHash;
     }
 
+    /**
+     * Detects transport/infra failures that must never be cached as if they
+     * were explanations (e.g. "Error: Read timed out", "Connection refused").
+     * A cached error suppresses regeneration forever.
+     */
+    private isErrorExplanation(text: string | undefined | null): boolean {
+        if (!text || !text.trim()) { return true; }
+        const t = text.trim();
+        return t.startsWith('Error:') ||
+            t.startsWith('AI server not running') ||
+            t === 'Read timed out' ||
+            t === 'Connection refused' ||
+            t.startsWith('Request failed');
+    }
+
     storeExplanation(explanation: CachedExplanation): void {
+        if (this.isErrorExplanation(explanation.explanation)) {
+            console.warn(`[AutoExplain] NOT caching error response for ${explanation.functionName}: ` +
+                explanation.explanation.slice(0, 80));
+            return;
+        }
         const key = this.getCacheKey(explanation.functionName, explanation.filePath);
         this.cache.set(key, explanation);
         this.saveCache();
@@ -532,8 +552,19 @@ export class ExplanationCacheManager {
                 const json = fs.readFileSync(this.cacheFilePath, 'utf-8');
                 const loaded: Record<string, CachedExplanation> = JSON.parse(json);
                 this.cache.clear();
+                // Self-heal caches poisoned by cached error strings; dropping
+                // them lets the background worker regenerate real explanations.
+                let purged = 0;
                 for (const [key, value] of Object.entries(loaded)) {
-                    this.cache.set(key, value);
+                    if (this.isErrorExplanation(value.explanation)) {
+                        purged++;
+                    } else {
+                        this.cache.set(key, value);
+                    }
+                }
+                if (purged > 0) {
+                    console.log(`[AutoExplain] Purged ${purged} cached error responses`);
+                    this.saveCache();
                 }
                 console.log(`[AutoExplain] Loaded ${this.cache.size} cached explanations`);
             }

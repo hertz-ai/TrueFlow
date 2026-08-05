@@ -193,7 +193,28 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
             return cached != null && cached.contentHash == contentHash
         }
 
+        /**
+         * Detects transport/infra failures that must never be cached as if they
+         * were explanations. Observed in poisoned caches: "Error: Read timed out",
+         * "Error: Connection refused", "AI server not running...". A cached error
+         * is worse than no cache: it suppresses regeneration forever.
+         */
+        fun isErrorExplanation(text: String?): Boolean {
+            if (text.isNullOrBlank()) return true
+            val t = text.trim()
+            return t.startsWith("Error:") ||
+                t.startsWith("AI server not running") ||
+                t == "Read timed out" ||
+                t == "Connection refused" ||
+                t.startsWith("Request failed")
+        }
+
         fun storeExplanation(explanation: CachedExplanation) {
+            if (isErrorExplanation(explanation.explanation)) {
+                PluginLogger.warn("[AutoExplain] NOT caching error response for ${explanation.functionName}: " +
+                    explanation.explanation.take(80))
+                return
+            }
             val key = getCacheKey(explanation.functionName, explanation.filePath)
             cache[key] = explanation
             saveCache()
@@ -592,7 +613,15 @@ class ManimVideoPanel(private val project: Project) : JBPanel<JBPanel<*>>(Border
                     val loaded: Map<String, CachedExplanation>? = gson.fromJson<Map<String, CachedExplanation>>(json, type)
                     if (loaded != null) {
                         cache.clear()
-                        cache.putAll(loaded)
+                        // Self-heal caches poisoned by cached error strings
+                        // (32 observed in one live cache); dropping them lets
+                        // the background worker regenerate real explanations.
+                        val (errors, good) = loaded.entries.partition { isErrorExplanation(it.value.explanation) }
+                        good.forEach { cache[it.key] = it.value }
+                        if (errors.isNotEmpty()) {
+                            PluginLogger.info("[AutoExplain] Purged ${errors.size} cached error responses")
+                            saveCache()
+                        }
                     }
                     PluginLogger.info("[AutoExplain] Loaded ${cache.size} cached explanations")
                 }
