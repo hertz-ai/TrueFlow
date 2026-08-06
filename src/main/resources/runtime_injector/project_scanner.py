@@ -107,10 +107,12 @@ class ProjectScanner(object):
             print("[ProjectScanner] WARNING: {0} of {1} functions ({2:.1f}%) live in {3} "
                   "files shadowed by a compiled extension for this interpreter."
                   .format(hidden, function_count, pct, len(self.compiled_shadowed)))
-            print("[ProjectScanner]          sys.settrace cannot see C extensions, so those "
-                  "can never be reported covered and will look DEAD.")
-            print("[ProjectScanner]          Rebuild the target with Cython directives "
-                  "profile=True, linetrace=True and -DCYTHON_TRACE=1 to make them traceable.")
+            print("[ProjectScanner]          sys.settrace cannot see a PLAIN C extension; a "
+                  "TRACE build (Cython profile=True + -DCYTHON_TRACE=1) emits call events, ")
+            print("[ProjectScanner]          which is all function coverage needs -- if the "
+                  ".pyds were built that way this ceiling does NOT apply. Per-line tracing ")
+            print("[ProjectScanner]          (linetrace=True) is a separate opt-in and made "
+                  "large imports exceed 10 minutes; leave it off unless line data is needed.")
             example = sorted(self.compiled_shadowed.items())[0]
             print("[ProjectScanner]          e.g. {0} -> {1}"
                   .format(os.path.basename(example[0]), os.path.basename(example[1])))

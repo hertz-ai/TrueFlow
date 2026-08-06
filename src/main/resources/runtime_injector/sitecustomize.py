@@ -14,6 +14,21 @@ trace_enabled = (
     os.getenv('PYCHARM_PLUGIN_TRACE_ENABLED') == '1'
 )
 
+# Bystander processes: the env (PYTHONPATH + flags) is inherited by EVERY
+# python the launching shell starts, not just the traced target. Observed
+# live (2026-08-06): TensorBoard inherited it, got fully instrumented and
+# project-scanned for zero value, and its trace server lost the port-5678
+# bind race against the real target (WinError 10048 noise at every boot).
+# Skip instrumentation when the entry point is a known bystander tool.
+_BYSTANDER_TOKENS = ('tensorboard', 'pip', 'wheel', 'setup_cython')
+# sys.argv is rewritten AFTER site init for `-m pkg` runs, so read the true
+# command line from sys.orig_argv (3.10+); fall back to argv for scripts.
+_cmdline = ' '.join(getattr(sys, 'orig_argv', None) or
+                    getattr(sys, 'argv', None) or []).lower()
+if trace_enabled and any(t in _cmdline for t in _BYSTANDER_TOKENS):
+    print("[TrueFlow] bystander process detected ({0}); tracing skipped".format(_cmdline[:120]))
+    trace_enabled = False
+
 # Debug: Always print to confirm sitecustomize.py is being loaded
 print("[TrueFlow] sitecustomize.py loaded from: {0}".format(__file__))
 print("[TrueFlow] TRUEFLOW_ENABLED = {0}".format(os.getenv('TRUEFLOW_ENABLED')))
